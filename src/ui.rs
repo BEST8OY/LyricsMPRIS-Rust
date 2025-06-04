@@ -68,17 +68,13 @@ pub async fn display_lyrics_modern(_meta: crate::mpris::TrackMetadata, _pos: f64
         tokio::select! {
             update = rx.recv() => {
                 if let Some(update) = update {
-                    // If lines is empty, check for unsynced/err, else clear state
+                    // If lines is empty, reuse cached lines
                     if !update.lines.is_empty() {
                         cached_lines = Some(update.lines.iter().map(|l| l.text.clone()).collect());
                         last_update = Some(update);
-                    } else if update.unsynced.is_some() || update.err.is_some() {
-                        last_update = Some(update);
-                        // Do not update cached_lines, so unsynced/err can be shown
-                    } else {
-                        // No lyrics at all: clear everything
-                        cached_lines = None;
-                        last_update = None;
+                    } else if let Some(ref mut upd) = last_update {
+                        // Only index changed, update index but reuse lines
+                        upd.index = update.index;
                     }
                     draw_ui_with_cache(&mut terminal, &last_update, &cached_lines, style_before, style_current, style_after)?;
                 } else {
