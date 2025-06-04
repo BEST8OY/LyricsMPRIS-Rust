@@ -9,61 +9,77 @@ use std::time::Duration;
 use crate::lyricsdb::LyricsDB;
 use std::sync::{Arc, Mutex};
 
-fn pad_centered(text: &str, width: usize) -> String {
-    let line_width = text.chars().count();
-    let pad_left = if width > line_width { (width - line_width) / 2 } else { 0 };
-    let mut content = String::with_capacity(width.max(line_width));
-    for _ in 0..pad_left { content.push(' '); }
-    content.push_str(text);
-    content
-}
+/// Utility functions for text formatting
+mod text_utils {
+    /// Center a string within a given width
+    pub fn pad_centered(text: &str, width: usize) -> String {
+        let line_width = text.chars().count();
+        let pad_left = if width > line_width { (width - line_width) / 2 } else { 0 };
+        let mut content = String::with_capacity(width.max(line_width));
+        for _ in 0..pad_left { content.push(' '); }
+        content.push_str(text);
+        content
+    }
 
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        if current.chars().count() + word.chars().count() + 1 > width && !current.is_empty() {
-            lines.push(current);
-            current = String::new();
+    /// Wrap text to a given width, breaking at word boundaries
+    pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut current = String::new();
+        for word in text.split_whitespace() {
+            if current.chars().count() + word.chars().count() + 1 > width && !current.is_empty() {
+                lines.push(current);
+                current = String::new();
+            }
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
         }
         if !current.is_empty() {
-            current.push(' ');
+            lines.push(current);
         }
-        current.push_str(word);
+        lines
     }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    lines
 }
 
-pub async fn display_lyrics_pipe(_meta: crate::mpris::TrackMetadata, _pos: f64, poll_interval: Duration, db: Option<Arc<Mutex<LyricsDB>>>, db_path: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+use text_utils::{pad_centered, wrap_text};
+
+/// Display lyrics in pipe mode (stdout only, for scripting)
+pub async fn display_lyrics_pipe(
+    _meta: crate::mpris::TrackMetadata,
+    _pos: f64,
+    poll_interval: Duration,
+    db: Option<Arc<Mutex<LyricsDB>>>,
+    db_path: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (tx, mut rx) = mpsc::channel(32);
     tokio::spawn(crate::pool::listen(tx, poll_interval, db.clone(), db_path.clone()));
     let mut last_line_idx = None;
     while let Some(upd) = rx.recv().await {
-        // Identify track by (title, artist, album)
-        let _track_id = (
-            upd.lines.get(0).map(|_| "has_lyrics").unwrap_or("no_lyrics").to_string(),
-            upd.err.clone().unwrap_or_default(),
-            upd.unsynced.clone().unwrap_or_default(),
-        );
         // If new track and no lyrics, reset state but do not print any message
         if upd.lines.is_empty() && (upd.err.is_some() || upd.unsynced.is_some() || (upd.err.is_none() && upd.unsynced.is_none())) {
             last_line_idx = None;
-            // Do not print or show any message in UI when no lyrics
             continue;
         }
         if upd.err.is_some() { continue; }
         if Some(upd.index) != last_line_idx {
-            println!("{}", upd.lines[upd.index].text);
+            if let Some(line) = upd.lines.get(upd.index) {
+                println!("{}", line.text);
+            }
             last_line_idx = Some(upd.index);
         }
     }
     Ok(())
 }
 
-pub async fn display_lyrics_modern(_meta: crate::mpris::TrackMetadata, _pos: f64, poll_interval: Duration, db: Option<Arc<Mutex<LyricsDB>>>, db_path: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+/// Display lyrics in modern TUI mode (centered, highlighted, real-time)
+pub async fn display_lyrics_modern(
+    _meta: crate::mpris::TrackMetadata,
+    _pos: f64,
+    poll_interval: Duration,
+    db: Option<Arc<Mutex<LyricsDB>>>,
+    db_path: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let (tx, mut rx) = mpsc::channel(32);
     tokio::spawn(crate::pool::listen(tx, poll_interval, db.clone(), db_path.clone()));
     enable_raw_mode()?;
@@ -77,7 +93,8 @@ pub async fn display_lyrics_modern(_meta: crate::mpris::TrackMetadata, _pos: f64
     let style_current = tui::style::Style::default().fg(tui::style::Color::Green).add_modifier(tui::style::Modifier::BOLD);
     let style_after = tui::style::Style::default();
     let mut last_track_id: Option<(String, String, String)> = None;
-    loop {
+    let mut should_exit = false;
+    while !should_exit {
         tokio::select! {
             update = rx.recv() => {
                 if let Some(update) = update {
@@ -90,7 +107,7 @@ pub async fn display_lyrics_modern(_meta: crate::mpris::TrackMetadata, _pos: f64
                     if update.lines.is_empty() && (update.err.is_some() || update.unsynced.is_some() || (update.err.is_none() && update.unsynced.is_none())) {
                         if last_track_id.as_ref() != Some(&track_id) {
                             cached_lines = None;
-                            last_update = None; // Do not set update, so UI stays blank
+                            last_update = None;
                         }
                         draw_ui_with_cache(&mut terminal, &last_update, &cached_lines, style_before, style_current, style_after)?;
                         last_track_id = Some(track_id);
@@ -105,7 +122,7 @@ pub async fn display_lyrics_modern(_meta: crate::mpris::TrackMetadata, _pos: f64
                     draw_ui_with_cache(&mut terminal, &last_update, &cached_lines, style_before, style_current, style_after)?;
                     last_track_id = Some(track_id);
                 } else {
-                    break;
+                    should_exit = true;
                 }
             }
             maybe_event = tokio::task::spawn_blocking(|| crossterm::event::poll(std::time::Duration::from_millis(100))) => {
@@ -114,7 +131,7 @@ pub async fn display_lyrics_modern(_meta: crate::mpris::TrackMetadata, _pos: f64
                     match event {
                         Event::Key(key) => {
                             match key.code {
-                                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => break,
+                                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => should_exit = true,
                                 _ => {}
                             }
                         },
@@ -130,6 +147,7 @@ pub async fn display_lyrics_modern(_meta: crate::mpris::TrackMetadata, _pos: f64
     Ok(())
 }
 
+/// Draw the TUI with the current lyric state and cache
 fn draw_ui_with_cache<B: tui::backend::Backend>(
     terminal: &mut Terminal<B>,
     last_update: &Option<Update>,
@@ -145,7 +163,6 @@ fn draw_ui_with_cache<B: tui::backend::Backend>(
         let mut lines = Vec::new();
         if let Some(update) = last_update {
             if let Some(ref err) = update.err {
-                // Show error message as before
                 let pad_top = h / 2;
                 lines.extend((0..pad_top).map(|_| Spans::from(Span::raw(""))));
                 for wrapped in wrap_text(err, w) {
@@ -159,20 +176,16 @@ fn draw_ui_with_cache<B: tui::backend::Backend>(
                     let current_height = current_block.len();
                     let mut visible = Vec::new();
                     if current_height >= h {
-                        // If the current line alone is taller than the window, show only its last h lines
                         for l in current_block[current_height.saturating_sub(h)..].iter() {
                             visible.push(Spans::from(Span::styled(pad_centered(l, w), style_current)));
                         }
-                        // No context, no centering
                         lines.extend(visible);
                     } else {
-                        // Center the current block with as much context as possible
                         let context_lines = h - current_height;
                         let mut before = Vec::new();
                         let mut after = Vec::new();
                         let mut lines_needed_before = context_lines / 2;
                         let mut lines_needed_after = context_lines - lines_needed_before;
-                        // Fill before context
                         let mut i = update.index;
                         while i > 0 && lines_needed_before > 0 {
                             i -= 1;
@@ -184,7 +197,6 @@ fn draw_ui_with_cache<B: tui::backend::Backend>(
                             lines_needed_before -= take;
                         }
                         before.reverse();
-                        // Fill after context
                         let mut j = update.index + 1;
                         while j < wrapped_lines.len() && lines_needed_after > 0 {
                             let take = visual_heights[j].min(lines_needed_after);
@@ -199,7 +211,6 @@ fn draw_ui_with_cache<B: tui::backend::Backend>(
                             visible.push(Spans::from(Span::styled(pad_centered(l, w), style_current)));
                         }
                         visible.extend(after);
-                        // Pad top/bottom if not enough context
                         let pad_top = h.saturating_sub(visible.len()) / 2;
                         let pad_bottom = h.saturating_sub(visible.len() + pad_top);
                         lines.extend((0..pad_top).map(|_| Spans::from(Span::raw(""))));
@@ -221,10 +232,8 @@ fn draw_ui_with_cache<B: tui::backend::Backend>(
                             lines.push(Spans::from(Span::styled(pad_centered(&wrapped, w), style_current)));
                         }
                     }
-                } // else: do not show any message if unsynced is empty
-            } // else: do not show any message if no lyrics, no error, no unsynced
-        } else {
-            // Show nothing while waiting for lyrics (blank screen)
+                }
+            }
         }
         let paragraph = Paragraph::new(lines)
             .alignment(Alignment::Left);
