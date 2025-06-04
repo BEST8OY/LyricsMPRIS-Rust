@@ -39,20 +39,12 @@ impl LyricState {
         if self.lines.len() <= 1 {
             return 0;
         }
-        if position >= self.lines[self.index].time {
-            for i in self.index + 1..self.lines.len() {
-                if position < self.lines[i].time {
-                    return i - 1;
-                }
-            }
-            return self.lines.len() - 1;
+        // Use binary search for efficiency
+        match self.lines.binary_search_by(|line| line.time.partial_cmp(&position).unwrap_or(std::cmp::Ordering::Less)) {
+            Ok(idx) => idx,
+            Err(0) => 0,
+            Err(idx) => idx - 1,
         }
-        for i in (0..=self.index).rev() {
-            if position > self.lines[i].time {
-                return i;
-            }
-        }
-        0
     }
 
     // fn clear(&mut self) {
@@ -188,13 +180,18 @@ async fn fetch_and_update_lyrics(
     state: &mut PlayerState,
     db: Option<&Arc<Mutex<LyricsDB>>>,
     db_path: Option<&str>,
+    position: f64, // <-- add position argument
 ) {
     if let Some(db) = db {
         if try_load_from_db(meta, lyric_state, last_unsynced, state, db) {
+            // Set correct index immediately after loading from DB
+            lyric_state.index = lyric_state.get_index(position);
             return;
         }
     }
     try_fetch_from_api_and_save(meta, lyric_state, last_unsynced, state, db, db_path).await;
+    // Set correct index after fetching from API
+    lyric_state.index = lyric_state.get_index(position);
 }
 
 /// Sends an update to the UI channel.
@@ -216,7 +213,7 @@ async fn send_update(
 fn set_lyric_state(
     lyric_state: &mut LyricState,
     lines: Vec<LyricLine>,
-    index: usize,
+    index: usize, // unused, always recalculate
     last_unsynced: &mut Option<String>,
     unsynced: Option<String>,
     state: &mut PlayerState,
@@ -253,9 +250,6 @@ struct Debouncer {
 impl Debouncer {
     fn new(duration: Duration) -> Self {
         Self { sleep: None, duration }
-    }
-    fn set_duration(&mut self, duration: Duration) {
-        self.duration = duration;
     }
     fn start(&mut self) {
         self.sleep = Some(Box::pin(sleep(self.duration)));
@@ -336,8 +330,9 @@ pub async fn listen(
                 }
             }, if debouncer.is_active() => {
                 if let Some(meta) = pending_meta.take() {
-                    fetch_and_update_lyrics(&meta, &mut lyric_state, &mut last_unsynced, &mut state, db.as_ref(), db_path.as_deref()).await;
-                    lyric_state.index = lyric_state.get_index(state.position);
+                    let position = state.position;
+                    fetch_and_update_lyrics(&meta, &mut lyric_state, &mut last_unsynced, &mut state, db.as_ref(), db_path.as_deref(), position).await;
+                    // lyric_state.index is already set correctly
                     send_update(&update_tx, &lyric_state, &state, &last_unsynced).await;
                 }
                 debouncer.clear();
