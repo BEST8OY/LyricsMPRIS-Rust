@@ -7,7 +7,8 @@ mod lyricsdb;
 use clap::Parser;
 use std::time::Duration;
 use std::error::Error;
-use std::sync::{Arc, Mutex};
+use tokio::sync::Mutex;
+use std::sync::Arc;
 
 /// Application configuration from CLI
 #[derive(Parser, Debug)]
@@ -25,7 +26,7 @@ struct Config {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cfg = Config::parse();
     let poll_interval = Duration::from_millis(cfg.poll);
     let db_path = cfg.database.clone();

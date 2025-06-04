@@ -30,7 +30,7 @@ struct LrcLibResp {
 }
 
 /// Fetch lyrics from lrclib for a given artist and title.
-pub async fn fetch_lyrics_from_lrclib(artist: &str, title: &str) -> Result<(String, String), Box<dyn Error>> {
+pub async fn fetch_lyrics_from_lrclib(artist: &str, title: &str) -> Result<(String, String), Box<dyn Error + Send + Sync>> {
     let client = Client::new();
     let url = format!(
         "https://lrclib.net/api/get?artist_name={}&track_name={}",

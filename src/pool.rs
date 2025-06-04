@@ -3,9 +3,9 @@
 use crate::lyrics::LyricLine;
 use crate::mpris;
 use crate::lyricsdb::LyricsDB;
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
-use std::sync::{Arc, Mutex};
-use tokio::time::{Duration, Instant};
+use tokio::sync::{mpsc, Mutex};
+use std::sync::Arc;
+use tokio::time::{Duration};
 
 /// Represents a UI update for lyrics and player state.
 #[derive(Debug, Clone, Default)]
@@ -62,56 +62,39 @@ fn update_player_state(state: &mut PlayerState, meta: &crate::mpris::TrackMetada
 }
 
 // Helper to try loading lyrics from DB
-fn try_load_from_db(
+async fn try_load_from_db(
     meta: &crate::mpris::TrackMetadata,
     lyric_state: &mut LyricState,
     last_unsynced: &mut Option<String>,
     state: &mut PlayerState,
     db: &Arc<Mutex<LyricsDB>>,
 ) -> bool {
-    match db.lock() {
-        Ok(guard) => {
-            if let Some(synced) = guard.get(&meta.artist, &meta.title) {
-                set_lyric_state(
-                    lyric_state,
-                    crate::lyrics::parse_synced_lyrics(&synced),
-                    0,
-                    last_unsynced,
-                    None,
-                    state,
-                    meta,
-                    None,
-                );
-                return true;
-            } else {
-                // Not found in DB, clear state and return false to trigger API fetch
-                set_lyric_state(
-                    lyric_state,
-                    Vec::new(),
-                    0,
-                    last_unsynced,
-                    None,
-                    state,
-                    meta,
-                    None,
-                );
-                return false;
-            }
-        }
-        Err(e) => {
-            eprintln!("[LyricsMPRIS] DB error: {}", e); // Log DB error
-            set_lyric_state(
-                lyric_state,
-                Vec::new(),
-                0,
-                last_unsynced,
-                None,
-                state,
-                meta,
-                Some(format!("DB error: {}", e)),
-            );
-            return true;
-        }
+    let guard = db.lock().await;
+    if let Some(synced) = guard.get(&meta.artist, &meta.title) {
+        set_lyric_state(
+            lyric_state,
+            crate::lyrics::parse_synced_lyrics(&synced),
+            0,
+            last_unsynced,
+            None,
+            state,
+            meta,
+            None,
+        );
+        true
+    } else {
+        // Not found in DB, clear state and return false to trigger API fetch
+        set_lyric_state(
+            lyric_state,
+            Vec::new(),
+            0,
+            last_unsynced,
+            None,
+            state,
+            meta,
+            None,
+        );
+        false
     }
 }
 
@@ -137,10 +120,9 @@ async fn try_fetch_from_api_and_save(
                 None,
             );
             if let (Some(db), Some(path)) = (db, db_path) {
-                if let Ok(mut guard) = db.lock() {
-                    guard.insert(&meta.artist, &meta.title, &synced);
-                    let _ = guard.save(path);
-                }
+                let mut guard = db.lock().await;
+                guard.insert(&meta.artist, &meta.title, &synced);
+                let _ = guard.save(path);
             }
         }
         Ok((plain, _synced)) => {
@@ -183,7 +165,7 @@ async fn fetch_and_update_lyrics(
     position: f64, // <-- add position argument
 ) {
     if let Some(db) = db {
-        if try_load_from_db(meta, lyric_state, last_unsynced, state, db) {
+        if try_load_from_db(meta, lyric_state, last_unsynced, state, db).await {
             // Set correct index immediately after loading from DB
             lyric_state.index = lyric_state.get_index(position);
             return;
@@ -254,10 +236,8 @@ pub async fn listen(
     let mut last_unsynced: Option<String> = None;
     let (event_tx, mut event_rx) = mpsc::channel(8);
 
-    // Rate limit state
-    let rate_limit = Duration::from_secs(2);
-    let mut last_api_call = Instant::now() - rate_limit;
-    let latest_meta = Arc::new(AsyncMutex::new(None));
+    // Use Mutex from tokio::sync for latest_meta
+    let latest_meta = Arc::new(Mutex::new(None));
 
     // Spawn event-based listener for MPRIS property changes
     let event_tx_clone = event_tx.clone();
@@ -295,17 +275,12 @@ pub async fn listen(
                 }
             }
             _ = tokio::time::sleep(poll_interval) => {
-                // Check if we need to fetch new lyrics (rate-limited)
-                let now = Instant::now();
-                if now.duration_since(last_api_call) >= rate_limit {
-                    let mut guard = latest_meta.lock().await;
-                    if let Some((meta, position)) = guard.take() {
-                        fetch_and_update_lyrics(&meta, &mut lyric_state, &mut last_unsynced, &mut state, db.as_ref(), db_path.as_deref(), position).await;
-                        send_update(&update_tx, &lyric_state, &state, &last_unsynced).await;
-                        last_api_call = Instant::now();
-                    }
-                }
                 // Always update lyric index and UI
+                let mut guard = latest_meta.lock().await;
+                if let Some((meta, position)) = guard.take() {
+                    fetch_and_update_lyrics(&meta, &mut lyric_state, &mut last_unsynced, &mut state, db.as_ref(), db_path.as_deref(), position).await;
+                    send_update(&update_tx, &lyric_state, &state, &last_unsynced).await;
+                }
                 let meta = mpris::get_metadata().await.unwrap_or_default();
                 let playing = matches!(mpris::get_playback_status().await.as_deref(), Ok("Playing"));
                 let position = mpris::get_position().await.unwrap_or(0.0);

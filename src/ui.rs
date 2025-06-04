@@ -5,9 +5,10 @@ use crossterm::{execute, terminal::{enable_raw_mode, disable_raw_mode, EnterAlte
 use std::io::{self};
 use tui::{backend::CrosstermBackend, Terminal, widgets::{Paragraph}, text::{Span, Spans}, layout::{Alignment}};
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use std::time::Duration;
 use crate::lyricsdb::LyricsDB;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Utility functions for text formatting
 mod text_utils {
@@ -51,7 +52,7 @@ pub async fn display_lyrics_pipe(
     poll_interval: Duration,
     db: Option<Arc<Mutex<LyricsDB>>>,
     db_path: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, mut rx) = mpsc::channel(32);
     let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
     tokio::spawn(crate::pool::listen(tx, poll_interval, db.clone(), db_path.clone(), shutdown_rx));
@@ -80,15 +81,15 @@ pub async fn display_lyrics_modern(
     poll_interval: Duration,
     db: Option<Arc<Mutex<LyricsDB>>>,
     db_path: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, mut rx) = mpsc::channel(32);
     let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
     tokio::spawn(crate::pool::listen(tx, poll_interval, db.clone(), db_path.clone(), shutdown_rx));
-    enable_raw_mode()?;
+    enable_raw_mode().map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen).map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = Terminal::new(backend).map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
     let mut last_update: Option<Update> = None;
     let mut cached_lines: Option<Vec<String>> = None;
     let style_before = tui::style::Style::default().add_modifier(tui::style::Modifier::ITALIC | tui::style::Modifier::DIM);
@@ -133,7 +134,7 @@ pub async fn display_lyrics_modern(
             }
             maybe_event = tokio::task::spawn_blocking(|| crossterm::event::poll(std::time::Duration::from_millis(100))) => {
                 if let Ok(Ok(true)) = maybe_event {
-                    let event = crossterm::event::read()?;
+                    let event = crossterm::event::read().map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
                     match event {
                         Event::Key(key) => {
                             match key.code {
@@ -148,8 +149,8 @@ pub async fn display_lyrics_modern(
             }
         }
     }
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen)?;
+    disable_raw_mode().map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
+    execute!(io::stdout(), LeaveAlternateScreen).map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
     Ok(())
 }
 
@@ -161,7 +162,7 @@ fn draw_ui_with_cache<B: tui::backend::Backend>(
     style_before: tui::style::Style,
     style_current: tui::style::Style,
     style_after: tui::style::Style,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     terminal.draw(|f| {
         let size = f.size();
         let w = size.width as usize;
@@ -252,6 +253,6 @@ fn draw_ui_with_cache<B: tui::backend::Backend>(
         let paragraph = Paragraph::new(lines)
             .alignment(Alignment::Left);
         f.render_widget(paragraph, size);
-    })?;
+    }).map_err(|e| Box::<dyn std::error::Error + Send + Sync>::from(e))?;
     Ok(())
 }
