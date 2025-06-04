@@ -40,6 +40,10 @@ pub async fn fetch_lyrics_from_lrclib(artist: &str, title: &str) -> Result<(Stri
     let resp = client.get(&url)
         .header("User-Agent", "LyricsMPRIS/1.0")
         .send().await?;
+    if resp.status().as_u16() == 404 {
+        // No lyrics found, not an error
+        return Ok((String::new(), String::new()));
+    }
     if !resp.status().is_success() {
         return Err(format!("lrclib: unexpected status {}", resp.status()).into());
     }
