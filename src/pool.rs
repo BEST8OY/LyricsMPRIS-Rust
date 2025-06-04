@@ -55,10 +55,10 @@ impl LyricState {
         0
     }
 
-    fn clear(&mut self) {
-        self.lines.clear();
-        self.index = 0;
-    }
+    // fn clear(&mut self) {
+    //     self.lines.clear();
+    //     self.index = 0;
+    // }
 }
 
 // Helper to update player state
@@ -81,25 +81,44 @@ fn try_load_from_db(
     match db.lock() {
         Ok(guard) => {
             if let Some(synced) = guard.get(&meta.artist, &meta.title) {
-                lyric_state.lines = crate::lyrics::parse_synced_lyrics(&synced);
-                lyric_state.index = 0;
-                *last_unsynced = None;
-                update_player_state(state, meta);
+                set_lyric_state(
+                    lyric_state,
+                    crate::lyrics::parse_synced_lyrics(&synced),
+                    0,
+                    last_unsynced,
+                    None,
+                    state,
+                    meta,
+                    None,
+                );
                 return true;
             } else {
-                lyric_state.clear();
-                lyric_state.index = 0;
-                *last_unsynced = None;
-                update_player_state(state, meta);
-                return true;
+                // Not found in DB, clear state and return false to trigger API fetch
+                set_lyric_state(
+                    lyric_state,
+                    Vec::new(),
+                    0,
+                    last_unsynced,
+                    None,
+                    state,
+                    meta,
+                    None,
+                );
+                return false;
             }
         }
         Err(e) => {
-            lyric_state.clear();
-            lyric_state.index = 0;
-            *last_unsynced = None;
-            state.err = Some(format!("DB error: {}", e));
-            update_player_state(state, meta);
+            eprintln!("[LyricsMPRIS] DB error: {}", e); // Log DB error
+            set_lyric_state(
+                lyric_state,
+                Vec::new(),
+                0,
+                last_unsynced,
+                None,
+                state,
+                meta,
+                Some(format!("DB error: {}", e)),
+            );
             return true;
         }
     }
@@ -112,33 +131,51 @@ async fn try_fetch_from_api_and_save(
     last_unsynced: &mut Option<String>,
     state: &mut PlayerState,
     db: Option<&Arc<Mutex<LyricsDB>>>,
-    db_path: Option<&String>,
+    db_path: Option<&str>,
 ) {
     match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title).await {
         Ok((_, synced)) if !synced.is_empty() => {
-            lyric_state.lines = crate::lyrics::parse_synced_lyrics(&synced);
-            lyric_state.index = 0;
-            *last_unsynced = None;
+            set_lyric_state(
+                lyric_state,
+                crate::lyrics::parse_synced_lyrics(&synced),
+                0,
+                last_unsynced,
+                None,
+                state,
+                meta,
+                None,
+            );
             if let (Some(db), Some(path)) = (db, db_path) {
                 if let Ok(mut guard) = db.lock() {
                     guard.insert(&meta.artist, &meta.title, &synced);
                     let _ = guard.save(path);
                 }
             }
-            update_player_state(state, meta);
         }
         Ok((plain, _)) => {
-            lyric_state.clear();
-            lyric_state.index = 0;
-            *last_unsynced = Some(plain);
-            update_player_state(state, meta);
+            set_lyric_state(
+                lyric_state,
+                Vec::new(),
+                0,
+                last_unsynced,
+                Some(plain),
+                state,
+                meta,
+                None,
+            );
         }
         Err(e) => {
-            lyric_state.clear();
-            lyric_state.index = 0;
-            *last_unsynced = None;
-            state.err = Some(e.to_string());
-            update_player_state(state, meta);
+            eprintln!("[LyricsMPRIS] API error: {}", e); // Log API error
+            set_lyric_state(
+                lyric_state,
+                Vec::new(),
+                0,
+                last_unsynced,
+                None,
+                state,
+                meta,
+                Some(e.to_string()),
+            );
         }
     }
 }
@@ -150,7 +187,7 @@ async fn fetch_and_update_lyrics(
     last_unsynced: &mut Option<String>,
     state: &mut PlayerState,
     db: Option<&Arc<Mutex<LyricsDB>>>,
-    db_path: Option<&String>,
+    db_path: Option<&str>,
 ) {
     if let Some(db) = db {
         if try_load_from_db(meta, lyric_state, last_unsynced, state, db) {
@@ -175,12 +212,75 @@ async fn send_update(
     }).await;
 }
 
+/// Helper to update lyric and player state in a consistent way
+fn set_lyric_state(
+    lyric_state: &mut LyricState,
+    lines: Vec<LyricLine>,
+    index: usize,
+    last_unsynced: &mut Option<String>,
+    unsynced: Option<String>,
+    state: &mut PlayerState,
+    meta: &crate::mpris::TrackMetadata,
+    err: Option<String>,
+) {
+    lyric_state.lines = lines;
+    lyric_state.index = index;
+    *last_unsynced = unsynced;
+    state.err = err;
+    update_player_state(state, meta);
+}
+
+/// Helper to update lyric index and send UI update if needed
+async fn update_lyric_index_and_send(
+    update_tx: &mpsc::Sender<Update>,
+    lyric_state: &mut LyricState,
+    state: &PlayerState,
+    last_unsynced: &Option<String>,
+    new_index: usize,
+) {
+    if new_index != lyric_state.index {
+        lyric_state.index = new_index;
+        send_update(update_tx, lyric_state, state, last_unsynced).await;
+    }
+}
+
+// Debounce helper struct
+struct Debouncer {
+    sleep: Option<Pin<Box<Sleep>>>,
+    duration: Duration,
+}
+
+impl Debouncer {
+    fn new(duration: Duration) -> Self {
+        Self { sleep: None, duration }
+    }
+    fn set_duration(&mut self, duration: Duration) {
+        self.duration = duration;
+    }
+    fn start(&mut self) {
+        self.sleep = Some(Box::pin(sleep(self.duration)));
+    }
+    fn is_active(&self) -> bool {
+        self.sleep.is_some()
+    }
+    async fn wait(&mut self) {
+        if let Some(ref mut sleep_fut) = self.sleep {
+            sleep_fut.as_mut().await;
+        }
+        self.sleep = None;
+    }
+    fn clear(&mut self) {
+        self.sleep = None;
+    }
+}
+
 /// Listens for player and lyric updates, sending them to the update channel.
 pub async fn listen(
     update_tx: mpsc::Sender<Update>,
     poll_interval: Duration,
     db: Option<Arc<Mutex<LyricsDB>>>,
     db_path: Option<String>,
+    mut shutdown_rx: mpsc::Receiver<()>,
 ) {
     let mut state = PlayerState::default();
     let mut lyric_state = LyricState::default();
@@ -189,8 +289,8 @@ pub async fn listen(
 
     // Debounce state for track changes
     let mut pending_meta: Option<crate::mpris::TrackMetadata> = None;
-    let mut debounce_sleep: Option<Pin<Box<Sleep>>> = None;
-    let debounce_duration = Duration::from_millis(500);
+    // Debounce duration is now configurable via poll_interval (or set as needed)
+    let mut debouncer = Debouncer::new(Duration::from_millis(500));
 
     // Spawn event-based listener for MPRIS property changes
     let event_tx_clone = event_tx.clone();
@@ -207,63 +307,62 @@ pub async fn listen(
 
     loop {
         tokio::select! {
+            _ = shutdown_rx.recv() => {
+                break;
+            }
             Some((meta, position, is_track_change)) = event_rx.recv() => {
                 let changed = meta.title != state.title || meta.artist != state.artist || meta.album != state.album;
                 if is_track_change && changed {
-                    // Debounce: store meta and reset timer
                     pending_meta = Some(meta.clone());
-                    debounce_sleep = Some(Box::pin(sleep(debounce_duration)));
+                    debouncer.start();
                 }
                 state.playing = true;
                 state.position = position;
                 let new_index = lyric_state.get_index(state.position);
-                let index_changed = new_index != lyric_state.index;
+                // Use helper to reduce duplication
                 if changed {
                     lyric_state.index = new_index;
                     send_update(&update_tx, &lyric_state, &state, &last_unsynced).await;
-                } else if index_changed {
-                    lyric_state.index = new_index;
-                    send_update(&update_tx, &lyric_state, &state, &last_unsynced).await;
+                } else {
+                    update_lyric_index_and_send(&update_tx, &mut lyric_state, &state, &last_unsynced, new_index).await;
                 }
             }
-            // Debounce timer fires: fetch lyrics for last pending meta
             _ = async {
-                if let Some(ref mut sleep_fut) = debounce_sleep {
-                    sleep_fut.as_mut().await;
+                if debouncer.is_active() {
+                    debouncer.wait().await;
                     true
                 } else {
                     false
                 }
-            }, if debounce_sleep.is_some() => {
+            }, if debouncer.is_active() => {
                 if let Some(meta) = pending_meta.take() {
-                    fetch_and_update_lyrics(&meta, &mut lyric_state, &mut last_unsynced, &mut state, db.as_ref(), db_path.as_ref()).await;
+                    fetch_and_update_lyrics(&meta, &mut lyric_state, &mut last_unsynced, &mut state, db.as_ref(), db_path.as_deref()).await;
                     lyric_state.index = lyric_state.get_index(state.position);
                     send_update(&update_tx, &lyric_state, &state, &last_unsynced).await;
                 }
-                debounce_sleep = None;
+                debouncer.clear();
             }
             _ = tokio::time::sleep(poll_interval) => {
-                // Fallback polling (for robustness)
                 let meta = mpris::get_metadata().await.unwrap_or_default();
                 let playing = matches!(mpris::get_playback_status().await.as_deref(), Ok("Playing"));
                 let position = mpris::get_position().await.unwrap_or(0.0);
                 let changed = meta.title != state.title || meta.artist != state.artist || meta.album != state.album;
                 if changed && playing {
-                    // Debounce polling as well
                     pending_meta = Some(meta.clone());
-                    debounce_sleep = Some(Box::pin(sleep(debounce_duration)));
+                    debouncer.start();
                 }
                 state.playing = playing;
                 state.position = position;
                 let new_index = lyric_state.get_index(state.position);
-                let index_changed = new_index != lyric_state.index;
+                // Use helper to reduce duplication
                 if changed {
                     lyric_state.index = new_index;
                     send_update(&update_tx, &lyric_state, &state, &last_unsynced).await;
-                } else if index_changed {
-                    lyric_state.index = new_index;
-                    send_update(&update_tx, &lyric_state, &state, &last_unsynced).await;
-                } else if state.err.is_some() || last_unsynced.is_some() {
+                } else {
+                    update_lyric_index_and_send(&update_tx, &mut lyric_state, &state, &last_unsynced, new_index).await;
+                }
+                // Always send update if error or unsynced lyrics present
+                if state.err.is_some() || last_unsynced.is_some() {
                     send_update(&update_tx, &lyric_state, &state, &last_unsynced).await;
                 }
             }

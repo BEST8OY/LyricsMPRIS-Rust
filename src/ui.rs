@@ -53,7 +53,8 @@ pub async fn display_lyrics_pipe(
     db_path: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (tx, mut rx) = mpsc::channel(32);
-    tokio::spawn(crate::pool::listen(tx, poll_interval, db.clone(), db_path.clone()));
+    let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    tokio::spawn(crate::pool::listen(tx, poll_interval, db.clone(), db_path.clone(), shutdown_rx));
     let mut last_line_idx = None;
     while let Some(upd) = rx.recv().await {
         // If new track and no lyrics, reset state but do not print any message
@@ -81,7 +82,8 @@ pub async fn display_lyrics_modern(
     db_path: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (tx, mut rx) = mpsc::channel(32);
-    tokio::spawn(crate::pool::listen(tx, poll_interval, db.clone(), db_path.clone()));
+    let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
+    tokio::spawn(crate::pool::listen(tx, poll_interval, db.clone(), db_path.clone(), shutdown_rx));
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
