@@ -111,6 +111,10 @@ pub async fn display_lyrics_modern(
                             cached_lines = None;
                             last_update = None;
                         }
+                        // If we have unsynced lyrics, set last_update so UI can show them
+                        if update.unsynced.is_some() && update.err.is_none() {
+                            last_update = Some(update);
+                        }
                         draw_ui_with_cache(&mut terminal, &last_update, &cached_lines, style_before, style_current, style_after)?;
                         last_track_id = Some(track_id);
                         continue;
@@ -224,12 +228,20 @@ fn draw_ui_with_cache<B: tui::backend::Backend>(
                 if !unsynced.trim().is_empty() {
                     let pad_top = h / 2 - 1;
                     lines.extend((0..pad_top).map(|_| Spans::from(Span::raw(""))));
-                    let unsynced_lines = vec![
-                        "--- Unsynced Lyrics ---",
-                        unsynced,
-                        "----------------------",
-                    ];
+                    let unsynced_lines = vec!["--- Unsynced Lyrics ---"];
                     for l in unsynced_lines {
+                        for wrapped in wrap_text(l, w) {
+                            lines.push(Spans::from(Span::styled(pad_centered(&wrapped, w), style_current)));
+                        }
+                    }
+                    // Show unsynced lyrics using parse_plain_lyrics from lyrics.rs
+                    for lyric_line in crate::lyrics::parse_plain_lyrics(unsynced) {
+                        for wrapped in wrap_text(&lyric_line, w) {
+                            lines.push(Spans::from(Span::styled(pad_centered(&wrapped, w), style_current)));
+                        }
+                    }
+                    let unsynced_footer = vec!["----------------------"];
+                    for l in unsynced_footer {
                         for wrapped in wrap_text(l, w) {
                             lines.push(Spans::from(Span::styled(pad_centered(&wrapped, w), style_current)));
                         }

@@ -26,7 +26,7 @@ pub fn is_timesynced(lines: &[LyricLine]) -> bool {
 #[allow(non_snake_case)]
 struct LrcLibResp {
     plainLyrics: String,
-    syncedLyrics: String,
+    syncedLyrics: Option<String>,
 }
 
 /// Fetch lyrics from lrclib for a given artist and title.
@@ -48,7 +48,7 @@ pub async fn fetch_lyrics_from_lrclib(artist: &str, title: &str) -> Result<(Stri
         return Err(format!("lrclib: unexpected status {}", resp.status()).into());
     }
     let api: LrcLibResp = resp.json().await?;
-    Ok((api.plainLyrics, api.syncedLyrics))
+    Ok((api.plainLyrics, api.syncedLyrics.unwrap_or_default()))
 }
 
 /// Parse time-synced lyrics into LyricLine structs.
@@ -71,4 +71,13 @@ pub fn parse_synced_lyrics(synced: &str) -> Vec<LyricLine> {
         }
     }
     lines
+}
+
+/// Parse plain (unsynced) lyrics into lines (splits on newlines, trims each line)
+pub fn parse_plain_lyrics(plain: &str) -> Vec<String> {
+    plain
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
 }
