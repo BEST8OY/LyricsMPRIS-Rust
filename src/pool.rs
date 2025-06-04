@@ -8,17 +8,12 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration, Sleep};
 use std::pin::Pin;
 
+/// Represents a UI update for lyrics and player state.
 #[derive(Debug, Clone, Default)]
 pub struct Update {
-    #[allow(dead_code)]
     pub lines: Vec<LyricLine>,
-    #[allow(dead_code)]
     pub index: usize,
-    #[allow(dead_code)]
-    pub playing: bool,
-    #[allow(dead_code)]
     pub err: Option<String>,
-    #[allow(dead_code)]
     pub unsynced: Option<String>,
 }
 
@@ -39,6 +34,7 @@ struct LyricState {
 }
 
 impl LyricState {
+    /// Returns the index of the lyric line for the given playback position.
     fn get_index(&self, position: f64) -> usize {
         if self.lines.len() <= 1 {
             return 0;
@@ -58,52 +54,125 @@ impl LyricState {
         }
         0
     }
+
+    fn clear(&mut self) {
+        self.lines.clear();
+        self.index = 0;
+    }
 }
 
-async fn update_lyric_state(meta: &crate::mpris::TrackMetadata, lyric_state: &mut LyricState, last_unsynced: &mut Option<String>, state: &mut PlayerState, db: Option<&Arc<Mutex<LyricsDB>>>, db_path: Option<&String>) {
-    // Try local DB first
-    if let Some(db) = db {
-        if let Some(synced) = db.lock().unwrap().get(&meta.artist, &meta.title) {
-            lyric_state.lines = crate::lyrics::parse_synced_lyrics(&synced);
-            *last_unsynced = None;
-            state.err = None;
-            return;
-        } else {
-            // Not found in DB: clear lyric state immediately
-            lyric_state.lines.clear();
-            lyric_state.index = 0;
-            *last_unsynced = None;
-            state.err = None;
-        }
-    }
-    // Fallback to API
-    match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title).await {
-        Ok((_, synced)) if !synced.is_empty() => {
-            lyric_state.lines = crate::lyrics::parse_synced_lyrics(&synced);
-            *last_unsynced = None;
-            // Save to DB if available
-            if let (Some(db), Some(path)) = (db, db_path) {
-                db.lock().unwrap().insert(&meta.artist, &meta.title, &synced);
-                let _ = db.lock().unwrap().save(path);
-            }
-            state.err = None;
-        }
-        Ok((plain, _)) => {
-            lyric_state.lines.clear();
-            *last_unsynced = Some(plain);
-            state.err = None;
-        }
-        Err(e) => {
-            lyric_state.lines.clear();
-            *last_unsynced = None;
-            state.err = Some(e.to_string());
-        }
-    }
-    lyric_state.index = 0;
-    state.position = 0.0;
+// Helper to update player state
+fn update_player_state(state: &mut PlayerState, meta: &crate::mpris::TrackMetadata) {
     state.title = meta.title.clone();
     state.artist = meta.artist.clone();
     state.album = meta.album.clone();
+    state.position = 0.0;
+    state.err = None;
+}
+
+// Helper to try loading lyrics from DB
+fn try_load_from_db(
+    meta: &crate::mpris::TrackMetadata,
+    lyric_state: &mut LyricState,
+    last_unsynced: &mut Option<String>,
+    state: &mut PlayerState,
+    db: &Arc<Mutex<LyricsDB>>,
+) -> bool {
+    match db.lock() {
+        Ok(guard) => {
+            if let Some(synced) = guard.get(&meta.artist, &meta.title) {
+                lyric_state.lines = crate::lyrics::parse_synced_lyrics(&synced);
+                lyric_state.index = 0;
+                *last_unsynced = None;
+                update_player_state(state, meta);
+                return true;
+            } else {
+                lyric_state.clear();
+                lyric_state.index = 0;
+                *last_unsynced = None;
+                update_player_state(state, meta);
+                return true;
+            }
+        }
+        Err(e) => {
+            lyric_state.clear();
+            lyric_state.index = 0;
+            *last_unsynced = None;
+            state.err = Some(format!("DB error: {}", e));
+            update_player_state(state, meta);
+            return true;
+        }
+    }
+}
+
+// Helper to fetch from API and optionally save to DB
+async fn try_fetch_from_api_and_save(
+    meta: &crate::mpris::TrackMetadata,
+    lyric_state: &mut LyricState,
+    last_unsynced: &mut Option<String>,
+    state: &mut PlayerState,
+    db: Option<&Arc<Mutex<LyricsDB>>>,
+    db_path: Option<&String>,
+) {
+    match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title).await {
+        Ok((_, synced)) if !synced.is_empty() => {
+            lyric_state.lines = crate::lyrics::parse_synced_lyrics(&synced);
+            lyric_state.index = 0;
+            *last_unsynced = None;
+            if let (Some(db), Some(path)) = (db, db_path) {
+                if let Ok(mut guard) = db.lock() {
+                    guard.insert(&meta.artist, &meta.title, &synced);
+                    let _ = guard.save(path);
+                }
+            }
+            update_player_state(state, meta);
+        }
+        Ok((plain, _)) => {
+            lyric_state.clear();
+            lyric_state.index = 0;
+            *last_unsynced = Some(plain);
+            update_player_state(state, meta);
+        }
+        Err(e) => {
+            lyric_state.clear();
+            lyric_state.index = 0;
+            *last_unsynced = None;
+            state.err = Some(e.to_string());
+            update_player_state(state, meta);
+        }
+    }
+}
+
+/// Attempts to update the lyric state for the given track metadata.
+async fn fetch_and_update_lyrics(
+    meta: &crate::mpris::TrackMetadata,
+    lyric_state: &mut LyricState,
+    last_unsynced: &mut Option<String>,
+    state: &mut PlayerState,
+    db: Option<&Arc<Mutex<LyricsDB>>>,
+    db_path: Option<&String>,
+) {
+    if let Some(db) = db {
+        if try_load_from_db(meta, lyric_state, last_unsynced, state, db) {
+            return;
+        }
+    }
+    try_fetch_from_api_and_save(meta, lyric_state, last_unsynced, state, db, db_path).await;
+}
+
+/// Sends an update to the UI channel.
+async fn send_update(
+    update_tx: &mpsc::Sender<Update>,
+    lyric_state: &LyricState,
+    state: &PlayerState,
+    last_unsynced: &Option<String>,
+) {
+    let _ = update_tx.send(Update {
+        lines: lyric_state.lines.clone(),
+        index: lyric_state.index,
+        err: state.err.clone(),
+        unsynced: last_unsynced.clone(),
+    }).await;
 }
 
 /// Listens for player and lyric updates, sending them to the update channel.
@@ -121,7 +190,7 @@ pub async fn listen(
     // Debounce state for track changes
     let mut pending_meta: Option<crate::mpris::TrackMetadata> = None;
     let mut debounce_sleep: Option<Pin<Box<Sleep>>> = None;
-    let debounce_duration = Duration::from_millis(500); // adjust as needed
+    let debounce_duration = Duration::from_millis(500);
 
     // Spawn event-based listener for MPRIS property changes
     let event_tx_clone = event_tx.clone();
@@ -151,22 +220,10 @@ pub async fn listen(
                 let index_changed = new_index != lyric_state.index;
                 if changed {
                     lyric_state.index = new_index;
-                    let _ = update_tx.send(Update {
-                        lines: lyric_state.lines.clone(),
-                        index: lyric_state.index,
-                        playing: state.playing,
-                        err: state.err.clone(),
-                        unsynced: last_unsynced.clone(),
-                    }).await;
+                    send_update(&update_tx, &lyric_state, &state, &last_unsynced).await;
                 } else if index_changed {
                     lyric_state.index = new_index;
-                    let _ = update_tx.send(Update {
-                        lines: Vec::new(),
-                        index: lyric_state.index,
-                        playing: state.playing,
-                        err: None,
-                        unsynced: None,
-                    }).await;
+                    send_update(&update_tx, &lyric_state, &state, &last_unsynced).await;
                 }
             }
             // Debounce timer fires: fetch lyrics for last pending meta
@@ -179,16 +236,9 @@ pub async fn listen(
                 }
             }, if debounce_sleep.is_some() => {
                 if let Some(meta) = pending_meta.take() {
-                    update_lyric_state(&meta, &mut lyric_state, &mut last_unsynced, &mut state, db.as_ref(), db_path.as_ref()).await;
+                    fetch_and_update_lyrics(&meta, &mut lyric_state, &mut last_unsynced, &mut state, db.as_ref(), db_path.as_ref()).await;
                     lyric_state.index = lyric_state.get_index(state.position);
-                    // Always send update after track change, even if no lyrics
-                    let _ = update_tx.send(Update {
-                        lines: lyric_state.lines.clone(),
-                        index: lyric_state.index,
-                        playing: state.playing,
-                        err: state.err.clone(),
-                        unsynced: last_unsynced.clone(),
-                    }).await;
+                    send_update(&update_tx, &lyric_state, &state, &last_unsynced).await;
                 }
                 debounce_sleep = None;
             }
@@ -209,30 +259,12 @@ pub async fn listen(
                 let index_changed = new_index != lyric_state.index;
                 if changed {
                     lyric_state.index = new_index;
-                    let _ = update_tx.send(Update {
-                        lines: lyric_state.lines.clone(),
-                        index: lyric_state.index,
-                        playing: state.playing,
-                        err: state.err.clone(),
-                        unsynced: last_unsynced.clone(),
-                    }).await;
+                    send_update(&update_tx, &lyric_state, &state, &last_unsynced).await;
                 } else if index_changed {
                     lyric_state.index = new_index;
-                    let _ = update_tx.send(Update {
-                        lines: Vec::new(),
-                        index: lyric_state.index,
-                        playing: state.playing,
-                        err: None,
-                        unsynced: None,
-                    }).await;
+                    send_update(&update_tx, &lyric_state, &state, &last_unsynced).await;
                 } else if state.err.is_some() || last_unsynced.is_some() {
-                    let _ = update_tx.send(Update {
-                        lines: lyric_state.lines.clone(),
-                        index: lyric_state.index,
-                        playing: state.playing,
-                        err: state.err.clone(),
-                        unsynced: last_unsynced.clone(),
-                    }).await;
+                    send_update(&update_tx, &lyric_state, &state, &last_unsynced).await;
                 }
             }
         }
