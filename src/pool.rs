@@ -68,6 +68,12 @@ async fn update_lyric_state(meta: &crate::mpris::TrackMetadata, lyric_state: &mu
             *last_unsynced = None;
             state.err = None;
             return;
+        } else {
+            // Not found in DB: clear lyric state immediately
+            lyric_state.lines.clear();
+            lyric_state.index = 0;
+            *last_unsynced = None;
+            state.err = None;
         }
     }
     // Fallback to API
@@ -175,6 +181,7 @@ pub async fn listen(
                 if let Some(meta) = pending_meta.take() {
                     update_lyric_state(&meta, &mut lyric_state, &mut last_unsynced, &mut state, db.as_ref(), db_path.as_ref()).await;
                     lyric_state.index = lyric_state.get_index(state.position);
+                    // Always send update after track change, even if no lyrics
                     let _ = update_tx.send(Update {
                         lines: lyric_state.lines.clone(),
                         index: lyric_state.index,

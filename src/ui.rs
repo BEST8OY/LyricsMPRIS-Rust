@@ -42,7 +42,19 @@ pub async fn display_lyrics_pipe(_meta: crate::mpris::TrackMetadata, _pos: f64, 
     tokio::spawn(crate::pool::listen(tx, poll_interval, db.clone(), db_path.clone()));
     let mut last_line_idx = None;
     while let Some(upd) = rx.recv().await {
-        if upd.err.is_some() || upd.lines.is_empty() { continue; }
+        // Identify track by (title, artist, album)
+        let _track_id = (
+            upd.lines.get(0).map(|_| "has_lyrics").unwrap_or("no_lyrics").to_string(),
+            upd.err.clone().unwrap_or_default(),
+            upd.unsynced.clone().unwrap_or_default(),
+        );
+        // If new track and no lyrics, reset state but do not print any message
+        if upd.lines.is_empty() && (upd.err.is_some() || upd.unsynced.is_some() || (upd.err.is_none() && upd.unsynced.is_none())) {
+            last_line_idx = None;
+            // Do not print or show any message in UI when no lyrics
+            continue;
+        }
+        if upd.err.is_some() { continue; }
         if Some(upd.index) != last_line_idx {
             println!("{}", upd.lines[upd.index].text);
             last_line_idx = Some(upd.index);
@@ -64,19 +76,34 @@ pub async fn display_lyrics_modern(_meta: crate::mpris::TrackMetadata, _pos: f64
     let style_before = tui::style::Style::default().add_modifier(tui::style::Modifier::ITALIC | tui::style::Modifier::DIM);
     let style_current = tui::style::Style::default().fg(tui::style::Color::Green).add_modifier(tui::style::Modifier::BOLD);
     let style_after = tui::style::Style::default();
+    let mut last_track_id: Option<(String, String, String)> = None;
     loop {
         tokio::select! {
             update = rx.recv() => {
                 if let Some(update) = update {
-                    // If lines is empty, reuse cached lines
+                    let track_id = (
+                        update.lines.get(0).map(|_| "has_lyrics").unwrap_or("no_lyrics").to_string(),
+                        update.err.clone().unwrap_or_default(),
+                        update.unsynced.clone().unwrap_or_default(),
+                    );
+                    // If new track and no lyrics, clear cache but do NOT show any message
+                    if update.lines.is_empty() && (update.err.is_some() || update.unsynced.is_some() || (update.err.is_none() && update.unsynced.is_none())) {
+                        if last_track_id.as_ref() != Some(&track_id) {
+                            cached_lines = None;
+                            last_update = None; // Do not set update, so UI stays blank
+                        }
+                        draw_ui_with_cache(&mut terminal, &last_update, &cached_lines, style_before, style_current, style_after)?;
+                        last_track_id = Some(track_id);
+                        continue;
+                    }
                     if !update.lines.is_empty() {
                         cached_lines = Some(update.lines.iter().map(|l| l.text.clone()).collect());
                         last_update = Some(update);
                     } else if let Some(ref mut upd) = last_update {
-                        // Only index changed, update index but reuse lines
                         upd.index = update.index;
                     }
                     draw_ui_with_cache(&mut terminal, &last_update, &cached_lines, style_before, style_current, style_after)?;
+                    last_track_id = Some(track_id);
                 } else {
                     break;
                 }
@@ -118,6 +145,7 @@ fn draw_ui_with_cache<B: tui::backend::Backend>(
         let mut lines = Vec::new();
         if let Some(update) = last_update {
             if let Some(ref err) = update.err {
+                // Show error message as before
                 let pad_top = h / 2;
                 lines.extend((0..pad_top).map(|_| Spans::from(Span::raw(""))));
                 for wrapped in wrap_text(err, w) {
@@ -193,29 +221,10 @@ fn draw_ui_with_cache<B: tui::backend::Backend>(
                             lines.push(Spans::from(Span::styled(pad_centered(&wrapped, w), style_current)));
                         }
                     }
-                } else {
-                    let pad_top = h / 2;
-                    lines.extend((0..pad_top).map(|_| Spans::from(Span::raw(""))));
-                    let msg = "No lyrics found for this track.";
-                    for wrapped in wrap_text(msg, w) {
-                        lines.push(Spans::from(Span::styled(pad_centered(&wrapped, w), style_current)));
-                    }
-                }
-            } else {
-                let pad_top = h / 2;
-                lines.extend((0..pad_top).map(|_| Spans::from(Span::raw(""))));
-                let msg = "No lyrics found for this track.";
-                for wrapped in wrap_text(msg, w) {
-                    lines.push(Spans::from(Span::styled(pad_centered(&wrapped, w), style_current)));
-                }
-            }
+                } // else: do not show any message if unsynced is empty
+            } // else: do not show any message if no lyrics, no error, no unsynced
         } else {
-            let pad_top = h / 2;
-            lines.extend((0..pad_top).map(|_| Spans::from(Span::raw(""))));
-            let msg = "Waiting for lyrics...";
-            for wrapped in wrap_text(msg, w) {
-                lines.push(Spans::from(Span::raw(pad_centered(&wrapped, w))));
-            }
+            // Show nothing while waiting for lyrics (blank screen)
         }
         let paragraph = Paragraph::new(lines)
             .alignment(Alignment::Left);
