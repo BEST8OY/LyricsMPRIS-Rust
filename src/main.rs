@@ -3,6 +3,7 @@ mod mpris;
 mod pool;
 mod ui;
 mod lyricsdb;
+mod text_utils;
 
 use clap::Parser;
 use std::time::Duration;
