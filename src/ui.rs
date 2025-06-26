@@ -3,13 +3,11 @@
 use crate::pool::Update;
 use crossterm::{execute, terminal::{enable_raw_mode, disable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen}, event::{Event, KeyCode}};
 use std::io::{self};
-use tui::{backend::CrosstermBackend, Terminal, widgets::{Paragraph}, text::{Span, Spans}, layout::{Alignment}};
-use tokio::sync::mpsc;
-use tokio::sync::Mutex;
+use tui::{backend::CrosstermBackend, Terminal, widgets::Paragraph, text::{Span, Spans}, layout::Alignment};
+use tokio::sync::{mpsc, Mutex};
 use std::time::Duration;
 use crate::lyricsdb::LyricsDB;
 use std::sync::Arc;
-
 use crate::text_utils::{pad_centered, wrap_text};
 
 /// Display lyrics in pipe mode (stdout only, for scripting)
@@ -19,13 +17,13 @@ pub async fn display_lyrics_pipe(
     poll_interval: Duration,
     db: Option<Arc<Mutex<LyricsDB>>>,
     db_path: Option<String>,
+    mpris_config: crate::Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, mut rx) = mpsc::channel(32);
     let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
-    tokio::spawn(crate::pool::listen(tx, poll_interval, db.clone(), db_path.clone(), shutdown_rx));
+    tokio::spawn(crate::pool::listen(tx, poll_interval, db.clone(), db_path.clone(), shutdown_rx, mpris_config.clone()));
     let mut last_line_idx = None;
     while let Some(upd) = rx.recv().await {
-        // If new track and no lyrics, reset state but do not print any message
         if upd.lines.is_empty() && (upd.err.is_some() || upd.unsynced.is_some() || (upd.err.is_none() && upd.unsynced.is_none())) {
             last_line_idx = None;
             continue;
@@ -48,10 +46,11 @@ pub async fn display_lyrics_modern(
     poll_interval: Duration,
     db: Option<Arc<Mutex<LyricsDB>>>,
     db_path: Option<String>,
+    mpris_config: crate::Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, mut rx) = mpsc::channel(32);
     let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
-    tokio::spawn(crate::pool::listen(tx, poll_interval, db.clone(), db_path.clone(), shutdown_rx));
+    tokio::spawn(crate::pool::listen(tx, poll_interval, db.clone(), db_path.clone(), shutdown_rx, mpris_config.clone()));
     enable_raw_mode().map_err(to_boxed_err)?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).map_err(to_boxed_err)?;
@@ -59,11 +58,7 @@ pub async fn display_lyrics_modern(
     let mut terminal = Terminal::new(backend).map_err(to_boxed_err)?;
     let mut last_update: Option<Update> = None;
     let mut cached_lines: Option<Vec<String>> = None;
-    let styles = LyricStyles {
-        before: tui::style::Style::default().add_modifier(tui::style::Modifier::ITALIC | tui::style::Modifier::DIM),
-        current: tui::style::Style::default().fg(tui::style::Color::Green).add_modifier(tui::style::Modifier::BOLD),
-        after: tui::style::Style::default(),
-    };
+    let styles = LyricStyles::default();
     let mut last_track_id: Option<(String, String, String)> = None;
     let mut should_exit = false;
     while !should_exit {
@@ -75,15 +70,20 @@ pub async fn display_lyrics_modern(
                         update.err.clone().unwrap_or_default(),
                         update.unsynced.clone().unwrap_or_default(),
                     );
-                    // If new track and no lyrics, clear cache but do NOT show any message
                     if update.lines.is_empty() && (update.err.is_some() || update.unsynced.is_some() || (update.err.is_none() && update.unsynced.is_none())) {
                         if last_track_id.as_ref() != Some(&track_id) {
                             cached_lines = None;
                             last_update = None;
                         }
-                        // If we have unsynced lyrics, set last_update so UI can show them
                         if update.unsynced.is_some() && update.err.is_none() {
-                            last_update = Some(update);
+                            last_update = Some(update.clone());
+                        }
+                        if let Some(ref upd_err) = update.err {
+                            if upd_err.contains("MprisError") || upd_err.contains("LyricsError") {
+                                draw_ui_with_cache(&mut terminal, &None, &cached_lines, &styles)?;
+                                last_track_id = Some(track_id);
+                                continue;
+                            }
                         }
                         draw_ui_with_cache(&mut terminal, &last_update, &cached_lines, &styles)?;
                         last_track_id = Some(track_id);
@@ -91,7 +91,7 @@ pub async fn display_lyrics_modern(
                     }
                     if !update.lines.is_empty() {
                         cached_lines = Some(update.lines.iter().map(|l| l.text.clone()).collect());
-                        last_update = Some(update);
+                        last_update = Some(update.clone());
                     } else if let Some(ref mut upd) = last_update {
                         upd.index = update.index;
                     }
@@ -104,14 +104,11 @@ pub async fn display_lyrics_modern(
             maybe_event = tokio::task::spawn_blocking(|| crossterm::event::poll(std::time::Duration::from_millis(100))) => {
                 if let Ok(Ok(true)) = maybe_event {
                     let event = crossterm::event::read().map_err(to_boxed_err)?;
-                    match event {
-                        Event::Key(key) => {
-                            match key.code {
-                                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => should_exit = true,
-                                _ => {}
-                            }
-                        },
-                        _ => {},
+                    if let Event::Key(key) = event {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => should_exit = true,
+                            _ => {}
+                        }
                     }
                     draw_ui_with_cache(&mut terminal, &last_update, &cached_lines, &styles)?;
                 }
@@ -123,19 +120,27 @@ pub async fn display_lyrics_modern(
     Ok(())
 }
 
-// Helper struct for lyric styles
+#[derive(Default)]
 struct LyricStyles {
     before: tui::style::Style,
     current: tui::style::Style,
     after: tui::style::Style,
 }
 
-// Helper for error conversion
+impl LyricStyles {
+    fn default() -> Self {
+        Self {
+            before: tui::style::Style::default().add_modifier(tui::style::Modifier::ITALIC | tui::style::Modifier::DIM),
+            current: tui::style::Style::default().fg(tui::style::Color::Green).add_modifier(tui::style::Modifier::BOLD),
+            after: tui::style::Style::default(),
+        }
+    }
+}
+
 fn to_boxed_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> Box<dyn std::error::Error + Send + Sync> {
     Box::new(e)
 }
 
-// Helper to render wrapped and centered lines with a style
 fn render_wrapped_centered_lines<'a>(
     lines: impl Iterator<Item = String>,
     width: usize,
@@ -151,7 +156,6 @@ fn render_wrapped_centered_lines<'a>(
         .collect()
 }
 
-/// Draw the TUI with the current lyric state and cache
 fn draw_ui_with_cache<B: tui::backend::Backend>(
     terminal: &mut Terminal<B>,
     last_update: &Option<Update>,

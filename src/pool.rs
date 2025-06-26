@@ -1,11 +1,11 @@
 // pool.rs: Central event loop for polling and event-based updates
 
 use crate::lyrics::LyricLine;
-use crate::mpris;
 use crate::lyricsdb::LyricsDB;
+use crate::mpris::{TrackMetadata};
 use tokio::sync::{mpsc, Mutex};
 use std::sync::Arc;
-use tokio::time::{Duration};
+use tokio::time::Duration;
 
 /// Represents a UI update for lyrics and player state.
 #[derive(Debug, Clone, Default)]
@@ -16,7 +16,7 @@ pub struct Update {
     pub unsynced: Option<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct PlayerState {
     title: String,
     artist: String,
@@ -27,7 +27,7 @@ struct PlayerState {
 }
 
 impl PlayerState {
-    fn update_from_metadata(&mut self, meta: &crate::mpris::TrackMetadata) {
+    fn update_from_metadata(&mut self, meta: &TrackMetadata) {
         self.title = meta.title.clone();
         self.artist = meta.artist.clone();
         self.album = meta.album.clone();
@@ -38,7 +38,7 @@ impl PlayerState {
         self.playing = playing;
         self.position = position;
     }
-    fn has_changed(&self, meta: &crate::mpris::TrackMetadata) -> bool {
+    fn has_changed(&self, meta: &TrackMetadata) -> bool {
         self.title != meta.title || self.artist != meta.artist || self.album != meta.album
     }
 }
@@ -62,9 +62,9 @@ impl LyricState {
             Err(idx) => idx - 1,
         }
     }
-    fn update_lines(&mut self, lines: Vec<LyricLine>, index: usize) {
+    fn update_lines(&mut self, lines: Vec<LyricLine>) {
+        self.index = 0;
         self.lines = lines;
-        self.index = index;
     }
     fn update_index(&mut self, new_index: usize) -> bool {
         if new_index != self.index {
@@ -76,9 +76,25 @@ impl LyricState {
     }
 }
 
+/// Helper to update lyric and player state in a consistent way
+fn set_lyric_state(
+    lyric_state: &mut LyricState,
+    lines: Vec<LyricLine>,
+    last_unsynced: &mut Option<String>,
+    unsynced: Option<String>,
+    player_state: &mut PlayerState,
+    meta: &TrackMetadata,
+    err: Option<String>,
+) {
+    lyric_state.update_lines(lines);
+    *last_unsynced = unsynced;
+    player_state.err = err;
+    player_state.update_from_metadata(meta);
+}
+
 // Helper to try loading lyrics from DB
 async fn try_load_from_db(
-    meta: &crate::mpris::TrackMetadata,
+    meta: &TrackMetadata,
     lyric_state: &mut LyricState,
     last_unsynced: &mut Option<String>,
     state: &mut PlayerState,
@@ -89,7 +105,6 @@ async fn try_load_from_db(
         set_lyric_state(
             lyric_state,
             crate::lyrics::parse_synced_lyrics(&synced),
-            0,
             last_unsynced,
             None,
             state,
@@ -102,7 +117,6 @@ async fn try_load_from_db(
         set_lyric_state(
             lyric_state,
             Vec::new(),
-            0,
             last_unsynced,
             None,
             state,
@@ -115,19 +129,19 @@ async fn try_load_from_db(
 
 // Helper to fetch from API and optionally save to DB
 async fn try_fetch_from_api_and_save(
-    meta: &crate::mpris::TrackMetadata,
+    meta: &TrackMetadata,
     lyric_state: &mut LyricState,
     last_unsynced: &mut Option<String>,
     state: &mut PlayerState,
     db: Option<&Arc<Mutex<LyricsDB>>>,
     db_path: Option<&str>,
+    debug_log: bool,
 ) {
     match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title).await {
         Ok((_plain, synced)) if !synced.is_empty() => {
             set_lyric_state(
                 lyric_state,
                 crate::lyrics::parse_synced_lyrics(&synced),
-                0,
                 last_unsynced,
                 None,
                 state,
@@ -141,11 +155,9 @@ async fn try_fetch_from_api_and_save(
             }
         }
         Ok((plain, _synced)) => {
-            // No synced lyrics found (plain may be empty or not), clear state, do not set err
             set_lyric_state(
                 lyric_state,
                 Vec::new(),
-                0,
                 last_unsynced,
                 if plain.is_empty() { None } else { Some(plain) },
                 state,
@@ -154,11 +166,12 @@ async fn try_fetch_from_api_and_save(
             );
         }
         Err(e) => {
-            eprintln!("[LyricsMPRIS] API error: {}", e); // Log API error
+            if debug_log {
+                eprintln!("[LyricsMPRIS] API error: {}", e);
+            }
             set_lyric_state(
                 lyric_state,
                 Vec::new(),
-                0,
                 last_unsynced,
                 None,
                 state,
@@ -171,23 +184,22 @@ async fn try_fetch_from_api_and_save(
 
 /// Attempts to update the lyric state for the given track metadata.
 async fn fetch_and_update_lyrics(
-    meta: &crate::mpris::TrackMetadata,
+    meta: &TrackMetadata,
     lyric_state: &mut LyricState,
     last_unsynced: &mut Option<String>,
     state: &mut PlayerState,
     db: Option<&Arc<Mutex<LyricsDB>>>,
     db_path: Option<&str>,
-    position: f64, // <-- add position argument
+    position: f64,
+    debug_log: bool,
 ) {
     if let Some(db) = db {
         if try_load_from_db(meta, lyric_state, last_unsynced, state, db).await {
-            // Set correct index immediately after loading from DB
             lyric_state.index = lyric_state.get_index(position);
             return;
         }
     }
-    try_fetch_from_api_and_save(meta, lyric_state, last_unsynced, state, db, db_path).await;
-    // Set correct index after fetching from API
+    try_fetch_from_api_and_save(meta, lyric_state, last_unsynced, state, db, db_path, debug_log).await;
     lyric_state.index = lyric_state.get_index(position);
 }
 
@@ -204,23 +216,6 @@ async fn send_update(
         err: state.err.clone(),
         unsynced: last_unsynced.clone(),
     }).await;
-}
-
-/// Helper to update lyric and player state in a consistent way
-fn set_lyric_state(
-    lyric_state: &mut LyricState,
-    lines: Vec<LyricLine>,
-    index: usize, // unused, always recalculate
-    last_unsynced: &mut Option<String>,
-    unsynced: Option<String>,
-    player_state: &mut PlayerState,
-    meta: &crate::mpris::TrackMetadata,
-    err: Option<String>,
-) {
-    lyric_state.update_lines(lines, index);
-    *last_unsynced = unsynced;
-    player_state.err = err;
-    player_state.update_from_metadata(meta);
 }
 
 /// Helper to update lyric index and send UI update if needed
@@ -243,6 +238,7 @@ pub async fn listen(
     db: Option<Arc<Mutex<LyricsDB>>>,
     db_path: Option<String>,
     mut shutdown_rx: mpsc::Receiver<()>,
+    mpris_config: crate::Config,
 ) {
     let mut player_state = PlayerState::default();
     let mut lyric_state = LyricState::default();
@@ -250,6 +246,7 @@ pub async fn listen(
     let (event_tx, mut event_rx) = mpsc::channel(8);
     let latest_meta = Arc::new(Mutex::new(None));
     let event_tx_clone = event_tx.clone();
+    let mpris_config_clone = mpris_config.clone();
     tokio::spawn(async move {
         let _ = crate::mpris::watch_and_handle_events(
             move |meta, pos| {
@@ -258,13 +255,12 @@ pub async fn listen(
             move |meta, pos| {
                 let _ = event_tx.try_send((meta, pos, false));
             },
+            Some(&mpris_config_clone),
         ).await;
     });
     loop {
         tokio::select! {
-            _ = shutdown_rx.recv() => {
-                break;
-            }
+            _ = shutdown_rx.recv() => break,
             maybe_event = event_rx.recv() => {
                 if let Some((meta, position, is_track_change)) = maybe_event {
                     handle_event_rx(
@@ -287,7 +283,8 @@ pub async fn listen(
                     &mut last_unsynced,
                     &latest_meta,
                     db.as_ref(),
-                    db_path.as_deref()
+                    db_path.as_deref(),
+                    &mpris_config
                 ).await;
             }
         }
@@ -300,8 +297,8 @@ async fn handle_event_rx(
     lyric_state: &mut LyricState,
     player_state: &mut PlayerState,
     last_unsynced: &mut Option<String>,
-    latest_meta: &Arc<Mutex<Option<(crate::mpris::TrackMetadata, f64)>>>,
-    meta: crate::mpris::TrackMetadata,
+    latest_meta: &Arc<Mutex<Option<(TrackMetadata, f64)>>>,
+    meta: TrackMetadata,
     position: f64,
     is_track_change: bool,
 ) {
@@ -326,18 +323,19 @@ async fn handle_poll_interval(
     lyric_state: &mut LyricState,
     player_state: &mut PlayerState,
     last_unsynced: &mut Option<String>,
-    latest_meta: &Arc<Mutex<Option<(crate::mpris::TrackMetadata, f64)>>>,
+    latest_meta: &Arc<Mutex<Option<(TrackMetadata, f64)>>>,
     db: Option<&Arc<Mutex<LyricsDB>>>,
     db_path: Option<&str>,
+    mpris_config: &crate::Config,
 ) {
     let mut guard = latest_meta.lock().await;
     if let Some((meta, position)) = guard.take() {
-        fetch_and_update_lyrics(&meta, lyric_state, last_unsynced, player_state, db, db_path, position).await;
+        fetch_and_update_lyrics(&meta, lyric_state, last_unsynced, player_state, db, db_path, position, mpris_config.debug_log).await;
         send_update(update_tx, lyric_state, player_state, last_unsynced).await;
     }
-    let meta = mpris::get_metadata().await.unwrap_or_default();
-    let playing = matches!(mpris::get_playback_status().await.as_deref(), Ok("Playing"));
-    let position = mpris::get_position().await.unwrap_or(0.0);
+    let meta = crate::mpris::get_metadata(Some(mpris_config)).await.unwrap_or_default();
+    let playing = matches!(crate::mpris::get_playback_status(Some(mpris_config)).await.unwrap_or_default().as_str(), "Playing");
+    let position = crate::mpris::get_position(Some(mpris_config)).await.unwrap_or(0.0);
     let changed = player_state.has_changed(&meta);
     player_state.update_playback(playing, position);
     let new_index = lyric_state.get_index(player_state.position);

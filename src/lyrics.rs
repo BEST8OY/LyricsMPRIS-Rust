@@ -2,8 +2,8 @@
 
 use reqwest::Client;
 use regex::Regex;
+use thiserror::Error;
 use serde::Deserialize;
-use std::error::Error;
 
 #[derive(Debug, Clone, Default)]
 pub struct LyricLine {
@@ -29,8 +29,18 @@ struct LrcLibResp {
     syncedLyrics: Option<String>,
 }
 
+#[derive(Error, Debug)]
+pub enum LyricsError {
+    #[error("Network error: {0}")]
+    Network(#[from] reqwest::Error),
+    #[error("API error: {0}")]
+    Api(String),
+    #[error("Serde error: {0}")]
+    Serde(#[from] serde_json::Error),
+}
+
 /// Fetch lyrics from lrclib for a given artist and title.
-pub async fn fetch_lyrics_from_lrclib(artist: &str, title: &str) -> Result<(String, String), Box<dyn Error + Send + Sync>> {
+pub async fn fetch_lyrics_from_lrclib(artist: &str, title: &str) -> Result<(String, String), LyricsError> {
     let client = Client::new();
     let url = format!(
         "https://lrclib.net/api/get?artist_name={}&track_name={}",
@@ -45,7 +55,7 @@ pub async fn fetch_lyrics_from_lrclib(artist: &str, title: &str) -> Result<(Stri
         return Ok((String::new(), String::new()));
     }
     if !resp.status().is_success() {
-        return Err(format!("lrclib: unexpected status {}", resp.status()).into());
+        return Err(LyricsError::Api(format!("lrclib: unexpected status {}", resp.status())));
     }
     let api: LrcLibResp = resp.json().await?;
     Ok((api.plainLyrics, api.syncedLyrics.unwrap_or_default()))
