@@ -124,6 +124,12 @@ impl StateBundle {
             unsynced: self.last_unsynced.clone(),
         }).await;
     }
+
+    /// Helper to update lyrics and send update in one step
+    async fn update_lyrics_and_send(&mut self, lines: Vec<LyricLine>, unsynced: Option<String>, meta: &TrackMetadata, err: Option<String>, update_tx: &mpsc::Sender<Update>) {
+        self.update_lyrics(lines, unsynced, meta, err);
+        self.send_update(update_tx).await;
+    }
 }
 
 async fn try_load_from_db_and_update(
@@ -134,16 +140,14 @@ async fn try_load_from_db_and_update(
 ) -> bool {
     let guard = db.lock().await;
     if let Some(synced) = guard.get(&meta.artist, &meta.title) {
-        bundle.update_lyrics(crate::lyrics::parse_synced_lyrics(&synced), None, meta, None);
-        bundle.send_update(update_tx).await;
+        bundle.update_lyrics_and_send(crate::lyrics::parse_synced_lyrics(&synced), None, meta, None, update_tx).await;
         return true;
     }
-    bundle.update_lyrics(Vec::new(), None, meta, None);
-    bundle.send_update(update_tx).await;
+    bundle.update_lyrics_and_send(Vec::new(), None, meta, None, update_tx).await;
     false
 }
 
-async fn try_fetch_from_api_and_save_and_update(
+async fn fetch_and_update_from_api(
     meta: &TrackMetadata,
     bundle: &mut StateBundle,
     db: Option<&Arc<Mutex<LyricsDB>>>,
@@ -153,9 +157,8 @@ async fn try_fetch_from_api_and_save_and_update(
 ) {
     match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title).await {
         Ok((_plain, synced)) if !synced.is_empty() => {
-            bundle.update_lyrics(crate::lyrics::parse_synced_lyrics(&synced), None, meta, None);
-            bundle.send_update(update_tx).await;
-            if let (Some(db), Some(path)) = (db, db_path) {
+            bundle.update_lyrics_and_send(crate::lyrics::parse_synced_lyrics(&synced), None, meta, None, update_tx).await;
+            if let Some((db, path)) = db.zip(db_path) {
                 let mut guard = db.lock().await;
                 guard.insert(&meta.artist, &meta.title, &synced);
                 let _ = guard.save(path);
@@ -163,15 +166,13 @@ async fn try_fetch_from_api_and_save_and_update(
         }
         Ok((plain, _)) => {
             let unsynced = if plain.is_empty() { None } else { Some(plain) };
-            bundle.update_lyrics(Vec::new(), unsynced, meta, None);
-            bundle.send_update(update_tx).await;
+            bundle.update_lyrics_and_send(Vec::new(), unsynced, meta, None, update_tx).await;
         }
         Err(e) => {
             if debug_log {
                 eprintln!("[LyricsMPRIS] API error: {}", e);
             }
-            bundle.update_lyrics(Vec::new(), None, meta, Some(e.to_string()));
-            bundle.send_update(update_tx).await;
+            bundle.update_lyrics_and_send(Vec::new(), None, meta, Some(e.to_string()), update_tx).await;
         }
     }
 }
@@ -191,7 +192,7 @@ async fn fetch_and_update_lyrics(
             return;
         }
     }
-    try_fetch_from_api_and_save_and_update(meta, bundle, db, db_path, debug_log, update_tx).await;
+    fetch_and_update_from_api(meta, bundle, db, db_path, debug_log, update_tx).await;
     bundle.lyric_state.index = bundle.lyric_state.get_index(position);
 }
 
@@ -205,14 +206,16 @@ async fn handle_event(
 ) {
     let changed = bundle.has_player_changed(&meta);
     if is_track_change && changed {
-        *latest_meta = Some((meta.clone(), position));
+        *latest_meta = Some((meta, position));
     }
     bundle.update_playback(true, position);
     let updated = bundle.update_index(bundle.player_state.position);
     if changed {
         bundle.clear_lyrics();
         bundle.send_update(update_tx).await;
-    } else if updated {
+        return;
+    }
+    if updated {
         bundle.send_update(update_tx).await;
     }
 }
