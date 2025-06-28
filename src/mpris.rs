@@ -1,5 +1,6 @@
 // mpris.rs: Fully async MPRIS client for metadata, position, and event watching
 
+// --- Imports ---
 use dbus::nonblock::{SyncConnection, Proxy};
 use dbus::message::MatchRule;
 use dbus::nonblock::stdintf::org_freedesktop_dbus::Properties;
@@ -10,16 +11,18 @@ use tokio::sync::mpsc;
 use thiserror::Error;
 use once_cell::sync::OnceCell;
 
+// --- Constants ---
 const TIMEOUT: Duration = Duration::from_millis(5000);
 
-#[derive(Debug, Clone, Default, PartialEq)]
+// --- Types ---
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrackMetadata {
     pub title: String,
     pub artist: String,
     pub album: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MprisPlayer {
     pub service: String,
     pub playback_status: String,
@@ -30,6 +33,7 @@ pub struct MprisPlayer {
 }
 
 impl MprisPlayer {
+    /// Convert player info to TrackMetadata
     pub fn to_metadata(&self) -> TrackMetadata {
         TrackMetadata {
             title: self.title.clone().unwrap_or_default(),
@@ -37,11 +41,13 @@ impl MprisPlayer {
             album: self.album.clone().unwrap_or_default(),
         }
     }
+    /// Get playback position in seconds
     pub fn position_seconds(&self) -> f64 {
         self.position.map(|p| p as f64 / 1_000_000.0).unwrap_or(0.0)
     }
 }
 
+// --- Error Types ---
 #[derive(Error, Debug)]
 pub enum MprisError {
     #[error("DBus error: {0}")]
@@ -54,8 +60,10 @@ pub enum MprisError {
     PlayerNotFound,
 }
 
+// --- Global State ---
 static DBUS_CONN: OnceCell<Arc<SyncConnection>> = OnceCell::new();
 
+// --- Internal Utilities ---
 /// Initialize the global D-Bus connection if not already present.
 pub async fn init_dbus_connection() -> Result<(), MprisError> {
     if DBUS_CONN.get().is_none() {
@@ -82,6 +90,11 @@ fn extract_metadata(map: &dbus::arg::PropMap) -> (Option<String>, Option<String>
     (title, artist, album)
 }
 
+fn default_config() -> crate::Config {
+    crate::Config { block: vec![], ..Default::default() }
+}
+
+// --- Public API ---
 /// Returns a vector of all active MPRIS players (async).
 pub async fn active_players() -> Result<Vec<MprisPlayer>, MprisError> {
     init_dbus_connection().await?;
@@ -141,10 +154,6 @@ pub async fn select_player(config: Option<&crate::Config>) -> Result<Option<Mpri
     Ok(players.into_iter().find(|p| {
         !config_ref.block.iter().any(|b| p.service.to_lowercase().contains(b))
     }))
-}
-
-fn default_config() -> crate::Config {
-    crate::Config { block: vec![], ..Default::default() }
 }
 
 /// Returns the current MPRIS player, or None if not available.

@@ -9,6 +9,7 @@ use tokio::sync::{mpsc, Mutex};
 use std::sync::Arc;
 use tokio::time::Duration;
 
+// --- Main Listener ---
 /// Listens for player and lyric updates, sending them to the update channel.
 ///
 /// - Spawns a watcher for MPRIS events, sending them to the event channel.
@@ -24,30 +25,34 @@ pub async fn listen(
     let mut state = StateBundle::new();
     let (event_tx, mut event_rx) = mpsc::channel(8);
     let mut latest_meta: Option<(TrackMetadata, f64)> = None;
-    let event_tx_clone = event_tx.clone();
-    let mpris_config_clone = mpris_config.clone();
-    // Spawn a task to watch for player events and send to event channel
+    let event_tx_track = event_tx.clone();
+    let event_tx_seek = event_tx.clone();
+    let mpris_config_arc = Arc::new(mpris_config);
+
+    // --- Spawn MPRIS watcher task ---
+    let mpris_config_track = mpris_config_arc.clone();
     tokio::spawn(async move {
         let _ = crate::mpris::watch_and_handle_events(
             move |meta, pos| {
-                let _ = event_tx_clone.try_send(Event::PlayerUpdate(meta, pos, true));
+                let _ = event_tx_track.try_send(Event::PlayerUpdate(meta, pos, true));
             },
             move |meta, pos| {
-                let _ = event_tx.try_send(Event::PlayerUpdate(meta, pos, false));
+                let _ = event_tx_seek.try_send(Event::PlayerUpdate(meta, pos, false));
             },
-            Some(&mpris_config_clone),
+            Some(&mpris_config_track),
         ).await;
     });
-    // Main event loop: handle shutdown, player events, and polling
+
+    // --- Main event loop: handle shutdown, player events, and polling ---
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
-                process_event(Event::Shutdown, &mut state, &update_tx, &mut latest_meta, &mpris_config).await;
+                process_event(Event::Shutdown, &mut state, &update_tx, &mut latest_meta, &mpris_config_arc).await;
                 break;
             },
             maybe_event = event_rx.recv() => {
                 if let Some(event) = maybe_event {
-                    process_event(event, &mut state, &update_tx, &mut latest_meta, &mpris_config).await;
+                    process_event(event, &mut state, &update_tx, &mut latest_meta, &mpris_config_arc).await;
                 }
             }
             _ = tokio::time::sleep(poll_interval) => {
@@ -55,7 +60,7 @@ pub async fn listen(
                     &mut state,
                     db.as_ref(),
                     db_path.as_deref(),
-                    &mpris_config,
+                    &mpris_config_arc,
                     &update_tx,
                     &mut latest_meta,
                 ).await;

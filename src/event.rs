@@ -3,9 +3,10 @@
 use crate::lyricsdb::LyricsDB;
 use crate::mpris::TrackMetadata;
 use crate::state::{StateBundle, Update};
-use tokio::sync::{mpsc, Mutex};
 use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 
+// --- Event Types ---
 /// Events that can be sent to the event loop.
 #[derive(Debug)]
 pub enum Event {
@@ -13,6 +14,7 @@ pub enum Event {
     Shutdown,
 }
 
+// --- Update Helpers ---
 /// Send an update if state has changed or if forced.
 pub async fn update_and_maybe_send(state: &StateBundle, update_tx: &mpsc::Sender<Update>, force: bool) {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +37,7 @@ pub async fn update_and_maybe_send(state: &StateBundle, update_tx: &mpsc::Sender
     }
 }
 
+// --- Lyrics Fetching & State Update ---
 /// Try to load lyrics from the DB and update state. Returns true if found.
 pub async fn try_load_from_db_and_update(meta: &TrackMetadata, state: &mut StateBundle, db: &Arc<Mutex<LyricsDB>>) -> bool {
     let guard = db.lock().await;
@@ -98,6 +101,7 @@ pub async fn fetch_and_update_lyrics(
     update_and_maybe_send(state, update_tx, true).await;
 }
 
+// --- Event Processing ---
 /// Process a single event, updating state and sending updates as needed.
 pub async fn process_event(
     event: Event,
