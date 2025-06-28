@@ -1,32 +1,33 @@
 // src/text_utils.rs
 // Utility functions for text formatting
 
-/// Center a string within a given width
+use textwrap;
+use unicode_width::UnicodeWidthStr;
+
+/// Center a string within a given width, with proper CJK and emoji support
 pub fn pad_centered(text: &str, width: usize) -> String {
-    let line_width = text.chars().count();
-    let pad_left = if width > line_width { (width - line_width) / 2 } else { 0 };
-    let mut content = String::with_capacity(width.max(line_width));
-    for _ in 0..pad_left { content.push(' '); }
-    content.push_str(text);
-    content
+    let text_width = UnicodeWidthStr::width(text);
+    if width <= text_width {
+        return text.to_string();
+    }
+    let pad_total = width - text_width;
+    let pad_left = pad_total / 2;
+    let pad_right = pad_total - pad_left;
+    format!("{0}{1}{2}", " ".repeat(pad_left), text, " ".repeat(pad_right))
 }
 
-/// Wrap text to a given width, breaking at word boundaries
+/// Wrap text to a given width, preserving empty lines and not splitting words
 pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        if current.chars().count() + word.chars().count() + 1 > width && !current.is_empty() {
-            lines.push(current);
-            current = String::new();
+    let mut result = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            result.push(String::new());
+            continue;
         }
-        if !current.is_empty() {
-            current.push(' ');
+        let wrapped = textwrap::wrap(line, width);
+        for w in wrapped {
+            result.push(w.to_string());
         }
-        current.push_str(word);
     }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    lines
+    result
 }
