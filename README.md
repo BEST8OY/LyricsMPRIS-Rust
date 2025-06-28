@@ -1,61 +1,114 @@
-# LyricsMPRIS
+# LyricsMPRIS-Rust
 
-A blazing-fast, terminal-based lyrics viewer for Linux that syncs in real time with your currently playing song using the MPRIS D-Bus interface. Enjoy a modern TUI (terminal user interface) for immersive lyric display, or use minimal pipe mode for scripting and automation.
+A modern, async terminal lyrics viewer for Linux, powered by the [MPRIS](https://specifications.freedesktop.org/mpris-spec/latest/) D-Bus interface. Displays synced lyrics for your currently playing song from any compatible media player (Spotify, VLC, mpv, etc.), with both a beautiful TUI and a scripting-friendly pipe mode.
+
+---
+
+> **Note:** This project is fully written by GitHub Copilot in Visual Studio Code.
+
+---
 
 ## Features
-- **Modern TUI**: Centered, highlighted lyrics with smooth, real-time updates.
-- **Pipe Mode**: Outputs only the current lyric line to stdout—perfect for scripts and status bars.
-- **MPRIS Integration**: Seamlessly detects the active player via `playerctld` (MPRIS D-Bus service).
-- **Async & Fast**: Built with async Rust (`tokio`, `dbus-tokio`) for instant, non-blocking updates.
-- **Custom Poll Interval**: Choose how often lyrics are refreshed.
-- **Local Lyrics Database**: Optionally cache synced lyrics in a local JSON file for instant, offline access.
 
-## Requirements
-- Linux with a running MPRIS-compatible media player and `playerctld` ([playerctl](https://github.com/altdesktop/playerctl)).
-- Rust (edition 2024) and Cargo for building.
+- **Modern TUI**: Centered, highlighted, real-time lyrics display in your terminal.
+- **Pipe Mode**: Output the current lyric line to stdout for scripting or status bars.
+- **MPRIS Support**: Works with any Linux player supporting MPRIS (Spotify, VLC, mpv, etc.).
+- **Async & Fast**: Fully async Rust code for smooth, responsive updates.
+- **Local Lyrics Database**: Optionally use a local lyrics database for offline lyrics.
+- **Blocklist**: Exclude specific MPRIS player services.
+- **Error Logging**: Optional debug logging to stderr.
+
+---
 
 ## Installation
-Clone the repository and build with Cargo:
 
+### Prerequisites
+- Linux (with D-Bus and MPRIS-compatible media player)
+- [Rust toolchain](https://rustup.rs/)
+
+### Build from Source
 ```sh
-# Clone and build
-git clone https://github.com/yourusername/lyricsmpris.git
-cd lyricsmpris
-cargo build --release
+# Clone the repo
+ git clone https://github.com/yourusername/LyricsMPRIS-Rust.git
+ cd LyricsMPRIS-Rust
+
+# Build the project
+ cargo build --release
+
+# Run (see usage below)
+ ./target/release/lyricsmpris
 ```
+
+---
 
 ## Usage
 
 ```sh
-# Modern TUI (default)
-./target/release/lyricsmpris
-
-# Pipe mode (outputs only the current lyric line)
-./target/release/lyricsmpris --pipe
-
-# Set custom poll interval (in milliseconds)
-./target/release/lyricsmpris --poll 500
-
-# Use a custom local lyrics database
-./target/release/lyricsmpris --database /path/to/lyrics.json
+lyricsmpris [OPTIONS]
 ```
 
-### Arguments
-- `--pipe` : Pipe current lyric line to stdout (disables TUI)
-- `--poll <ms>` : Set lyric poll interval in milliseconds (default: 500)
-- `--database <path>` : Use a custom local lyrics database (JSON)
+### Options
+- `--pipe`           Pipe current lyric line to stdout (for scripting)
+- `--poll <ms>`      Lyric poll interval in milliseconds (default: 1000)
+- `--database <path>`  Path to local lyrics database (optional)
+- `--block <SERVICES>` Blocklist for MPRIS player service names (comma-separated, case-insensitive)
+- `--debug-log`      Enable backend error logging to stderr
+- `-h, --help`       Print help
+- `-V, --version`    Print version
+
+### Examples
+
+- **Modern TUI (default):**
+  ```sh
+  lyricsmpris
+  ```
+- **Pipe mode for status bar:**
+  ```sh
+  lyricsmpris --pipe
+  ```
+- **Use a local lyrics database:**
+  ```sh
+  lyricsmpris --database ~/.local/share/lyrics.db
+  ```
+- **Block Spotify, VLC and Edge:**
+  ```sh
+  lyricsmpris --block spotify,vlc
+  ```
+
+---
 
 ## How It Works
-- Connects to the session D-Bus and queries the active MPRIS player via `playerctld`.
-- Fetches song metadata (title, artist, album) and playback position.
-- Periodically polls for updates and displays synced lyrics in the terminal.
-- Optionally caches and retrieves synced lyrics from a local JSON database for offline/instant access.
+
+- Connects to the D-Bus session and queries MPRIS-compatible players for metadata and playback position.
+- Periodically polls and/or listens for D-Bus events to update lyrics in real time.
+- Displays lyrics in a modern TUI or pipes the current line to stdout.
+- Optionally loads lyrics from a local database.
+
+---
+
+## Supported Players
+Any Linux media player that implements the MPRIS D-Bus interface, including:
+- Spotify
+- VLC
+- mpv
+- Rhythmbox
+- Audacious
+- ...and many more
+
+---
 
 ## Troubleshooting
-- Ensure `playerctld` is running: `playerctld --fork`
-- Make sure your media player supports MPRIS and is running.
-- If you see "No lyrics found for this track", lyrics may not be available for the current song.
-- For database issues, check the path and permissions of your lyrics JSON file.
+- **No lyrics shown?**  Make sure your player supports MPRIS and is playing a track with metadata.
+- **D-Bus errors?**  Ensure you have a running D-Bus session and the player is started normally (not as root).
+- **Debugging:**  Use `--debug-log` to print backend errors to stderr.
+
+---
+
+## Contributing
+Pull requests, bug reports, and feature suggestions are welcome! Please open an issue or PR on GitHub.
+
+---
 
 ## License
-MIT License — see [LICENSE](LICENSE)
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
