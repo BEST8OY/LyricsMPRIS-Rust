@@ -232,7 +232,9 @@ pub async fn listen(
                     bundle.player_state.update_playback(true, position);
                     let new_index = bundle.lyric_state.get_index(bundle.player_state.position);
                     if changed {
-                        bundle.lyric_state.index = new_index;
+                        // Clear lyrics immediately on track change
+                        bundle.lyric_state.update_lines(Vec::new());
+                        bundle.lyric_state.index = 0;
                         let _ = update_tx.send(Update {
                             lines: bundle.lyric_state.lines.clone(),
                             index: bundle.lyric_state.index,
