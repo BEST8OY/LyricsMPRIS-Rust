@@ -10,7 +10,6 @@ pub struct Update {
     pub lines: Arc<Vec<LyricLine>>,
     pub index: usize,
     pub err: Option<String>,
-    pub unsynced: Option<String>,
     pub version: u64, // Incremented on any state change
 }
 
@@ -86,7 +85,6 @@ impl LyricState {
 pub struct StateBundle {
     pub lyric_state: LyricState,
     pub player_state: PlayerState,
-    pub last_unsynced: Option<String>,
     pub version: u64, // Incremented on any state change
 }
 
@@ -95,7 +93,6 @@ impl StateBundle {
         Self {
             lyric_state: LyricState::default(),
             player_state: PlayerState::default(),
-            last_unsynced: None,
             version: 0,
         }
     }
@@ -113,9 +110,8 @@ impl StateBundle {
         self.lyric_state.index = 0;
         self.version += 1;
     }
-    pub fn update_lyrics(&mut self, lines: Vec<LyricLine>, unsynced: Option<String>, meta: &TrackMetadata, err: Option<String>) {
+    pub fn update_lyrics(&mut self, lines: Vec<LyricLine>, meta: &TrackMetadata, err: Option<String>) {
         self.lyric_state.update_lines(lines);
-        self.last_unsynced = unsynced;
         self.player_state.err = err;
         self.player_state.update_from_metadata(meta);
         self.version += 1;

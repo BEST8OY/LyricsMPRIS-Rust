@@ -25,7 +25,7 @@ pub async fn display_lyrics_pipe(
     tokio::spawn(pool::listen(tx, poll_interval, db.clone(), db_path.clone(), shutdown_rx, mpris_config.clone()));
     let mut last_line_idx = None;
     while let Some(upd) = rx.recv().await {
-        if upd.lines.is_empty() && (upd.err.is_some() || upd.unsynced.is_some() || (upd.err.is_none() && upd.unsynced.is_none())) {
+        if upd.lines.is_empty() && upd.err.is_some() {
             last_line_idx = None;
             continue;
         }
@@ -60,7 +60,7 @@ pub async fn display_lyrics_modern(
     let mut last_update: Option<Update> = None;
     let mut cached_lines: Option<Vec<String>> = None;
     let styles = LyricStyles::default();
-    let mut last_track_id: Option<(String, String, String)> = None;
+    let mut last_track_id: Option<(String, String)> = None;
     let mut should_exit = false;
     while !should_exit {
         tokio::select! {
@@ -69,15 +69,11 @@ pub async fn display_lyrics_modern(
                     let track_id = (
                         update.lines.get(0).map(|_| "has_lyrics").unwrap_or("no_lyrics").to_string(),
                         update.err.clone().unwrap_or_default(),
-                        update.unsynced.clone().unwrap_or_default(),
                     );
-                    if update.lines.is_empty() && (update.err.is_some() || update.unsynced.is_some() || (update.err.is_none() && update.unsynced.is_none())) {
+                    if update.lines.is_empty() && update.err.is_some() {
                         if last_track_id.as_ref() != Some(&track_id) {
                             cached_lines = None;
                             last_update = None;
-                        }
-                        if update.unsynced.is_some() && update.err.is_none() {
-                            last_update = Some(update.clone());
                         }
                         if let Some(ref upd_err) = update.err {
                             if upd_err.contains("MprisError") || upd_err.contains("LyricsError") {
@@ -214,16 +210,6 @@ fn draw_ui_with_cache<B: tui::backend::Backend>(
                         lines.extend(visible);
                         lines.extend((0..pad_bottom).map(|_| Spans::from(Span::raw(""))));
                     }
-                }
-            } else if let Some(ref unsynced) = update.unsynced {
-                if !unsynced.trim().is_empty() {
-                    let pad_top = h / 2 - 1;
-                    lines.extend((0..pad_top).map(|_| Spans::from(Span::raw(""))));
-                    lines.extend(render_wrapped_centered_lines(vec!["--- Unsynced Lyrics ---".to_string()].into_iter(), w, styles.current));
-                    for lyric_line in crate::lyrics::parse_plain_lyrics(unsynced) {
-                        lines.extend(render_wrapped_centered_lines(std::iter::once(lyric_line), w, styles.current));
-                    }
-                    lines.extend(render_wrapped_centered_lines(vec!["----------------------".to_string()].into_iter(), w, styles.current));
                 }
             }
         }

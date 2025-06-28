@@ -25,10 +25,9 @@ pub async fn update_and_maybe_send(state: &StateBundle, update_tx: &mpsc::Sender
         lines: state.lyric_state.lines.clone(),
         index: state.lyric_state.index,
         err: state.player_state.err.as_ref().map(|e| e.to_string()),
-        unsynced: state.last_unsynced.as_ref().map(|u| u.to_string()),
         version,
     };
-    if force || !update.lines.is_empty() || update.err.is_some() || update.unsynced.is_some() {
+    if force || !update.lines.is_empty() || update.err.is_some() {
         let _ = update_tx.send(update).await;
         LAST_SENT_VERSION.store(version, Ordering::Relaxed);
     }
@@ -38,10 +37,10 @@ pub async fn update_and_maybe_send(state: &StateBundle, update_tx: &mpsc::Sender
 pub async fn try_load_from_db_and_update(meta: &TrackMetadata, state: &mut StateBundle, db: &Arc<Mutex<LyricsDB>>) -> bool {
     let guard = db.lock().await;
     if let Some(synced) = guard.get(&meta.artist, &meta.title) {
-        state.update_lyrics(crate::lyrics::parse_synced_lyrics(&synced), None, meta, None);
+        state.update_lyrics(crate::lyrics::parse_synced_lyrics(&synced), meta, None);
         return true;
     }
-    state.update_lyrics(Vec::new(), None, meta, None);
+    state.update_lyrics(Vec::new(), meta, None);
     false
 }
 
@@ -54,23 +53,22 @@ pub async fn fetch_and_update_from_api(
     debug_log: bool,
 ) {
     match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title).await {
-        Ok((_plain, synced)) if !synced.is_empty() => {
-            state.update_lyrics(crate::lyrics::parse_synced_lyrics(&synced), None, meta, None);
+        Ok(synced) if !synced.is_empty() => {
+            state.update_lyrics(crate::lyrics::parse_synced_lyrics(&synced), meta, None);
             if let Some((db, path)) = db.zip(db_path) {
                 let mut guard = db.lock().await;
                 guard.insert(&meta.artist, &meta.title, &synced);
                 let _ = guard.save(path);
             }
         }
-        Ok((plain, _)) => {
-            let unsynced = if plain.is_empty() { None } else { Some(plain) };
-            state.update_lyrics(Vec::new(), unsynced, meta, None);
+        Ok(_) => {
+            state.update_lyrics(Vec::new(), meta, None);
         }
         Err(e) => {
             if debug_log {
                 eprintln!("[LyricsMPRIS] API error: {}", e);
             }
-            state.update_lyrics(Vec::new(), None, meta, Some(e.to_string()));
+            state.update_lyrics(Vec::new(), meta, Some(e.to_string()));
         }
     }
 }
@@ -152,7 +150,7 @@ pub async fn handle_poll(
         update_and_maybe_send(state, update_tx, true).await;
         sent = true;
     }
-    if !sent && (state.player_state.err.is_some() || state.last_unsynced.is_some()) {
+    if !sent && state.player_state.err.is_some() {
         update_and_maybe_send(state, update_tx, true).await;
     }
 }
