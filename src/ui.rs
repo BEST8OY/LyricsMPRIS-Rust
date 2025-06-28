@@ -11,6 +11,27 @@ use crate::lyricsdb::LyricsDB;
 use std::sync::Arc;
 use crate::text_utils::{pad_centered, wrap_text};
 
+/// UI state for the modern TUI mode
+struct ModernUIState {
+    last_update: Option<Update>,
+    cached_lines: Option<Vec<String>>,
+    last_track_id: Option<(String, String)>,
+    should_exit: bool,
+    paused_scroll_index: Option<usize>,
+}
+
+impl ModernUIState {
+    fn new() -> Self {
+        Self {
+            last_update: None,
+            cached_lines: None,
+            last_track_id: None,
+            should_exit: false,
+            paused_scroll_index: None,
+        }
+    }
+}
+
 /// Display lyrics in pipe mode (stdout only, for scripting)
 pub async fn display_lyrics_pipe(
     _meta: crate::mpris::TrackMetadata,
@@ -57,57 +78,17 @@ pub async fn display_lyrics_modern(
     execute!(stdout, EnterAlternateScreen).map_err(to_boxed_err)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).map_err(to_boxed_err)?;
-    let mut last_update: Option<Update> = None;
-    let mut cached_lines: Option<Vec<String>> = None;
     let styles = LyricStyles::default();
-    let mut last_track_id: Option<(String, String)> = None;
-    let mut should_exit = false;
-    while !should_exit {
+    let mut state = ModernUIState::new();
+    while !state.should_exit {
         tokio::select! {
             update = rx.recv() => {
-                if let Some(update) = update {
-                    let track_id = (
-                        update.lines.get(0).map(|_| "has_lyrics").unwrap_or("no_lyrics").to_string(),
-                        update.err.clone().unwrap_or_default(),
-                    );
-                    if update.lines.is_empty() && update.err.is_some() {
-                        if last_track_id.as_ref() != Some(&track_id) {
-                            cached_lines = None;
-                            last_update = None;
-                        }
-                        if let Some(ref upd_err) = update.err {
-                            if upd_err.contains("MprisError") || upd_err.contains("LyricsError") {
-                                draw_ui_with_cache(&mut terminal, &None, &cached_lines, &styles)?;
-                                last_track_id = Some(track_id);
-                                continue;
-                            }
-                        }
-                        draw_ui_with_cache(&mut terminal, &last_update, &cached_lines, &styles)?;
-                        last_track_id = Some(track_id);
-                        continue;
-                    }
-                    if !update.lines.is_empty() {
-                        cached_lines = Some(update.lines.iter().map(|l| l.text.clone()).collect());
-                        last_update = Some(update.clone());
-                    } else if let Some(ref mut upd) = last_update {
-                        upd.index = update.index;
-                    }
-                    draw_ui_with_cache(&mut terminal, &last_update, &cached_lines, &styles)?;
-                    last_track_id = Some(track_id);
-                } else {
-                    should_exit = true;
-                }
+                process_update(update, &mut state, &mut terminal, &styles)?;
             }
             maybe_event = tokio::task::spawn_blocking(|| crossterm::event::poll(std::time::Duration::from_millis(100))) => {
                 if let Ok(Ok(true)) = maybe_event {
                     let event = crossterm::event::read().map_err(to_boxed_err)?;
-                    if let Event::Key(key) = event {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => should_exit = true,
-                            _ => {}
-                        }
-                    }
-                    draw_ui_with_cache(&mut terminal, &last_update, &cached_lines, &styles)?;
+                    process_event(event, &mut state, &mut terminal, &styles)?;
                 }
             }
         }
@@ -115,6 +96,105 @@ pub async fn display_lyrics_modern(
     disable_raw_mode().map_err(to_boxed_err)?;
     execute!(io::stdout(), LeaveAlternateScreen).map_err(to_boxed_err)?;
     Ok(())
+}
+
+/// Handle incoming update from the lyrics source
+fn process_update<B: tui::backend::Backend>(
+    update: Option<Update>,
+    state: &mut ModernUIState,
+    terminal: &mut Terminal<B>,
+    styles: &LyricStyles,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(update) = update {
+        let track_id = (
+            update.lines.get(0).map(|_| "has_lyrics").unwrap_or("no_lyrics").to_string(),
+            update.err.clone().unwrap_or_default(),
+        );
+        if update.lines.is_empty() && update.err.is_some() {
+            if state.last_track_id.as_ref() != Some(&track_id) {
+                state.cached_lines = None;
+                state.last_update = None;
+            }
+            if let Some(ref upd_err) = update.err {
+                if upd_err.contains("MprisError") || upd_err.contains("LyricsError") {
+                    draw_ui_with_cache(terminal, &None, &state.cached_lines, styles)?;
+                    state.last_track_id = Some(track_id);
+                    return Ok(());
+                }
+            }
+            draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
+            state.last_track_id = Some(track_id);
+            return Ok(());
+        }
+        if !update.lines.is_empty() {
+            state.cached_lines = Some(update.lines.iter().map(|l| l.text.clone()).collect());
+            state.last_update = Some(update.clone());
+            if !update.playing {
+                if state.paused_scroll_index.is_none() {
+                    state.paused_scroll_index = Some(update.index);
+                }
+            } else {
+                state.paused_scroll_index = None;
+            }
+        } else if let Some(ref mut upd) = state.last_update {
+            upd.index = update.index;
+            if !update.playing {
+                if state.paused_scroll_index.is_none() {
+                    state.paused_scroll_index = Some(update.index);
+                }
+            } else {
+                state.paused_scroll_index = None;
+            }
+        }
+        draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
+        state.last_track_id = Some(track_id);
+    } else {
+        state.should_exit = true;
+    }
+    Ok(())
+}
+
+/// Handle user input events (keyboard)
+fn process_event<B: tui::backend::Backend>(
+    event: Event,
+    state: &mut ModernUIState,
+    terminal: &mut Terminal<B>,
+    styles: &LyricStyles,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Event::Key(key) = event {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                state.should_exit = true;
+            },
+            KeyCode::Up | KeyCode::Char('k') => {
+                try_scroll_lyrics(state, -1);
+                draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
+            },
+            KeyCode::Down | KeyCode::Char('j') => {
+                try_scroll_lyrics(state, 1);
+                draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
+            },
+            _ => {}
+        }
+    }
+    draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
+    Ok(())
+}
+
+/// Try to scroll the lyrics up or down by delta (if paused)
+fn try_scroll_lyrics(state: &mut ModernUIState, delta: isize) {
+    if let (Some(ref mut upd), Some(ref _lines)) = (state.last_update.as_mut(), state.cached_lines.as_ref()) {
+        if let Some(idx) = state.paused_scroll_index.as_mut() {
+            if !upd.playing {
+                let len = state.cached_lines.as_ref().map(|l| l.len()).unwrap_or(0);
+                let new_idx = (*idx as isize + delta).clamp(0, (len as isize).saturating_sub(1)) as usize;
+                if new_idx != *idx {
+                    *idx = new_idx;
+                    upd.index = *idx;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default)]

@@ -6,6 +6,7 @@ use crate::state::{StateBundle, Update};
 use tokio::sync::{mpsc, Mutex};
 use std::sync::Arc;
 
+/// Events that can be sent to the event loop.
 #[derive(Debug)]
 pub enum Event {
     PlayerUpdate(TrackMetadata, f64, bool),
@@ -26,6 +27,7 @@ pub async fn update_and_maybe_send(state: &StateBundle, update_tx: &mpsc::Sender
         index: state.lyric_state.index,
         err: state.player_state.err.as_ref().map(|e| e.to_string()),
         version,
+        playing: state.player_state.playing,
     };
     if force || !update.lines.is_empty() || update.err.is_some() {
         let _ = update_tx.send(update).await;
@@ -102,6 +104,7 @@ pub async fn process_event(
     state: &mut StateBundle,
     update_tx: &mpsc::Sender<Update>,
     latest_meta: &mut Option<(TrackMetadata, f64)>,
+    mpris_config: &crate::Config,
 ) {
     match event {
         Event::PlayerUpdate(meta, position, is_track_change) => {
@@ -109,10 +112,17 @@ pub async fn process_event(
             if is_track_change && changed {
                 *latest_meta = Some((meta, position));
             }
-            state.update_playback(true, position);
+            let prev_playing = state.player_state.playing;
+            let playing = matches!(crate::mpris::get_playback_status(Some(mpris_config)).await.unwrap_or_default().as_str(), "Playing");
+            state.update_playback(playing, position);
             let updated = state.update_index(state.player_state.position);
             if changed {
                 state.clear_lyrics();
+                update_and_maybe_send(state, update_tx, true).await;
+                return;
+            }
+            // Force update if playing/paused state changed
+            if prev_playing != playing {
                 update_and_maybe_send(state, update_tx, true).await;
                 return;
             }
@@ -143,12 +153,12 @@ pub async fn handle_poll(
     let meta = crate::mpris::get_metadata(Some(mpris_config)).await.unwrap_or_default();
     let playing = matches!(crate::mpris::get_playback_status(Some(mpris_config)).await.unwrap_or_default().as_str(), "Playing");
     let position = crate::mpris::get_position(Some(mpris_config)).await.unwrap_or(0.0);
-    let changed = state.has_player_changed(&meta);
+    // Update state BEFORE checking for changes or sending updates
     state.update_playback(playing, position);
+    let changed = state.has_player_changed(&meta);
     let updated = state.update_index(state.player_state.position);
     if (changed || updated) && !sent {
         update_and_maybe_send(state, update_tx, true).await;
-        sent = true;
     }
     if !sent && state.player_state.err.is_some() {
         update_and_maybe_send(state, update_tx, true).await;

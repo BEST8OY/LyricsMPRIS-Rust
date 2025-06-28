@@ -56,6 +56,7 @@ pub enum MprisError {
 
 static DBUS_CONN: OnceCell<Arc<SyncConnection>> = OnceCell::new();
 
+/// Initialize the global D-Bus connection if not already present.
 pub async fn init_dbus_connection() -> Result<(), MprisError> {
     if DBUS_CONN.get().is_none() {
         let (resource, conn) = dbus_tokio::connection::new_session_sync()
@@ -96,7 +97,7 @@ pub async fn active_players() -> Result<Vec<MprisPlayer>, MprisError> {
         .unwrap_or_default();
     let mut players = Vec::new();
     for service in player_names {
-        if let Ok(Some(player)) = get_player_by_service(&service).await.map(Some) {
+        if let Ok(player) = get_player_by_service(&service).await {
             players.push(player);
         }
     }
@@ -199,6 +200,7 @@ where
         on_track_change(meta.clone(), pos);
     }
     let mut last_track = TrackMetadata::default();
+    let mut last_playback_status = String::new();
 
     while let Some(msg) = rx.recv().await {
         if msg.read1::<&str>().ok() != Some("org.mpris.MediaPlayer2.Player") {
@@ -206,6 +208,7 @@ where
         }
         let changed: Option<dbus::arg::PropMap> = msg.read2().ok().map(|(_, c): (String, dbus::arg::PropMap)| c);
         if let Some(changed) = changed {
+            // Metadata changed
             if changed.contains_key("Metadata") {
                 if let (Ok(meta), Ok(pos)) = (get_metadata(config).await, get_position(config).await) {
                     if meta != last_track {
@@ -214,10 +217,23 @@ where
                     }
                 }
             }
+            // Position changed
             if let Some(pos_var) = changed.get("Position") {
                 if let Some(pos) = pos_var.0.as_i64() {
                     let sec = pos as f64 / 1_000_000.0;
                     on_seek(last_track.clone(), sec);
+                }
+            }
+            // Playback status changed
+            if let Some(status_var) = changed.get("PlaybackStatus") {
+                if let Some(status) = status_var.0.as_str() {
+                    if status != last_playback_status {
+                        last_playback_status = status.to_string();
+                        // On playback status change, emit on_track_change to trigger UI update
+                        if let (Ok(meta), Ok(pos)) = (get_metadata(config).await, get_position(config).await) {
+                            on_track_change(meta, pos);
+                        }
+                    }
                 }
             }
         }
