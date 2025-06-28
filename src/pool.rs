@@ -12,12 +12,13 @@ use tokio::time::Duration;
 // =====================
 
 /// Represents a UI update for lyrics and player state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Update {
-    pub lines: Vec<LyricLine>,
+    pub lines: Arc<Vec<LyricLine>>,
     pub index: usize,
     pub err: Option<String>,
     pub unsynced: Option<String>,
+    pub version: u64, // Incremented on any state change
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -49,7 +50,7 @@ impl PlayerState {
 
 #[derive(Debug, Default)]
 pub struct LyricState {
-    pub lines: Vec<LyricLine>,
+    pub lines: Arc<Vec<LyricLine>>,
     pub index: usize,
 }
 
@@ -59,8 +60,16 @@ impl LyricState {
         if self.lines.len() <= 1 {
             return 0;
         }
-        // Use binary search for efficiency
-        match self.lines.binary_search_by(|line| line.time.partial_cmp(&position).unwrap_or(std::cmp::Ordering::Less)) {
+        // Explicitly handle NaN or invalid times
+        if position.is_nan() || self.lines.iter().any(|line| line.time.is_nan()) {
+            return 0;
+        }
+        match self.lines.binary_search_by(|line| {
+            match line.time.partial_cmp(&position) {
+                Some(ord) => ord,
+                None => std::cmp::Ordering::Less, // Should not happen if all times are valid
+            }
+        }) {
             Ok(idx) => idx,
             Err(0) => 0,
             Err(idx) => idx - 1,
@@ -68,7 +77,7 @@ impl LyricState {
     }
     pub fn update_lines(&mut self, lines: Vec<LyricLine>) {
         self.index = 0;
-        self.lines = lines;
+        self.lines = Arc::new(lines);
     }
     pub fn update_index(&mut self, new_index: usize) -> bool {
         if new_index != self.index {
@@ -84,6 +93,7 @@ pub struct StateBundle {
     pub lyric_state: LyricState,
     pub player_state: PlayerState,
     pub last_unsynced: Option<String>,
+    pub version: u64, // Incremented on any state change
 }
 
 impl StateBundle {
@@ -92,10 +102,14 @@ impl StateBundle {
             lyric_state: LyricState::default(),
             player_state: PlayerState::default(),
             last_unsynced: None,
+            version: 0,
         }
     }
 
     pub fn update_playback(&mut self, playing: bool, position: f64) {
+        if self.player_state.playing != playing || (self.player_state.position - position).abs() > f64::EPSILON {
+            self.version += 1;
+        }
         self.player_state.update_playback(playing, position);
     }
 
@@ -106,6 +120,7 @@ impl StateBundle {
     pub fn clear_lyrics(&mut self) {
         self.lyric_state.update_lines(Vec::new());
         self.lyric_state.index = 0;
+        self.version += 1;
     }
 
     pub fn update_lyrics(&mut self, lines: Vec<LyricLine>, unsynced: Option<String>, meta: &TrackMetadata, err: Option<String>) {
@@ -113,25 +128,38 @@ impl StateBundle {
         self.last_unsynced = unsynced;
         self.player_state.err = err;
         self.player_state.update_from_metadata(meta);
+        self.version += 1;
     }
 
     pub fn update_index(&mut self, position: f64) -> bool {
         let new_index = self.lyric_state.get_index(position);
-        self.lyric_state.update_index(new_index)
+        let changed = self.lyric_state.update_index(new_index);
+        if changed {
+            self.version += 1;
+        }
+        changed
     }
 }
 
 /// Helper function to send an update if state has changed
 async fn update_and_maybe_send(state_bundle: &StateBundle, update_tx: &mpsc::Sender<Update>, force: bool) {
-    // This could be improved to check for actual changes if needed
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST_SENT_VERSION: AtomicU64 = AtomicU64::new(0);
+    let version = state_bundle.version;
+    let last_version = LAST_SENT_VERSION.load(Ordering::Relaxed);
+    if !force && version == last_version {
+        return;
+    }
     let update = Update {
         lines: state_bundle.lyric_state.lines.clone(),
         index: state_bundle.lyric_state.index,
         err: state_bundle.player_state.err.as_ref().map(|e| e.to_string()),
         unsynced: state_bundle.last_unsynced.as_ref().map(|u| u.to_string()),
+        version,
     };
     if force || !update.lines.is_empty() || update.err.is_some() || update.unsynced.is_some() {
         let _ = update_tx.send(update).await;
+        LAST_SENT_VERSION.store(version, Ordering::Relaxed);
     }
 }
 
@@ -204,27 +232,39 @@ async fn fetch_and_update_lyrics(
     update_and_maybe_send(state_bundle, update_tx, true).await;
 }
 
-async fn handle_event(
-    meta: TrackMetadata,
-    position: f64,
-    is_track_change: bool,
+// Event enum for extensibility
+enum Event {
+    PlayerUpdate(TrackMetadata, f64, bool),
+    Shutdown,
+}
+
+async fn process_event(
+    event: Event,
     state_bundle: &mut StateBundle,
     update_tx: &mpsc::Sender<Update>,
     latest_meta: &mut Option<(TrackMetadata, f64)>,
 ) {
-    let changed = state_bundle.has_player_changed(&meta);
-    if is_track_change && changed {
-        *latest_meta = Some((meta, position));
-    }
-    state_bundle.update_playback(true, position);
-    let updated = state_bundle.update_index(state_bundle.player_state.position);
-    if changed {
-        state_bundle.clear_lyrics();
-        update_and_maybe_send(state_bundle, update_tx, true).await;
-        return;
-    }
-    if updated {
-        update_and_maybe_send(state_bundle, update_tx, false).await;
+    match event {
+        Event::PlayerUpdate(meta, position, is_track_change) => {
+            let changed = state_bundle.player_state.has_changed(&meta);
+            if is_track_change && changed {
+                *latest_meta = Some((meta, position));
+            }
+            state_bundle.update_playback(true, position);
+            let updated = state_bundle.update_index(state_bundle.player_state.position);
+            if changed {
+                state_bundle.clear_lyrics();
+                update_and_maybe_send(state_bundle, update_tx, true).await;
+                return;
+            }
+            if updated {
+                update_and_maybe_send(state_bundle, update_tx, false).await;
+            }
+        }
+        Event::Shutdown => {
+            // Send a final update to indicate UI should close (now just a normal update)
+            update_and_maybe_send(state_bundle, update_tx, true).await;
+        }
     }
 }
 
@@ -277,20 +317,23 @@ pub async fn listen(
     tokio::spawn(async move {
         let _ = crate::mpris::watch_and_handle_events(
             move |meta, pos| {
-                let _ = event_tx_clone.try_send((meta, pos, true));
+                let _ = event_tx_clone.try_send(Event::PlayerUpdate(meta, pos, true));
             },
             move |meta, pos| {
-                let _ = event_tx.try_send((meta, pos, false));
+                let _ = event_tx.try_send(Event::PlayerUpdate(meta, pos, false));
             },
             Some(&mpris_config_clone),
         ).await;
     });
     loop {
         tokio::select! {
-            _ = shutdown_rx.recv() => break,
+            _ = shutdown_rx.recv() => {
+                process_event(Event::Shutdown, &mut state_bundle, &update_tx, &mut latest_meta).await;
+                break;
+            },
             maybe_event = event_rx.recv() => {
-                if let Some((meta, position, is_track_change)) = maybe_event {
-                    handle_event(meta, position, is_track_change, &mut state_bundle, &update_tx, &mut latest_meta).await;
+                if let Some(event) = maybe_event {
+                    process_event(event, &mut state_bundle, &update_tx, &mut latest_meta).await;
                 }
             }
             _ = tokio::time::sleep(poll_interval) => {

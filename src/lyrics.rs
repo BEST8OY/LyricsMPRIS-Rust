@@ -5,7 +5,7 @@ use regex::Regex;
 use thiserror::Error;
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LyricLine {
     pub time: f64,
     pub text: String,
