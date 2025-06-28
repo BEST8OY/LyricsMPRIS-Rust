@@ -98,6 +98,41 @@ pub async fn display_lyrics_modern(
     Ok(())
 }
 
+/// Helper: Handle error updates and UI
+fn handle_update_error<B: tui::backend::Backend>(
+    update: &Update,
+    state: &mut ModernUIState,
+    terminal: &mut Terminal<B>,
+    styles: &LyricStyles,
+    track_id: &(String, String),
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(ref upd_err) = update.err {
+        if upd_err.contains("MprisError") || upd_err.contains("LyricsError") {
+            draw_ui_with_cache(terminal, &None, &state.cached_lines, styles)?;
+            state.last_track_id = Some(track_id.clone());
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Helper: Update paused scroll index
+fn update_paused_scroll(state: &mut ModernUIState, update: &Update) {
+    if !update.playing {
+        if state.paused_scroll_index.is_none() {
+            state.paused_scroll_index = Some(update.index);
+        }
+    } else {
+        state.paused_scroll_index = None;
+    }
+}
+
+/// Helper: Update cached lines and last update
+fn update_cache_and_state(state: &mut ModernUIState, update: &Update) {
+    state.cached_lines = Some(update.lines.iter().map(|l| l.text.clone()).collect());
+    state.last_update = Some(update.clone());
+}
+
 /// Handle incoming update from the lyrics source
 fn process_update<B: tui::backend::Backend>(
     update: Option<Update>,
@@ -115,36 +150,19 @@ fn process_update<B: tui::backend::Backend>(
                 state.cached_lines = None;
                 state.last_update = None;
             }
-            if let Some(ref upd_err) = update.err {
-                if upd_err.contains("MprisError") || upd_err.contains("LyricsError") {
-                    draw_ui_with_cache(terminal, &None, &state.cached_lines, styles)?;
-                    state.last_track_id = Some(track_id);
-                    return Ok(());
-                }
+            if handle_update_error(&update, state, terminal, styles, &track_id)? {
+                return Ok(());
             }
             draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
             state.last_track_id = Some(track_id);
             return Ok(());
         }
         if !update.lines.is_empty() {
-            state.cached_lines = Some(update.lines.iter().map(|l| l.text.clone()).collect());
-            state.last_update = Some(update.clone());
-            if !update.playing {
-                if state.paused_scroll_index.is_none() {
-                    state.paused_scroll_index = Some(update.index);
-                }
-            } else {
-                state.paused_scroll_index = None;
-            }
-        } else if let Some(ref mut upd) = state.last_update {
-            upd.index = update.index;
-            if !update.playing {
-                if state.paused_scroll_index.is_none() {
-                    state.paused_scroll_index = Some(update.index);
-                }
-            } else {
-                state.paused_scroll_index = None;
-            }
+            update_cache_and_state(state, &update);
+            update_paused_scroll(state, &update);
+        } else if let Some(ref mut last_upd) = state.last_update {
+            last_upd.index = update.index;
+            update_paused_scroll(state, &update);
         }
         draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
         state.last_track_id = Some(track_id);
@@ -168,29 +186,30 @@ fn process_event<B: tui::backend::Backend>(
             },
             KeyCode::Up | KeyCode::Char('k') => {
                 try_scroll_lyrics(state, -1);
-                draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
             },
             KeyCode::Down | KeyCode::Char('j') => {
                 try_scroll_lyrics(state, 1);
-                draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
             },
             _ => {}
         }
     }
-    draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
+    // Only redraw if state changed (scroll or exit)
+    if !state.should_exit {
+        draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
+    }
     Ok(())
 }
 
 /// Try to scroll the lyrics up or down by delta (if paused)
 fn try_scroll_lyrics(state: &mut ModernUIState, delta: isize) {
-    if let (Some(ref mut upd), Some(ref _lines)) = (state.last_update.as_mut(), state.cached_lines.as_ref()) {
+    if let (Some(ref mut last_update), Some(ref lines)) = (state.last_update.as_mut(), state.cached_lines.as_ref()) {
         if let Some(idx) = state.paused_scroll_index.as_mut() {
-            if !upd.playing {
-                let len = state.cached_lines.as_ref().map(|l| l.len()).unwrap_or(0);
+            if !last_update.playing {
+                let len = lines.len();
                 let new_idx = (*idx as isize + delta).clamp(0, (len as isize).saturating_sub(1)) as usize;
                 if new_idx != *idx {
                     *idx = new_idx;
-                    upd.index = *idx;
+                    last_update.index = *idx;
                 }
             }
         }
