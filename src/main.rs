@@ -4,6 +4,8 @@ mod pool;
 mod ui;
 mod lyricsdb;
 mod text_utils;
+mod state;
+mod event;
 
 use clap::Parser;
 use std::time::Duration;

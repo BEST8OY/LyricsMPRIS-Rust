@@ -1,6 +1,7 @@
 // ui.rs: Terminal UI for displaying lyrics in pipe and modern modes
 
-use crate::pool::Update;
+use crate::state::Update;
+use crate::pool;
 use crossterm::{execute, terminal::{enable_raw_mode, disable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen}, event::{Event, KeyCode}};
 use std::io::{self};
 use tui::{backend::CrosstermBackend, Terminal, widgets::Paragraph, text::{Span, Spans}, layout::Alignment};
@@ -21,7 +22,7 @@ pub async fn display_lyrics_pipe(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, mut rx) = mpsc::channel(32);
     let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
-    tokio::spawn(crate::pool::listen(tx, poll_interval, db.clone(), db_path.clone(), shutdown_rx, mpris_config.clone()));
+    tokio::spawn(pool::listen(tx, poll_interval, db.clone(), db_path.clone(), shutdown_rx, mpris_config.clone()));
     let mut last_line_idx = None;
     while let Some(upd) = rx.recv().await {
         if upd.lines.is_empty() && (upd.err.is_some() || upd.unsynced.is_some() || (upd.err.is_none() && upd.unsynced.is_none())) {
@@ -50,7 +51,7 @@ pub async fn display_lyrics_modern(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, mut rx) = mpsc::channel(32);
     let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
-    tokio::spawn(crate::pool::listen(tx, poll_interval, db.clone(), db_path.clone(), shutdown_rx, mpris_config.clone()));
+    tokio::spawn(pool::listen(tx, poll_interval, db.clone(), db_path.clone(), shutdown_rx, mpris_config.clone()));
     enable_raw_mode().map_err(to_boxed_err)?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).map_err(to_boxed_err)?;
