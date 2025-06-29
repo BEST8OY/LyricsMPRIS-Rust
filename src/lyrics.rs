@@ -4,6 +4,7 @@ use reqwest::Client;
 use regex::Regex;
 use thiserror::Error;
 use serde::Deserialize;
+use once_cell::sync::Lazy;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LyricLine {
@@ -60,10 +61,13 @@ pub async fn fetch_lyrics_from_lrclib(artist: &str, title: &str) -> Result<Strin
     Ok(api.syncedLyrics.unwrap_or_default())
 }
 
+static SYNCED_LYRICS_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"\[(\d{1,2}):(\d{2})[.](\d{1,2})\]").unwrap()
+});
+
 /// Parse time-synced lyrics into LyricLine structs.
 pub fn parse_synced_lyrics(synced: &str) -> Vec<LyricLine> {
-    // Correct regex: [mm:ss.xx] or [m:ss.xx]
-    let re = Regex::new(r"\[(\d{1,2}):(\d{2})[.](\d{1,2})\]").unwrap();
+    let re = &SYNCED_LYRICS_RE;
     let mut lines = Vec::new();
     for line in synced.lines() {
         let matches: Vec<_> = re.captures_iter(line).collect();
