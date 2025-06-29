@@ -7,7 +7,7 @@ use crate::state::{StateBundle, Update};
 use crate::event::{Event, process_event, handle_poll};
 use tokio::sync::{mpsc, Mutex};
 use std::sync::Arc;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 
 // --- Main Listener ---
 /// Listens for player and lyric updates, sending them to the update channel.
@@ -17,7 +17,7 @@ use tokio::time::Duration;
 pub async fn listen(
     update_tx: mpsc::Sender<Update>,
     poll_interval: Duration,
-    db: Option<Arc<Mutex<LyricsDB>>>,
+    mut db: Option<Arc<Mutex<LyricsDB>>>,
     db_path: Option<String>,
     mut shutdown_rx: mpsc::Receiver<()>,
     mpris_config: crate::Config,
@@ -28,6 +28,11 @@ pub async fn listen(
     let event_tx_track = event_tx.clone();
     let event_tx_seek = event_tx.clone();
     let mpris_config_arc = Arc::new(mpris_config);
+
+    // --- Pause/Resume Resource Management ---
+    let mut paused_since: Option<Instant> = None;
+    let pause_release_threshold = Duration::from_secs(60); // 1 minute
+    let mut was_playing = true;
 
     // --- Spawn MPRIS watcher task ---
     let mpris_config_track = mpris_config_arc.clone();
@@ -52,18 +57,48 @@ pub async fn listen(
             },
             maybe_event = event_rx.recv() => {
                 if let Some(event) = maybe_event {
+                    // Check for playback status change
+                    let prev_playing = was_playing;
                     process_event(event, &mut state, &update_tx, &mut latest_meta, &mpris_config_arc).await;
+                    was_playing = state.player_state.playing;
+                    if prev_playing != was_playing {
+                        if !was_playing {
+                            // Just paused
+                            paused_since = Some(Instant::now());
+                        } else {
+                            // Just resumed
+                            paused_since = None;
+                            // Reacquire DB if needed
+                            if db.is_none() {
+                                if let Some(ref path) = db_path {
+                                    if let Ok(new_db) = LyricsDB::load(path) {
+                                        db = Some(Arc::new(Mutex::new(new_db)));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             _ = tokio::time::sleep(poll_interval) => {
-                handle_poll(
-                    &mut state,
-                    db.as_ref(),
-                    db_path.as_deref(),
-                    &mpris_config_arc,
-                    &update_tx,
-                    &mut latest_meta,
-                ).await;
+                // Only poll if playing
+                if state.player_state.playing {
+                    handle_poll(
+                        &mut state,
+                        db.as_ref(),
+                        db_path.as_deref(),
+                        &mpris_config_arc,
+                        &update_tx,
+                        &mut latest_meta,
+                    ).await;
+                } else {
+                    // If paused for a long time, release DB
+                    if let Some(paused_at) = paused_since {
+                        if paused_at.elapsed() > pause_release_threshold {
+                            db = None;
+                        }
+                    }
+                }
             }
         }
     }
