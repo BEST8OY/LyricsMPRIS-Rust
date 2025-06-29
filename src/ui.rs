@@ -157,6 +157,14 @@ fn process_update<B: tui::backend::Backend>(
             state.last_track_id = Some(track_id);
             return Ok(());
         }
+        // Clear UI if no lyrics and no error (e.g. instrumental or missing lyrics)
+        if update.lines.is_empty() && update.err.is_none() {
+            state.cached_lines = None;
+            state.last_update = None;
+            draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
+            state.last_track_id = Some(track_id);
+            return Ok(());
+        }
         if !update.lines.is_empty() {
             update_cache_and_state(state, &update);
             update_paused_scroll(state, &update);
