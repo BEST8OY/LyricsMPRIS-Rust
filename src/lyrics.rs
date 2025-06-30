@@ -12,17 +12,6 @@ pub struct LyricLine {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct Lyric {
-    #[allow(dead_code)]
-    pub lines: Vec<LyricLine>,
-}
-
-#[allow(dead_code)]
-pub fn is_timesynced(lines: &[LyricLine]) -> bool {
-    lines.len() > 1 && (lines[0].time > 0.0 || lines[1].time > 0.0)
-}
-
 #[derive(Deserialize)]
 #[allow(non_snake_case)]
 struct LrcLibResp {
