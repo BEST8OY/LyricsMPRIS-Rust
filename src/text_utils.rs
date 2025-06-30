@@ -12,7 +12,7 @@ pub fn pad_centered(text: &str, width: usize) -> String {
     }
     let pad_total = width - text_width;
     let pad_left = (pad_total + 1) / 2; // Extra space goes to the left
-    let pad_right = pad_total - pad_left;
+    let pad_right = pad_left;
     format!("{0}{1}{2}", " ".repeat(pad_left), text, " ".repeat(pad_right))
 }
 
