@@ -4,12 +4,13 @@ use crate::state::Update;
 use crate::pool;
 use crossterm::{execute, terminal::{enable_raw_mode, disable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen}, event::{Event, KeyCode}};
 use std::io::{self};
-use tui::{backend::CrosstermBackend, Terminal, widgets::Paragraph, text::{Span, Spans}, layout::Alignment};
+use tui::{backend::CrosstermBackend, Terminal, widgets::Paragraph, text::{Span, Spans}, layout::{Alignment, Rect}};
 use tokio::sync::{mpsc, Mutex};
 use std::time::Duration;
 use crate::lyricsdb::LyricsDB;
 use std::sync::Arc;
-use crate::text_utils::{pad_centered, wrap_text};
+// We no longer need pad_centered
+use crate::text_utils::wrap_text;
 
 /// UI state for the modern TUI mode
 struct ModernUIState {
@@ -32,6 +33,21 @@ impl ModernUIState {
     }
 }
 
+/// A collection of styled text lines (Spans) ready for rendering.
+struct VisibleLines<'a> {
+    before: Vec<Spans<'a>>,
+    current: Vec<Spans<'a>>,
+    after: Vec<Spans<'a>>,
+}
+
+impl<'a> VisibleLines<'a> {
+    /// Combines before, current, and after spans into a single Vec for rendering.
+    fn into_vec(self) -> Vec<Spans<'a>> {
+        [self.before, self.current, self.after].concat()
+    }
+}
+
+
 /// Display lyrics in pipe mode (stdout only, for scripting)
 pub async fn display_lyrics_pipe(
     _meta: crate::mpris::TrackMetadata,
@@ -53,7 +69,11 @@ pub async fn display_lyrics_pipe(
         if upd.err.is_some() { continue; }
         if Some(upd.index) != last_line_idx {
             if let Some(line) = upd.lines.get(upd.index) {
-                println!("{}", line.text);
+                // Use wrap_text to handle long lines even in pipe mode
+                let wrapped = wrap_text(&line.text, 80); // Default width for pipe
+                for wrapped_line in wrapped {
+                    println!("{}", wrapped_line);
+                }
             }
             last_line_idx = Some(upd.index);
         }
@@ -245,21 +265,92 @@ fn to_boxed_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> Box<dyn s
     Box::new(e)
 }
 
-fn render_wrapped_centered_lines<'a>(
-    lines: impl Iterator<Item = String>,
-    width: usize,
+/// Collects the styled lines that should appear *before* the current lyric.
+fn collect_before_spans<'a>(
+    current_index: usize,
+    wrapped_blocks: &[Vec<String>],
+    mut lines_needed: usize,
     style: tui::style::Style,
-) -> Vec<tui::text::Spans<'a>> {
-    lines
-        .flat_map(|l| {
-            wrap_text(&l, width)
-                .into_iter()
-                .map(|wrapped| tui::text::Spans::from(tui::text::Span::styled(pad_centered(&wrapped, width), style)))
-                .collect::<Vec<_>>()
-        })
-        .collect()
+) -> Vec<Spans<'a>> {
+    let mut before_spans = Vec::new();
+    let mut i = current_index;
+    while i > 0 && lines_needed > 0 {
+        i -= 1;
+        let block_to_take_from = &wrapped_blocks[i];
+        let take = block_to_take_from.len().min(lines_needed);
+        let start = block_to_take_from.len() - take;
+
+        let spans = block_to_take_from[start..]
+            .iter()
+            .map(|line| Spans::from(Span::styled(line.clone(), style)));
+        before_spans.splice(0..0, spans); // Prepend to maintain order
+        lines_needed -= take;
+    }
+    before_spans
 }
 
+/// Collects the styled lines that should appear *after* the current lyric.
+fn collect_after_spans<'a>(
+    current_index: usize,
+    wrapped_blocks: &[Vec<String>],
+    mut lines_needed: usize,
+    style: tui::style::Style,
+) -> Vec<Spans<'a>> {
+    let mut after_spans = Vec::new();
+    let mut j = current_index + 1;
+    while j < wrapped_blocks.len() && lines_needed > 0 {
+        let block_to_take_from = &wrapped_blocks[j];
+        let take = block_to_take_from.len().min(lines_needed);
+
+        let spans = block_to_take_from[..take]
+            .iter()
+            .map(|line| Spans::from(Span::styled(line.clone(), style)));
+        after_spans.extend(spans);
+        lines_needed -= take;
+        j += 1;
+    }
+    after_spans
+}
+
+/// Gathers all visible lines (before, current, after) based on the current state and screen size.
+fn gather_visible_lines<'a>(
+    update: &Update,
+    cached: &[String],
+    w: usize,
+    h: usize,
+    styles: &'a LyricStyles,
+) -> VisibleLines<'a> {
+    let wrapped_blocks: Vec<Vec<String>> = cached.iter().map(|l| wrap_text(l, w)).collect();
+    let current_block = &wrapped_blocks[update.index];
+    let current_height = current_block.len();
+
+    let current = current_block
+        .iter()
+        .map(|line| Spans::from(Span::styled(line.clone(), styles.current)))
+        .collect();
+
+    if current_height >= h {
+        // If the current line alone fills the screen, just show that.
+        return VisibleLines {
+            before: Vec::new(),
+            current,
+            after: Vec::new(),
+        };
+    }
+
+    // Otherwise, calculate context lines to show before and after.
+    let context_lines = h - current_height;
+    let lines_needed_before = context_lines / 2;
+    let lines_needed_after = context_lines - lines_needed_before;
+
+    let before = collect_before_spans(update.index, &wrapped_blocks, lines_needed_before, styles.before);
+    let after = collect_after_spans(update.index, &wrapped_blocks, lines_needed_after, styles.after);
+
+    VisibleLines { before, current, after }
+}
+
+
+/// Renders the UI, now using the TUI Paragraph widget for centering.
 fn draw_ui_with_cache<B: tui::backend::Backend>(
     terminal: &mut Terminal<B>,
     last_update: &Option<Update>,
@@ -270,59 +361,36 @@ fn draw_ui_with_cache<B: tui::backend::Backend>(
         let size = f.size();
         let w = size.width as usize;
         let h = size.height as usize;
-        let mut lines = Vec::new();
+        let mut visible_spans: Vec<Spans> = Vec::new();
+
         if let Some(update) = last_update {
             if let Some(ref err) = update.err {
-                let pad_top = h / 2;
-                lines.extend((0..pad_top).map(|_| Spans::from(Span::raw(""))));
-                lines.extend(render_wrapped_centered_lines(std::iter::once(err.clone()), w, styles.current));
+                // If there's an error, wrap it and prepare to render it.
+                visible_spans = wrap_text(err, w)
+                    .into_iter()
+                    .map(|line| Spans::from(Span::styled(line, styles.current)))
+                    .collect();
             } else if let Some(cached) = cached_lines {
                 if !cached.is_empty() && update.index < cached.len() {
-                    let wrapped_lines: Vec<Vec<String>> = cached.iter().map(|l| wrap_text(l, w)).collect();
-                    let visual_heights: Vec<usize> = wrapped_lines.iter().map(|v| v.len()).collect();
-                    let current_block = &wrapped_lines[update.index];
-                    let current_height = current_block.len();
-                    let mut visible = Vec::new();
-                    if current_height >= h {
-                        visible.extend(render_wrapped_centered_lines(current_block.iter().cloned(), w, styles.current));
-                        lines.extend(visible);
-                    } else {
-                        let context_lines = h - current_height;
-                        let mut before = Vec::new();
-                        let mut after = Vec::new();
-                        let mut lines_needed_before = context_lines / 2;
-                        let mut lines_needed_after = context_lines - lines_needed_before;
-                        let mut i = update.index;
-                        while i > 0 && lines_needed_before > 0 {
-                            i -= 1;
-                            let take = visual_heights[i].min(lines_needed_before);
-                            let start = visual_heights[i] - take;
-                            before.extend(render_wrapped_centered_lines(wrapped_lines[i][start..].iter().cloned(), w, styles.before));
-                            lines_needed_before -= take;
-                        }
-                        before.reverse();
-                        let mut j = update.index + 1;
-                        while j < wrapped_lines.len() && lines_needed_after > 0 {
-                            let take = visual_heights[j].min(lines_needed_after);
-                            after.extend(render_wrapped_centered_lines(wrapped_lines[j][..take].iter().cloned(), w, styles.after));
-                            lines_needed_after -= take;
-                            j += 1;
-                        }
-                        visible.extend(before);
-                        visible.extend(render_wrapped_centered_lines(current_block.iter().cloned(), w, styles.current));
-                        visible.extend(after);
-                        let pad_top = h.saturating_sub(visible.len()) / 2;
-                        let pad_bottom = h.saturating_sub(visible.len() + pad_top);
-                        lines.extend((0..pad_top).map(|_| Spans::from(Span::raw(""))));
-                        lines.extend(visible);
-                        lines.extend((0..pad_bottom).map(|_| Spans::from(Span::raw(""))));
-                    }
+                    visible_spans = gather_visible_lines(update, cached, w, h, styles).into_vec();
                 }
             }
         }
-        let paragraph = Paragraph::new(lines)
-            .alignment(Alignment::Left);
-        f.render_widget(paragraph, size);
-    }).map_err(to_boxed_err)?;
+
+        // Calculate vertical padding to center the entire block of text.
+        let top_padding = h.saturating_sub(visible_spans.len()) / 2;
+        let render_area = Rect {
+            x: size.x,
+            y: size.y + top_padding as u16,
+            width: size.width,
+            // Ensure height doesn't exceed the terminal boundary
+            height: (visible_spans.len() as u16).min(size.height),
+        };
+
+        // Create a Paragraph and let it handle the horizontal centering.
+        let paragraph = Paragraph::new(visible_spans).alignment(Alignment::Center);
+        f.render_widget(paragraph, render_area);
+    })
+    .map_err(to_boxed_err)?;
     Ok(())
 }
