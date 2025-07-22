@@ -23,6 +23,7 @@ pub struct PlayerState {
     pub playing: bool,
     pub position: f64,
     pub err: Option<String>,
+    pub player_service: Option<String>, // Cached D-Bus service name
 }
 
 impl PlayerState {
@@ -111,10 +112,7 @@ impl StateBundle {
         }
         self.player_state.update_playback(playing, position);
     }
-    /// Returns true if the player (track) has changed.
-    pub fn has_player_changed(&self, meta: &TrackMetadata) -> bool {
-        self.player_state.has_changed(meta)
-    }
+
     /// Clear all lyrics and increment version.
     pub fn clear_lyrics(&mut self) {
         self.lyric_state.update_lines(Vec::new());

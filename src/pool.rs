@@ -24,7 +24,7 @@ pub async fn listen(
 ) {
     let mut state = StateBundle::new();
     let (event_tx, mut event_rx) = mpsc::channel(8);
-    let mut latest_meta: Option<(TrackMetadata, f64)> = None;
+    let mut latest_meta: Option<(TrackMetadata, f64, String)> = None;
     let event_tx_track = event_tx.clone();
     let event_tx_seek = event_tx.clone();
     let mpris_config_arc = Arc::new(mpris_config);
@@ -38,7 +38,7 @@ pub async fn listen(
     let mpris_config_track = mpris_config_arc.clone();
     tokio::spawn(async move {
         let _ = crate::mpris::watch_and_handle_events(
-            move |meta, pos| {
+            move |meta, pos, _service| {
                 let _ = event_tx_track.try_send(Event::PlayerUpdate(meta, pos, true));
             },
             move |meta, pos| {

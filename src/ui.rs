@@ -2,14 +2,13 @@
 
 use crate::state::Update;
 use crate::pool;
+use crate::lyricsdb::LyricsDB;
 use crossterm::{execute, terminal::{enable_raw_mode, disable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen}, event::{Event, KeyCode}};
 use std::io::{self};
 use tui::{backend::CrosstermBackend, Terminal, widgets::Paragraph, text::{Span, Spans}, layout::{Alignment, Rect}};
 use tokio::sync::{mpsc, Mutex};
 use std::time::Duration;
-use crate::lyricsdb::LyricsDB;
 use std::sync::Arc;
-// We no longer need pad_centered
 use crate::text_utils::wrap_text;
 
 /// UI state for the modern TUI mode

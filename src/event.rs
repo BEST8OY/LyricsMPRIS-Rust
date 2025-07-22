@@ -107,14 +107,19 @@ pub async fn process_event(
     event: Event,
     state: &mut StateBundle,
     update_tx: &mpsc::Sender<Update>,
-    latest_meta: &mut Option<(TrackMetadata, f64)>,
+    latest_meta: &mut Option<(TrackMetadata, f64, String)>,
     mpris_config: &crate::Config,
 ) {
     match event {
         Event::PlayerUpdate(meta, position, is_track_change) => {
             let changed = state.player_state.has_changed(&meta);
             if is_track_change && changed {
-                *latest_meta = Some((meta, position));
+                // Always update the player_service to the new one on track change
+                // The service name is passed via latest_meta in handle_poll, so we must update it here as well
+                // If you have a way to get the service name here, use it; otherwise, clear it to force refresh
+                state.player_state.player_service = None;
+                let service = state.player_state.player_service.clone().unwrap_or_default();
+                *latest_meta = Some((meta, position, service));
             }
             let prev_playing = state.player_state.playing;
             let playing = matches!(crate::mpris::get_playback_status(Some(mpris_config)).await.unwrap_or_default().as_str(), "Playing");
@@ -147,23 +152,58 @@ pub async fn handle_poll(
     db_path: Option<&str>,
     mpris_config: &crate::Config,
     update_tx: &mpsc::Sender<Update>,
-    latest_meta: &mut Option<(TrackMetadata, f64)>,
+    latest_meta: &mut Option<(TrackMetadata, f64, String)>,
 ) {
     let mut sent = false;
-    if let Some((meta, position)) = latest_meta.take() {
+    if let Some((meta, position, service)) = latest_meta.take() {
+        // Only update lyrics and state if a track change was detected by D-Bus event
         fetch_and_update_lyrics(&meta, state, db, db_path, position, mpris_config.debug_log, update_tx).await;
+        // Always update the current player service for polling
+        state.player_state.err = None; // clear error on track change
+        state.player_state.title = meta.title.clone();
+        state.player_state.artist = meta.artist.clone();
+        state.player_state.album = meta.album.clone();
+        state.player_state.position = position;
+        if !service.is_empty() {
+            state.player_state.player_service = Some(service);
+        } else {
+            // If service is empty, clear it to force refresh in polling
+            state.player_state.player_service = None;
+        }
         sent = true;
     }
-    let meta = crate::mpris::get_metadata(Some(mpris_config)).await.unwrap_or_default();
-    let playing = matches!(crate::mpris::get_playback_status(Some(mpris_config)).await.unwrap_or_default().as_str(), "Playing");
-    let position = crate::mpris::get_position(Some(mpris_config)).await.unwrap_or(0.0);
-    // Update state BEFORE checking for changes or sending updates
-    state.update_playback(playing, position);
-    let changed = state.has_player_changed(&meta);
-    let updated = state.update_index(state.player_state.position);
-    if (changed || updated) && !sent {
-        update_and_maybe_send(state, update_tx, true).await;
+    // Only poll position and update lyric index while playing
+    if state.player_state.playing {
+        let position = if let Some(service) = &state.player_state.player_service {
+            if !service.is_empty() {
+                crate::mpris::get_position_for_service(service).await.unwrap_or(0.0)
+            } else {
+                // fallback, and try to cache the service if possible
+                match crate::mpris::get_current_player(Some(mpris_config)).await {
+                    Ok(Some(player)) => {
+                        state.player_state.player_service = Some(player.service.clone());
+                        player.position_seconds()
+                    },
+                    _ => 0.0
+                }
+            }
+        } else {
+            // fallback, and try to cache the service if possible
+            match crate::mpris::get_current_player(Some(mpris_config)).await {
+                Ok(Some(player)) => {
+                    state.player_state.player_service = Some(player.service.clone());
+                    player.position_seconds()
+                },
+                _ => 0.0
+            }
+        };
+        state.update_playback(true, position);
+        let updated = state.update_index(state.player_state.position);
+        if updated && !sent {
+            update_and_maybe_send(state, update_tx, false).await;
+        }
     }
+    // If there is an error, always send update
     if !sent && state.player_state.err.is_some() {
         update_and_maybe_send(state, update_tx, true).await;
     }
