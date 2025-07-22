@@ -60,22 +60,48 @@ pub async fn display_lyrics_pipe(
     let (tx, mut rx) = mpsc::channel(32);
     let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
     tokio::spawn(pool::listen(tx, poll_interval, db.clone(), db_path.clone(), shutdown_rx, mpris_config.clone()));
+
+    // State for track transitions and lyric printing
+    let mut last_track_id: Option<(String, String)> = None;
+    let mut last_track_had_lyric = false;
+    let mut pending_newline = false;
     let mut last_line_idx = None;
+
     while let Some(upd) = rx.recv().await {
-        if upd.lines.is_empty() && upd.err.is_some() {
+        // Track identity: use presence of lyrics and error string
+        let track_id = (
+            upd.lines.get(0).map(|_| "has_lyrics").unwrap_or("no_lyrics").to_string(),
+            upd.err.clone().unwrap_or_default(),
+        );
+
+        // Detect track change
+        let track_changed = last_track_id.as_ref() != Some(&track_id);
+        if track_changed {
+            // If previous track had lyrics, set flag to print newline after first update of new track
+            pending_newline = last_track_id.is_some() && last_track_had_lyric;
+            last_track_id = Some(track_id);
             last_line_idx = None;
+            last_track_had_lyric = false;
             continue;
         }
-        if upd.err.is_some() { continue; }
-        if Some(upd.index) != last_line_idx {
-            if let Some(line) = upd.lines.get(upd.index) {
-                // Use wrap_text to handle long lines even in pipe mode
-                let wrapped = wrap_text(&line.text, 80); // Default width for pipe
-                for wrapped_line in wrapped {
-                    println!("{}", wrapped_line);
-                }
+
+        // On first update for new track, print newline if needed
+        if pending_newline {
+            if upd.lines.is_empty() {
+                println!("");
             }
-            last_line_idx = Some(upd.index);
+            pending_newline = false;
+        }
+
+        // Print lyric line if new lyric index
+        if !upd.lines.is_empty() {
+            if Some(upd.index) != last_line_idx {
+                if let Some(line) = upd.lines.get(upd.index) {
+                    println!("{}", line.text);
+                    last_track_had_lyric = true;
+                }
+                last_line_idx = Some(upd.index);
+            }
         }
     }
     Ok(())
