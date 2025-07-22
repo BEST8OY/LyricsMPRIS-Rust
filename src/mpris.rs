@@ -95,8 +95,8 @@ fn default_config() -> crate::Config {
 }
 
 // --- Public API ---
-/// Returns a vector of all active MPRIS players (async).
-pub async fn active_players() -> Result<Vec<MprisPlayer>, MprisError> {
+/// Gets the list of active player names from playerctld
+async fn get_active_player_names() -> Result<Vec<String>, MprisError> {
     init_dbus_connection().await?;
     let conn = get_shared_connection()?;
     let proxy = Proxy::new(
@@ -105,11 +105,25 @@ pub async fn active_players() -> Result<Vec<MprisPlayer>, MprisError> {
         TIMEOUT,
         conn.clone(),
     );
-    let player_names: Vec<String> = Properties::get(&proxy, "com.github.altdesktop.playerctld", "PlayerNames")
+    Ok(Properties::get(&proxy, "com.github.altdesktop.playerctld", "PlayerNames")
         .await
-        .unwrap_or_default();
+        .unwrap_or_default())
+}
+
+/// Finds the first unblocked player name from the active players list
+async fn find_first_unblocked_player(config: &crate::Config) -> Result<Option<String>, MprisError> {
+    let names = get_active_player_names().await?;
+    Ok(names.into_iter().find(|service| {
+        !config.block.iter().any(|b| service.to_lowercase().contains(b))
+    }))
+}
+
+/// Returns a vector of all active MPRIS players (async).
+/// Note: This function queries all players' properties and should be used sparingly.
+pub async fn active_players() -> Result<Vec<MprisPlayer>, MprisError> {
+    let names = get_active_player_names().await?;
     let mut players = Vec::new();
-    for service in player_names {
+    for service in names {
         if let Ok(player) = get_player_by_service(&service).await {
             players.push(player);
         }
@@ -149,11 +163,13 @@ pub async fn get_player_by_service(service: &str) -> Result<MprisPlayer, MprisEr
 /// Returns the first non-blocked MPRIS player, or None if none are available.
 pub async fn select_player(config: Option<&crate::Config>) -> Result<Option<MprisPlayer>, MprisError> {
     let config_owned = config.map_or_else(default_config, |c| c.clone());
-    let config_ref = &config_owned;
-    let players = active_players().await?;
-    Ok(players.into_iter().find(|p| {
-        !config_ref.block.iter().any(|b| p.service.to_lowercase().contains(b))
-    }))
+    // First find an unblocked player without querying properties
+    if let Some(service) = find_first_unblocked_player(&config_owned).await? {
+        // Only query properties for the first unblocked player
+        get_player_by_service(&service).await.map(Some)
+    } else {
+        Ok(None)
+    }
 }
 
 /// Returns the current MPRIS player, or None if not available.
@@ -190,58 +206,117 @@ where
     tokio::spawn(async move { resource.await });
     let conn = Arc::new(conn);
 
-    let rule = MatchRule::new_signal("org.freedesktop.DBus.Properties", "PropertiesChanged");
-    conn.add_match(rule.clone()).await?;
+    // Watch for both property changes and active player changes
+    let mut rules = vec![
+        MatchRule::new_signal("org.freedesktop.DBus.Properties", "PropertiesChanged"),
+        MatchRule::new_signal("com.github.altdesktop.playerctld", "ActivePlayerChangeEnd"),
+    ];
+    
+    for rule in &rules {
+        conn.add_match(rule.clone()).await?;
+    }
 
     let (tx, mut rx) = mpsc::channel::<dbus::message::Message>(8);
     let conn2 = Arc::clone(&conn);
+    
+    // Create combined match rule for all signals
+    let combined_rule = rules.remove(0);
     MatchingReceiver::start_receive(
         &**conn2,
-        rule,
+        combined_rule,
         Box::new(move |msg, _| {
             let _ = tx.try_send(msg);
             true
         }),
     );
 
-    // Send initial state
-    if let (Ok(meta), Ok(pos)) = (get_metadata(config).await, get_position(config).await) {
-        on_track_change(meta.clone(), pos);
-    }
+    let mut current_service = String::new();
     let mut last_track = TrackMetadata::default();
     let mut last_playback_status = String::new();
-
+    
+    // Get initial player and state
+    if let Some(player) = select_player(config).await? {
+        let meta = player.to_metadata();
+        let pos = player.position_seconds();
+        current_service = player.service;
+        last_track = meta.clone();
+        last_playback_status = player.playback_status;
+        on_track_change(meta, pos);
+    }
+    
     while let Some(msg) = rx.recv().await {
-        if msg.read1::<&str>().ok() != Some("org.mpris.MediaPlayer2.Player") {
+        // Handle active player change signal
+        if msg.interface().as_deref() == Some("com.github.altdesktop.playerctld") &&
+           msg.member().as_deref() == Some("ActivePlayerChangeEnd") {
+            // Get the new active player
+            if let Some(player) = select_player(config).await? {
+                let meta = player.to_metadata();
+                let pos = player.position_seconds();
+                current_service = player.service;
+                last_track = meta.clone();
+                last_playback_status = player.playback_status;
+                on_track_change(meta, pos);
+            }
             continue;
         }
-        let changed: Option<dbus::arg::PropMap> = msg.read2().ok().map(|(_, c): (String, dbus::arg::PropMap)| c);
-        if let Some(changed) = changed {
-            // Metadata changed
-            if changed.contains_key("Metadata") {
-                if let (Ok(meta), Ok(pos)) = (get_metadata(config).await, get_position(config).await) {
-                    if meta != last_track {
-                        last_track = meta.clone();
-                        on_track_change(meta, pos);
+
+        // Handle property changes
+        if msg.interface().as_deref() == Some("org.freedesktop.DBus.Properties") &&
+           msg.read1::<&str>().ok() == Some("org.mpris.MediaPlayer2.Player") {
+            // Only process if we have a current player
+            if current_service.is_empty() {
+                continue;
+            }
+
+            let player_proxy = Proxy::new(
+                &current_service,
+                "/org/mpris/MediaPlayer2",
+                TIMEOUT,
+                get_shared_connection()?.clone(),
+            );
+
+            let changed: Option<dbus::arg::PropMap> = msg.read2().ok().map(|(_, c): (String, dbus::arg::PropMap)| c);
+            if let Some(changed) = changed {
+                // Metadata or PlaybackStatus changed - query only what changed
+                let mut metadata_changed = false;
+                let mut status_changed = false;
+
+                if changed.contains_key("Metadata") {
+                    if let Ok(metadata) = Properties::get::<dbus::arg::PropMap>(&player_proxy, "org.mpris.MediaPlayer2.Player", "Metadata").await {
+                        let (title, artist, album) = extract_metadata(&metadata);
+                        let new_track = TrackMetadata {
+                            title: title.unwrap_or_default(),
+                            artist: artist.unwrap_or_default(),
+                            album: album.unwrap_or_default(),
+                        };
+                        if new_track != last_track {
+                            last_track = new_track;
+                            metadata_changed = true;
+                        }
                     }
                 }
-            }
-            // Position changed
-            if let Some(pos_var) = changed.get("Position") {
-                if let Some(pos) = pos_var.0.as_i64() {
-                    let sec = pos as f64 / 1_000_000.0;
-                    on_seek(last_track.clone(), sec);
-                }
-            }
-            // Playback status changed
-            if let Some(status_var) = changed.get("PlaybackStatus") {
-                if let Some(status) = status_var.0.as_str() {
-                    if status != last_playback_status {
-                        last_playback_status = status.to_string();
-                        // On playback status change, emit on_track_change to trigger UI update
-                        if let (Ok(meta), Ok(pos)) = (get_metadata(config).await, get_position(config).await) {
-                            on_track_change(meta, pos);
+
+                if changed.contains_key("PlaybackStatus") {
+                    if let Ok(status) = Properties::get::<String>(&player_proxy, "org.mpris.MediaPlayer2.Player", "PlaybackStatus").await {
+                        if status != last_playback_status {
+                            last_playback_status = status;
+                            status_changed = true;
                         }
+                    }
+                }
+
+                // Only get position if metadata or status changed (we need all info for track change)
+                if metadata_changed || status_changed {
+                    let position = Properties::get::<i64>(&player_proxy, "org.mpris.MediaPlayer2.Player", "Position")
+                        .await
+                        .map(|p| p as f64 / 1_000_000.0)
+                        .unwrap_or(0.0);
+                    on_track_change(last_track.clone(), position);
+                } else if let Some(pos_var) = changed.get("Position") {
+                    // For position updates, use the value directly from the signal
+                    if let Some(pos) = pos_var.0.as_i64() {
+                        let sec = pos as f64 / 1_000_000.0;
+                        on_seek(last_track.clone(), sec);
                     }
                 }
             }
