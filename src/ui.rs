@@ -144,24 +144,6 @@ pub async fn display_lyrics_modern(
     Ok(())
 }
 
-/// Helper: Handle error updates and UI
-fn handle_update_error<B: tui::backend::Backend>(
-    update: &Update,
-    state: &mut ModernUIState,
-    terminal: &mut Terminal<B>,
-    styles: &LyricStyles,
-    track_id: &(String, String),
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(ref upd_err) = update.err {
-        if upd_err.contains("MprisError") || upd_err.contains("LyricsError") {
-            draw_ui_with_cache(terminal, &None, &state.cached_lines, styles)?;
-            state.last_track_id = Some(track_id.clone());
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 /// Helper: Update paused scroll index
 fn update_paused_scroll(state: &mut ModernUIState, update: &Update) {
     if !update.playing {
@@ -179,13 +161,8 @@ fn update_cache_and_state(state: &mut ModernUIState, update: &Update) {
     state.last_update = Some(update.clone());
 }
 
-/// Handle incoming update from the lyrics source
-fn process_update<B: tui::backend::Backend>(
-    update: Option<Update>,
-    state: &mut ModernUIState,
-    terminal: &mut Terminal<B>,
-    styles: &LyricStyles,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// Encapsulates all logic for updating ModernUIState from an Update.
+fn update_state(state: &mut ModernUIState, update: Option<Update>) {
     if let Some(update) = update {
         let track_id = (
             update.lines.get(0).map(|_| "has_lyrics").unwrap_or("no_lyrics").to_string(),
@@ -196,20 +173,14 @@ fn process_update<B: tui::backend::Backend>(
                 state.cached_lines = None;
                 state.last_update = None;
             }
-            if handle_update_error(&update, state, terminal, styles, &track_id)? {
-                return Ok(());
-            }
-            draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
             state.last_track_id = Some(track_id);
-            return Ok(());
+            return;
         }
-        // Clear UI if no lyrics and no error (e.g. instrumental or missing lyrics)
         if update.lines.is_empty() && update.err.is_none() {
             state.cached_lines = None;
             state.last_update = None;
-            draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
             state.last_track_id = Some(track_id);
-            return Ok(());
+            return;
         }
         if !update.lines.is_empty() {
             update_cache_and_state(state, &update);
@@ -218,11 +189,45 @@ fn process_update<B: tui::backend::Backend>(
             last_upd.index = update.index;
             update_paused_scroll(state, &update);
         }
-        draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
         state.last_track_id = Some(track_id);
     } else {
         state.should_exit = true;
     }
+}
+
+/// Prepares the visible spans for rendering, given the state and styles.
+fn prepare_visible_spans<'a>(
+    last_update: &Option<Update>,
+    cached_lines: &Option<Vec<String>>,
+    w: usize,
+    h: usize,
+    styles: &'a LyricStyles,
+) -> Vec<Spans<'a>> {
+    if let Some(update) = last_update {
+        if let Some(ref err) = update.err {
+            // If there's an error, wrap it and prepare to render it.
+            return wrap_text(err, w)
+                .into_iter()
+                .map(|line| Spans::from(Span::styled(line, styles.current)))
+                .collect();
+        } else if let Some(cached) = cached_lines {
+            if !cached.is_empty() && update.index < cached.len() {
+                return gather_visible_lines(update, cached, w, h, styles).into_vec();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Handle incoming update from the lyrics source (now simplified)
+fn process_update<B: tui::backend::Backend>(
+    update: Option<Update>,
+    state: &mut ModernUIState,
+    terminal: &mut Terminal<B>,
+    styles: &LyricStyles,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    update_state(state, update);
+    draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
     Ok(())
 }
 
@@ -387,21 +392,7 @@ fn draw_ui_with_cache<B: tui::backend::Backend>(
         let size = f.size();
         let w = size.width as usize;
         let h = size.height as usize;
-        let mut visible_spans: Vec<Spans> = Vec::new();
-
-        if let Some(update) = last_update {
-            if let Some(ref err) = update.err {
-                // If there's an error, wrap it and prepare to render it.
-                visible_spans = wrap_text(err, w)
-                    .into_iter()
-                    .map(|line| Spans::from(Span::styled(line, styles.current)))
-                    .collect();
-            } else if let Some(cached) = cached_lines {
-                if !cached.is_empty() && update.index < cached.len() {
-                    visible_spans = gather_visible_lines(update, cached, w, h, styles).into_vec();
-                }
-            }
-        }
+        let visible_spans = prepare_visible_spans(last_update, cached_lines, w, h, styles);
 
         // Calculate vertical padding to center the entire block of text.
         let top_padding = h.saturating_sub(visible_spans.len()) / 2;
