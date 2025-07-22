@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, Mutex};
 /// Events that can be sent to the event loop.
 #[derive(Debug)]
 pub enum Event {
-    PlayerUpdate(TrackMetadata, f64, bool),
+    PlayerUpdate(TrackMetadata, f64, bool, bool), // (meta, pos, is_track_change, is_playing)
     Shutdown,
 }
 
@@ -107,18 +107,17 @@ pub async fn process_event(
     event: Event,
     state: &mut StateBundle,
     update_tx: &mpsc::Sender<Update>,
-    latest_meta: &mut Option<(TrackMetadata, f64)>,
-    mpris_config: &crate::Config,
+    latest_meta: &mut Option<(TrackMetadata, f64, bool)>,
+    _mpris_config: &crate::Config,
 ) {
     match event {
-        Event::PlayerUpdate(meta, position, is_track_change) => {
+        Event::PlayerUpdate(meta, position, is_track_change, is_playing) => {
             let changed = state.player_state.has_changed(&meta);
             if is_track_change && changed {
-                *latest_meta = Some((meta, position));
+                *latest_meta = Some((meta.clone(), position, is_playing));
             }
             let prev_playing = state.player_state.playing;
-            let playing = matches!(crate::mpris::get_playback_status(Some(mpris_config)).await.unwrap_or_default().as_str(), "Playing");
-            state.update_playback(playing, position);
+            state.update_playback(is_playing, position);
             let updated = state.update_index(state.player_state.position);
             if changed {
                 state.clear_lyrics();
@@ -126,7 +125,7 @@ pub async fn process_event(
                 return;
             }
             // Force update if playing/paused state changed
-            if prev_playing != playing {
+            if prev_playing != is_playing {
                 update_and_maybe_send(state, update_tx, true).await;
                 return;
             }
@@ -147,24 +146,34 @@ pub async fn handle_poll(
     db_path: Option<&str>,
     mpris_config: &crate::Config,
     update_tx: &mpsc::Sender<Update>,
-    latest_meta: &mut Option<(TrackMetadata, f64)>,
+    latest_meta: &mut Option<(TrackMetadata, f64, bool)>,
 ) {
-    let mut sent = false;
-    if let Some((meta, position)) = latest_meta.take() {
+    // removed unused sent variable
+    if let Some((meta, position, playing)) = latest_meta.take() {
         fetch_and_update_lyrics(&meta, state, db, db_path, position, mpris_config.debug_log, update_tx).await;
-        sent = true;
-    }
-    let meta = crate::mpris::get_metadata(Some(mpris_config)).await.unwrap_or_default();
-    let playing = matches!(crate::mpris::get_playback_status(Some(mpris_config)).await.unwrap_or_default().as_str(), "Playing");
-    let position = crate::mpris::get_position(Some(mpris_config)).await.unwrap_or(0.0);
-    // Update state BEFORE checking for changes or sending updates
-    state.update_playback(playing, position);
-    let changed = state.has_player_changed(&meta);
-    let updated = state.update_index(state.player_state.position);
-    if (changed || updated) && !sent {
-        update_and_maybe_send(state, update_tx, true).await;
-    }
-    if !sent && state.player_state.err.is_some() {
-        update_and_maybe_send(state, update_tx, true).await;
+        state.update_playback(playing, position);
+        let changed = state.has_player_changed(&meta);
+        let updated = state.update_index(state.player_state.position);
+        if changed || updated {
+            update_and_maybe_send(state, update_tx, true).await;
+        }
+        if state.player_state.err.is_some() {
+            update_and_maybe_send(state, update_tx, true).await;
+        }
+        // removed unused sent variable
+    } else {
+        // Only poll D-Bus if we have no recent event-driven update
+        let meta = crate::mpris::get_metadata(Some(mpris_config)).await.unwrap_or_default();
+        let playing = matches!(crate::mpris::get_playback_status(Some(mpris_config)).await.unwrap_or_default().as_str(), "Playing");
+        let position = crate::mpris::get_position(Some(mpris_config)).await.unwrap_or(0.0);
+        state.update_playback(playing, position);
+        let changed = state.has_player_changed(&meta);
+        let updated = state.update_index(state.player_state.position);
+        if changed || updated {
+            update_and_maybe_send(state, update_tx, true).await;
+        }
+        if state.player_state.err.is_some() {
+            update_and_maybe_send(state, update_tx, true).await;
+        }
     }
 }

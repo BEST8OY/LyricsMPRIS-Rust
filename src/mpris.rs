@@ -118,19 +118,6 @@ async fn find_first_unblocked_player(config: &crate::Config) -> Result<Option<St
     }))
 }
 
-/// Returns a vector of all active MPRIS players (async).
-/// Note: This function queries all players' properties and should be used sparingly.
-pub async fn active_players() -> Result<Vec<MprisPlayer>, MprisError> {
-    let names = get_active_player_names().await?;
-    let mut players = Vec::new();
-    for service in names {
-        if let Ok(player) = get_player_by_service(&service).await {
-            players.push(player);
-        }
-    }
-    Ok(players)
-}
-
 /// Fetch a player by its D-Bus service name (async).
 pub async fn get_player_by_service(service: &str) -> Result<MprisPlayer, MprisError> {
     init_dbus_connection().await?;
@@ -195,12 +182,12 @@ pub async fn get_playback_status(config: Option<&crate::Config>) -> Result<Strin
 /// Watches for MPRIS property change signals and invokes the provided callbacks.
 pub async fn watch_and_handle_events<F, G>(
     mut on_track_change: F,
-    mut on_seek: G,
+    _on_seek: G,
     config: Option<&crate::Config>,
 ) -> Result<(), MprisError>
 where
-    F: FnMut(TrackMetadata, f64) + Send + 'static,
-    G: FnMut(TrackMetadata, f64) + Send + 'static,
+    F: FnMut(TrackMetadata, f64, bool) + Send + 'static,
+    G: FnMut(TrackMetadata, f64, bool) + Send + 'static,
 {
     let (resource, conn) = dbus_tokio::connection::new_session_sync()?;
     tokio::spawn(async move { resource.await });
@@ -231,31 +218,29 @@ where
     );
 
     let mut current_service = String::new();
-    let mut last_track = TrackMetadata::default();
-    let mut last_playback_status = String::new();
     
-    // Get initial player and state
+    // On startup: fetch player names, player state, and metadata
+    let _ = get_active_player_names().await?;
     if let Some(player) = select_player(config).await? {
         let meta = player.to_metadata();
         let pos = player.position_seconds();
+        let playing = player.playback_status == "Playing";
         current_service = player.service;
-        last_track = meta.clone();
-        last_playback_status = player.playback_status;
-        on_track_change(meta, pos);
+        on_track_change(meta, pos, playing);
     }
     
     while let Some(msg) = rx.recv().await {
         // Handle active player change signal
         if msg.interface().as_deref() == Some("com.github.altdesktop.playerctld") &&
            msg.member().as_deref() == Some("ActivePlayerChangeEnd") {
-            // Get the new active player
+            // On ActivePlayerChangeEnd: fetch player names and update current player
+            let _ = get_active_player_names().await?;
             if let Some(player) = select_player(config).await? {
                 let meta = player.to_metadata();
                 let pos = player.position_seconds();
+                let playing = player.playback_status == "Playing";
                 current_service = player.service;
-                last_track = meta.clone();
-                last_playback_status = player.playback_status;
-                on_track_change(meta, pos);
+                on_track_change(meta, pos, playing);
             }
             continue;
         }
@@ -268,58 +253,15 @@ where
                 continue;
             }
 
-            let player_proxy = Proxy::new(
-                &current_service,
-                "/org/mpris/MediaPlayer2",
-                TIMEOUT,
-                get_shared_connection()?.clone(),
-            );
-
-            let changed: Option<dbus::arg::PropMap> = msg.read2().ok().map(|(_, c): (String, dbus::arg::PropMap)| c);
-            if let Some(changed) = changed {
-                // Metadata or PlaybackStatus changed - query only what changed
-                let mut metadata_changed = false;
-                let mut status_changed = false;
-
-                if changed.contains_key("Metadata") {
-                    if let Ok(metadata) = Properties::get::<dbus::arg::PropMap>(&player_proxy, "org.mpris.MediaPlayer2.Player", "Metadata").await {
-                        let (title, artist, album) = extract_metadata(&metadata);
-                        let new_track = TrackMetadata {
-                            title: title.unwrap_or_default(),
-                            artist: artist.unwrap_or_default(),
-                            album: album.unwrap_or_default(),
-                        };
-                        if new_track != last_track {
-                            last_track = new_track;
-                            metadata_changed = true;
-                        }
-                    }
-                }
-
-                if changed.contains_key("PlaybackStatus") {
-                    if let Ok(status) = Properties::get::<String>(&player_proxy, "org.mpris.MediaPlayer2.Player", "PlaybackStatus").await {
-                        if status != last_playback_status {
-                            last_playback_status = status;
-                            status_changed = true;
-                        }
-                    }
-                }
-
-                // Only get position if metadata or status changed (we need all info for track change)
-                if metadata_changed || status_changed {
-                    let position = Properties::get::<i64>(&player_proxy, "org.mpris.MediaPlayer2.Player", "Position")
-                        .await
-                        .map(|p| p as f64 / 1_000_000.0)
-                        .unwrap_or(0.0);
-                    on_track_change(last_track.clone(), position);
-                } else if let Some(pos_var) = changed.get("Position") {
-                    // For position updates, use the value directly from the signal
-                    if let Some(pos) = pos_var.0.as_i64() {
-                        let sec = pos as f64 / 1_000_000.0;
-                        on_seek(last_track.clone(), sec);
-                    }
-                }
+            // On PropertiesChanged: fetch player state and metadata for the affected player
+            if let Some(player) = select_player(config).await? {
+                let meta = player.to_metadata();
+                let pos = player.position_seconds();
+                let playing = player.playback_status == "Playing";
+                current_service = player.service;
+                on_track_change(meta, pos, playing);
             }
+            continue;
         }
     }
     Ok(())
