@@ -3,6 +3,7 @@
 use crate::lyrics::LyricLine;
 use crate::mpris::TrackMetadata;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Represents a UI update for lyrics and player state.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -12,18 +13,39 @@ pub struct Update {
     pub err: Option<String>,
     pub version: u64, // Incremented on any state change
     pub playing: bool, // Whether playback is active
+    pub artist: String,
+    pub title: String,
+    pub album: String,
 }
 
 /// Holds the current state of the player (track info, playback, errors).
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct PlayerState {
     pub title: String,
     pub artist: String,
     pub album: String,
     pub playing: bool,
-    pub position: f64,
+    pub position: f64, // last known position (seconds)
     pub err: Option<String>,
     pub player_service: Option<String>, // Cached D-Bus service name
+    pub last_position: f64, // last position from DBus (seconds)
+    pub last_update: Option<Instant>, // when last_position was updated
+}
+
+impl Default for PlayerState {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            artist: String::new(),
+            album: String::new(),
+            playing: false,
+            position: 0.0,
+            err: None,
+            player_service: None,
+            last_position: 0.0,
+            last_update: None,
+        }
+    }
 }
 
 impl PlayerState {
@@ -34,15 +56,39 @@ impl PlayerState {
         self.album = meta.album.clone();
         self.position = 0.0;
         self.err = None;
+        self.last_position = 0.0;
+        self.last_update = Some(Instant::now());
     }
-    /// Update playback status and position.
-    pub fn update_playback(&mut self, playing: bool, position: f64) {
+
+    /// Update playback status and position from DBus (reset cache).
+    pub fn update_playback_dbus(&mut self, playing: bool, position: f64) {
         self.playing = playing;
+        self.last_position = position;
+        self.last_update = Some(Instant::now());
         self.position = position;
     }
+
+    /// Estimate current position using local timer if playing.
+    pub fn estimate_position(&self) -> f64 {
+        if self.playing {
+            if let Some(instant) = self.last_update {
+                let elapsed = instant.elapsed().as_secs_f64();
+                return self.last_position + elapsed;
+            }
+        }
+        self.last_position
+    }
+
     /// Returns true if the track metadata has changed.
     pub fn has_changed(&self, meta: &TrackMetadata) -> bool {
         self.title != meta.title || self.artist != meta.artist || self.album != meta.album
+    }
+
+    /// Reset position cache (e.g., on track change).
+    pub fn reset_position_cache(&mut self, position: f64) {
+        self.last_position = position;
+        self.last_update = Some(Instant::now());
+        self.position = position;
     }
 }
 
@@ -73,11 +119,13 @@ impl LyricState {
             Err(idx) => idx - 1,
         }
     }
+
     /// Replace all lyric lines and reset index.
     pub fn update_lines(&mut self, lines: Vec<LyricLine>) {
         self.index = 0;
         self.lines = Arc::new(lines);
     }
+
     /// Update the current lyric index. Returns true if changed.
     pub fn update_index(&mut self, new_index: usize) -> bool {
         if new_index != self.index {
@@ -105,13 +153,6 @@ impl StateBundle {
             version: 0,
         }
     }
-    /// Update playback state and increment version if changed.
-    pub fn update_playback(&mut self, playing: bool, position: f64) {
-        if self.player_state.playing != playing || (self.player_state.position - position).abs() > f64::EPSILON {
-            self.version += 1;
-        }
-        self.player_state.update_playback(playing, position);
-    }
 
     /// Clear all lyrics and increment version.
     pub fn clear_lyrics(&mut self) {
@@ -119,6 +160,7 @@ impl StateBundle {
         self.lyric_state.index = 0;
         self.version += 1;
     }
+
     /// Update lyrics, player metadata, and error, incrementing version.
     pub fn update_lyrics(&mut self, lines: Vec<LyricLine>, meta: &TrackMetadata, err: Option<String>) {
         self.lyric_state.update_lines(lines);
@@ -126,6 +168,7 @@ impl StateBundle {
         self.player_state.update_from_metadata(meta);
         self.version += 1;
     }
+
     /// Update lyric index for the given position. Returns true if changed and increments version.
     pub fn update_index(&mut self, position: f64) -> bool {
         let new_index = self.lyric_state.get_index(position);

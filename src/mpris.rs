@@ -1,16 +1,3 @@
-/// Fetch only the playback position for a known service (async).
-pub async fn get_position_for_service(service: &str) -> Result<f64, MprisError> {
-    init_dbus_connection().await?;
-    let conn = get_shared_connection()?;
-    let player_proxy = Proxy::new(service, "/org/mpris/MediaPlayer2", TIMEOUT, conn.clone());
-    let position: Option<i64> = Properties::get(&player_proxy, "org.mpris.MediaPlayer2.Player", "Position")
-        .await
-        .map_err(|e| {
-            e
-        })
-        .ok();
-    Ok(position.map(|p| p as f64 / 1_000_000.0).unwrap_or(0.0))
-}
 // mpris.rs: Fully async MPRIS client for metadata, position, and event watching
 
 // --- Imports ---
@@ -94,12 +81,25 @@ fn get_shared_connection() -> Result<Arc<SyncConnection>, MprisError> {
 
 fn extract_metadata(map: &dbus::arg::PropMap) -> (Option<String>, Option<String>, Option<String>) {
     let title = map.get("xesam:title").and_then(|v| v.0.as_str()).map(str::to_string);
-    let artist = map.get("xesam:artist")
-        .and_then(|v| v.0.as_iter())
-        .and_then(|mut it| it.next())
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let album = map.get("xesam:album").and_then(|v| v.0.as_str()).map(str::to_string);
+    let artist = map.get("xesam:artist").and_then(|v| {
+        // Try as array of strings
+        if let Some(mut iter) = v.0.as_iter() {
+            iter.next().and_then(|v| v.as_str()).map(str::to_string)
+        } else if let Some(s) = v.0.as_str() {
+            Some(s.to_string())
+        } else {
+            None
+        }
+    });
+    let album = map.get("xesam:album").and_then(|v| {
+        if let Some(mut iter) = v.0.as_iter() {
+            iter.next().and_then(|v| v.as_str()).map(str::to_string)
+        } else if let Some(s) = v.0.as_str() {
+            Some(s.to_string())
+        } else {
+            None
+        }
+    });
     (title, artist, album)
 }
 
@@ -215,17 +215,30 @@ where
     tokio::spawn(async move { resource.await });
     let conn = Arc::new(conn);
 
-    // Only watch for PropertiesChanged
-    let rule = MatchRule::new_signal("org.freedesktop.DBus.Properties", "PropertiesChanged");
-    conn.add_match(rule.clone()).await?;
+    // Watch for PropertiesChanged and Seeked
+    let rule_prop = MatchRule::new_signal("org.freedesktop.DBus.Properties", "PropertiesChanged");
+    let rule_seeked = MatchRule::new_signal("org.mpris.MediaPlayer2.Player", "Seeked");
+    conn.add_match(rule_prop.clone()).await?;
+    conn.add_match(rule_seeked.clone()).await?;
 
     let (tx, mut rx) = mpsc::channel::<dbus::message::Message>(8);
     let conn2 = Arc::clone(&conn);
+    let tx_prop = tx.clone();
     MatchingReceiver::start_receive(
         &**conn2,
-        rule,
+        rule_prop,
         Box::new(move |msg, _| {
-            let _ = tx.try_send(msg);
+            let _ = tx_prop.try_send(msg);
+            true
+        }),
+    );
+    let conn3 = Arc::clone(&conn);
+    let tx_seeked = tx.clone();
+    MatchingReceiver::start_receive(
+        &**conn3,
+        rule_seeked,
+        Box::new(move |msg, _| {
+            let _ = tx_seeked.try_send(msg);
             true
         }),
     );
@@ -263,6 +276,23 @@ where
         }
 
         if let Some(msg) = rx.recv().await {
+            // Handle Seeked signal
+            if msg.interface().as_deref() == Some("org.mpris.MediaPlayer2.Player") {
+                if let Some(member) = msg.member() {
+                    if member.to_string() == "Seeked" {
+                        // Only process if we have a current player
+                        if current_service.is_empty() {
+                            return Ok(());
+                        }
+                        // Seeked signal: arg0 is new position in microseconds
+                        if let Some(pos) = msg.read1::<i64>().ok() {
+                            let sec = pos as f64 / 1_000_000.0;
+                            on_seek(last_track.clone(), sec);
+                        }
+                        continue;
+                    }
+                }
+            }
 
             // Handle property changes
             if msg.interface().as_deref() == Some("org.freedesktop.DBus.Properties") &&
@@ -322,7 +352,6 @@ where
                         // For position updates, use the value directly from the signal
                         if let Some(pos) = pos_var.0.as_i64() {
                             let sec = pos as f64 / 1_000_000.0;
-                            
                             on_seek(last_track.clone(), sec);
                         }
                     }
