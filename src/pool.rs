@@ -3,7 +3,8 @@
 use crate::lyricsdb::LyricsDB;
 use crate::mpris::TrackMetadata;
 use crate::state::{StateBundle, Update};
-use crate::event::{Event, process_event, handle_poll};
+use crate::event::{Event, MprisEvent, process_event, handle_poll};
+use crate::mpris::events::MprisEventHandler;
 use tokio::sync::{mpsc, Mutex};
 use std::sync::Arc;
 use tokio::time::{Duration, Instant};
@@ -13,7 +14,7 @@ pub async fn listen(
     poll_interval: Duration,
     mut db: Option<Arc<Mutex<LyricsDB>>>,
     db_path: Option<String>,
-    mut shutdown_rx: mpsc::Receiver<()>,
+    mut shutdown_rx: mpsc::Receiver<()>, 
     mpris_config: crate::Config,
 ) {
     let mut state = StateBundle::new();
@@ -28,16 +29,14 @@ pub async fn listen(
 
     // Initial fetch (refactored for efficiency)
     let meta = crate::mpris::metadata::get_metadata(service.as_deref().unwrap_or("")).await.unwrap_or_default();
-    let position = crate::mpris::playback::get_position(service.as_deref().unwrap_or("")).await.unwrap_or(0.0);
-    crate::event::fetch_and_update_lyrics(
+    let position = crate::event::fetch_and_update_lyrics(
         &meta,
         &mut state,
         db.as_ref(),
         db_path.as_deref(),
         mpris_config_arc.debug_log,
-        &update_tx,
+        service.as_deref().unwrap_or(""),
     ).await;
-    state.player_state.player_service = service;
     state.player_state.position = position;
 
     let mut paused_since: Option<Instant> = None;
@@ -45,29 +44,20 @@ pub async fn listen(
     let mut was_playing = true;
 
     // Spawn MPRIS watcher
-    let event_tx_track = event_tx.clone();
+    let event_tx_update = event_tx.clone();
     let event_tx_seek = event_tx.clone();
     let block_list = mpris_config_arc.block.clone();
     tokio::spawn(async move {
-        let _ = crate::mpris::watch_and_handle_events(
+        let mut event_handler = MprisEventHandler::new(
             move |meta, pos, service| {
-                let _ = event_tx_track.try_send(Event::PlayerUpdate {
-                    meta,
-                    position: pos,
-                    track_changed: true,
-                    player_service: service,
-                });
+                let _ = event_tx_update.try_send(Event::Mpris(MprisEvent::PlayerUpdate(meta, pos, service)));
             },
             move |meta, pos, service| {
-                let _ = event_tx_seek.try_send(Event::PlayerUpdate {
-                    meta,
-                    position: pos,
-                    track_changed: false,
-                    player_service: service,
-                });
+                let _ = event_tx_seek.try_send(Event::Mpris(MprisEvent::Seeked(meta, pos, service)));
             },
-            &block_list,
-        ).await;
+            block_list,
+        ).await.expect("Failed to create MPRIS event handler");
+        let _ = event_handler.handle_events().await;
     });
 
     loop {
@@ -105,6 +95,7 @@ pub async fn listen(
                         db.as_ref(),
                         db_path.as_deref(),
                         &update_tx,
+                        mpris_config_arc.debug_log,
                         &mut latest_meta,
                     ).await;
                 } else if let Some(paused_at) = paused_since {

@@ -9,4 +9,4 @@ pub mod events;
 pub use connection::{get_active_player_names, is_blocked};
 pub use metadata::TrackMetadata;
 pub use playback::get_playback_status;
-pub use events::watch_and_handle_events;
+

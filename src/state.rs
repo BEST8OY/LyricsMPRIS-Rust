@@ -25,7 +25,6 @@ pub struct PlayerState {
     pub playing: bool,
     pub position: f64,
     pub err: Option<String>,
-    pub player_service: Option<String>,
     pub last_position: f64,
     pub last_update: Option<Instant>,
     pub length: Option<f64>,
