@@ -23,9 +23,6 @@ pub struct Config {
     /// Pipe current lyric line to stdout (default is modern UI)
     #[arg(long)]
     pipe: bool,
-    /// Lyric poll interval in milliseconds
-    #[arg(long, default_value_t = 1000)]
-    poll: u64,
     /// Path to local lyrics database (optional)
     #[arg(long)]
     database: Option<String>,
@@ -43,7 +40,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             pipe: false,
-            poll: 1000,
             database: None,
             block: vec![],
             debug_log: false,
@@ -55,7 +51,7 @@ impl Default for Config {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cfg = Config::parse();
-    let poll_interval = Duration::from_millis(cfg.poll);
+    let poll_interval = Duration::from_millis(1000);
     let db_path = cfg.database.clone();
 
     // Load database if path provided

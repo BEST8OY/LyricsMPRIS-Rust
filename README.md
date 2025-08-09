@@ -1,114 +1,127 @@
-# LyricsMPRIS-Rust
+# LyricsMPRIS for Rust
 
-A modern, async terminal lyrics viewer for Linux, powered by the [MPRIS](https://specifications.freedesktop.org/mpris-spec/latest/) D-Bus interface. Displays synced lyrics for your currently playing song from any compatible media player (Spotify, VLC, mpv, etc.), with both a beautiful TUI and a scripting-friendly pipe mode.
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
 
----
+**A sleek, real-time terminal lyrics viewer for Linux.**
 
-> **Note:** This project is fully written by GitHub Copilot in Visual Studio Code.
+LyricsMPRIS connects to any [MPRIS](https://specifications.freedesktop.org/mpris-spec/latest/)-compatible music player (like Spotify, VLC, or mpv) and displays the current song's lyrics right in your terminal. It offers a beautiful, focused TUI and a simple "pipe" mode for scripting and status bars.
 
 ---
 
 ## Features
 
-- **Modern TUI**: Centered, highlighted, real-time lyrics display in your terminal.
-- **Pipe Mode**: Output the current lyric line to stdout for scripting or status bars.
-- **MPRIS Support**: Works with any Linux player supporting MPRIS (Spotify, VLC, mpv, etc.).
-- **Async & Fast**: Fully async Rust code for smooth, responsive updates.
-- **Local Lyrics Database**: Optionally use a local lyrics database for offline lyrics.
-- **Blocklist**: Exclude specific MPRIS player services.
-- **Error Logging**: Optional debug logging to stderr.
+- **Real-Time Lyrics:** Automatically fetches and displays synced lyrics for the currently playing song.
+- **Modern Terminal UI:** A clean, centered, and highlighted interface that looks great in any terminal.
+- **Pipe Mode:** Output the current lyric line directly to `stdout`. Perfect for custom scripts, status bars (like `polybar` or `waybar`), or other tools.
+- **Wide Compatibility:** Works with any media player that implements the MPRIS D-Bus interface.
+- **Fast and Efficient:** Built with asynchronous Rust for a smooth, non-blocking experience.
+- **Local Lyrics:** (Optional) Use a local database for instant, offline lyric access.
+- **Player Blocklist:** Ignore specific media players you don't want to track.
 
 ---
 
 ## Installation
 
 ### Prerequisites
-- Linux (with D-Bus and MPRIS-compatible media player)
-- [Rust toolchain](https://rustup.rs/)
+
+- A Linux-based OS with D-Bus.
+- The [Rust toolchain](https://rustup.rs/) (to build from source).
+- An MPRIS-compatible media player.
 
 ### Build from Source
-```sh
-# Clone the repo
- git clone https://github.com/yourusername/LyricsMPRIS-Rust.git
- cd LyricsMPRIS-Rust
 
-# Build the project
- cargo build --release
+1.  **Clone the repository:**
+    ```sh
+    git clone https://github.com/your-username/LyricsMPRIS-Rust.git
+    cd LyricsMPRIS-Rust
+    ```
 
-# Run (see usage below)
- ./target/release/lyricsmpris
-```
+2.  **Build the release binary:**
+    ```sh
+    cargo build --release
+    ```
+
+3.  **Run the application:**
+    The executable will be at `./target/release/lyricsmpris`. You can copy it to a directory in your `$PATH` for easy access (e.g., `~/.local/bin`).
 
 ---
 
 ## Usage
 
+The simplest way to run LyricsMPRIS is without any arguments, which will launch the TUI.
+
 ```sh
-lyricsmpris [OPTIONS]
+lyricsmpris
 ```
 
-### Options
-- `--pipe`           Pipe current lyric line to stdout (for scripting)
-- `--poll <ms>`      Lyric poll interval in milliseconds (default: 1000)
-- `--database <path>`  Path to local lyrics database (optional)
-- `--block <SERVICES>` Blocklist for MPRIS player service names (comma-separated, case-insensitive)
-- `--debug-log`      Enable backend error logging to stderr
-- `-h, --help`       Print help
-- `-V, --version`    Print version
+For more options, use the `--help` flag:
+
+```sh
+$ lyricsmpris --help
+A modern, async terminal lyrics viewer for Linux via MPRIS.
+
+Usage: lyricsmpris [OPTIONS]
+
+Options:
+      --pipe
+          Pipe current lyric line to stdout (for scripting)
+      --database <path>
+          Path to local lyrics database
+      --block <SERVICES>
+          Blocklist for MPRIS player service names (comma-separated)
+      --debug-log
+          Enable backend error logging to stderr
+  -h, --help
+          Print help
+  -V, --version
+          Print version
+```
 
 ### Examples
 
-- **Modern TUI (default):**
+- **Launch the default TUI:**
   ```sh
   lyricsmpris
   ```
-- **Pipe mode for status bar:**
+
+- **Pipe lyrics to your status bar:**
   ```sh
   lyricsmpris --pipe
   ```
+
 - **Use a local lyrics database:**
   ```sh
-  lyricsmpris --database ~/.local/share/lyrics.db
+  lyricsmpris --poll 500 --database ~/.config/lyrics.db
   ```
-- **Block Spotify, VLC and Edge:**
+
+- **Ignore Spotify and VLC:**
   ```sh
   lyricsmpris --block spotify,vlc
   ```
 
 ---
 
-## How It Works
-
-- Connects to the D-Bus session and queries MPRIS-compatible players for metadata and playback position.
-- Periodically polls and/or listens for D-Bus events to update lyrics in real time.
-- Displays lyrics in a modern TUI or pipes the current line to stdout.
-- Optionally loads lyrics from a local database.
-
----
-
 ## Supported Players
-Any Linux media player that implements the MPRIS D-Bus interface, including:
+
+LyricsMPRIS should work with any media player that implements the MPRIS D-Bus interface. This includes, but is not limited to:
+
 - Spotify
 - VLC
-- mpv
+- mpv (with an MPRIS plugin)
 - Rhythmbox
 - Audacious
-- ...and many more
-
----
-
-## Troubleshooting
-- **No lyrics shown?**  Make sure your player supports MPRIS and is playing a track with metadata.
-- **D-Bus errors?**  Ensure you have a running D-Bus session and the player is started normally (not as root).
-- **Debugging:**  Use `--debug-log` to print backend errors to stderr.
+- Elisa
+- And many more...
 
 ---
 
 ## Contributing
-Pull requests, bug reports, and feature suggestions are welcome! Please open an issue or PR on GitHub.
+
+Contributions are welcome! If you have a feature request, bug report, or pull request, please feel free to open an issue or PR on the GitHub repository.
 
 ---
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
