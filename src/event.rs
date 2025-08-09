@@ -132,6 +132,22 @@ async fn handle_mpris_event(
         MprisEvent::Seeked(meta, pos, service) => (meta, pos, service, false),
     };
 
+    if service.is_empty() {
+        state.clear_lyrics();
+        state.player_state = Default::default();
+        send_update(state, update_tx, true).await;
+        return;
+    }
+
+    let playback_status = crate::mpris::get_playback_status(&service).await.unwrap_or_default();
+
+    if playback_status == "Stopped" {
+        state.clear_lyrics();
+        state.player_state = Default::default(); // Reset player state
+        send_update(state, update_tx, true).await;
+        return;
+    }
+
     let is_new_track = state.player_state.has_changed(&meta);
 
     if track_changed && is_new_track {
@@ -141,10 +157,7 @@ async fn handle_mpris_event(
     }
 
     let prev_playing = state.player_state.playing;
-    let playing = matches!(
-        crate::mpris::get_playback_status(&service).await.unwrap_or_default().as_str(),
-        "Playing"
-    );
+    let playing = playback_status == "Playing";
 
     state.player_state.update_playback_dbus(playing, position);
     let updated = state.update_index(state.player_state.estimate_position());

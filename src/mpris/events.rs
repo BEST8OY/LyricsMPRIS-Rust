@@ -152,6 +152,11 @@ where
                         if *service != self.current_service {
                             self.update_current_player(service).await?;
                         }
+                    } else {
+                        // No active, unblocked player found
+                        self.current_service.clear();
+                        let meta = TrackMetadata::default();
+                        (self.on_track_change)(meta, 0.0, String::new());
                     }
                 }
             }
