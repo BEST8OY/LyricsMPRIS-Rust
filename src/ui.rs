@@ -17,7 +17,7 @@ struct ModernUIState {
     cached_lines: Option<Vec<String>>,
     last_track_id: Option<(String, String)>,
     should_exit: bool,
-    paused_scroll_index: Option<usize>,
+    
 }
 
 impl ModernUIState {
@@ -27,7 +27,7 @@ impl ModernUIState {
             cached_lines: None,
             last_track_id: None,
             should_exit: false,
-            paused_scroll_index: None,
+            
         }
     }
 }
@@ -129,7 +129,6 @@ pub async fn display_lyrics_modern(
                     let track_id = (upd.artist.clone(), upd.title.clone(), upd.album.clone());
                     if last_track_id.as_ref() != Some(&track_id) {
                         // Optionally, reset scroll or state here if needed
-                        state.paused_scroll_index = None;
                         state.last_track_id = None;
                     }
                     last_track_id = Some(track_id);
@@ -149,16 +148,7 @@ pub async fn display_lyrics_modern(
     Ok(())
 }
 
-/// Helper: Update paused scroll index
-fn update_paused_scroll(state: &mut ModernUIState, update: &Update) {
-    if !update.playing {
-        if state.paused_scroll_index.is_none() {
-            state.paused_scroll_index = Some(update.index);
-        }
-    } else {
-        state.paused_scroll_index = None;
-    }
-}
+
 
 /// Helper: Update cached lines and last update
 fn update_cache_and_state(state: &mut ModernUIState, update: &Update) {
@@ -189,10 +179,8 @@ fn update_state(state: &mut ModernUIState, update: Option<Update>) {
         }
         if !update.lines.is_empty() {
             update_cache_and_state(state, &update);
-            update_paused_scroll(state, &update);
         } else if let Some(ref mut last_upd) = state.last_update {
             last_upd.index = update.index;
-            update_paused_scroll(state, &update);
         }
         state.last_track_id = Some(track_id);
     } else {
@@ -248,12 +236,7 @@ fn process_event<B: tui::backend::Backend>(
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
                 state.should_exit = true;
             },
-            KeyCode::Up | KeyCode::Char('k') => {
-                try_scroll_lyrics(state, -1);
-            },
-            KeyCode::Down | KeyCode::Char('j') => {
-                try_scroll_lyrics(state, 1);
-            },
+            
             _ => {}
         }
     }
@@ -264,21 +247,7 @@ fn process_event<B: tui::backend::Backend>(
     Ok(())
 }
 
-/// Try to scroll the lyrics up or down by delta (if paused)
-fn try_scroll_lyrics(state: &mut ModernUIState, delta: isize) {
-    if let (Some(ref mut last_update), Some(ref lines)) = (state.last_update.as_mut(), state.cached_lines.as_ref()) {
-        if let Some(idx) = state.paused_scroll_index.as_mut() {
-            if !last_update.playing {
-                let len = lines.len();
-                let new_idx = (*idx as isize + delta).clamp(0, (len as isize).saturating_sub(1)) as usize;
-                if new_idx != *idx {
-                    *idx = new_idx;
-                    last_update.index = *idx;
-                }
-            }
-        }
-    }
-}
+
 
 #[derive(Default)]
 struct LyricStyles {
