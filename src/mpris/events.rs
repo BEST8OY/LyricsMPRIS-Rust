@@ -47,7 +47,6 @@ where
         Self::add_match_rule(&conn, MatchRule::new_signal(DBUS_PROPERTIES_INTERFACE, "PropertiesChanged").static_clone(), tx.clone()).await?;
         Self::add_match_rule(&conn, MatchRule::new_signal(DBUS_PROPERTIES_INTERFACE, "PropertiesChanged").with_sender(PLAYERCTL_SENDER).static_clone(), tx.clone()).await?;
         Self::add_match_rule(&conn, MatchRule::new_signal(MPRIS_PLAYER_INTERFACE, "Seeked").static_clone(), tx.clone()).await?;
-        Self::add_match_rule(&conn, MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged").static_clone(), tx.clone()).await?;
 
         let mut handler = Self {
             on_track_change,
@@ -125,17 +124,7 @@ where
         match (msg.interface().as_deref(), msg.member().as_deref()) {
             (Some(MPRIS_PLAYER_INTERFACE), Some("Seeked")) => self.handle_seek(msg).await?,
             (Some(DBUS_PROPERTIES_INTERFACE), _) => self.handle_properties_changed(msg).await?,
-            (Some("org.freedesktop.DBus"), Some("NameOwnerChanged")) => self.handle_name_owner_changed(msg).await?,
             _ => {}
-        }
-        Ok(())
-    }
-
-    async fn handle_name_owner_changed(&mut self, msg: dbus::message::Message) -> Result<(), MprisError> {
-        if let Some(name) = msg.read1::<&str>().ok() {
-            if name.starts_with("org.mpris.MediaPlayer2.") {
-                self.check_player_change().await?;
-            }
         }
         Ok(())
     }
