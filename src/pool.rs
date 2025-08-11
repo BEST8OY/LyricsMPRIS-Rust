@@ -23,7 +23,7 @@ pub async fn listen(
     let mut mpris_config = mpris_config;
 
     // Find first unblocked player at startup
-    let mut service = match crate::mpris::get_active_player_names().await {
+    let service = match crate::mpris::get_active_player_names().await {
         Ok(names) => names.into_iter().find(|s| !crate::mpris::is_blocked(s, &mpris_config.block)),
         Err(e) => {
             if mpris_config.debug_log {
@@ -33,7 +33,7 @@ pub async fn listen(
         }
     };
     mpris_config.player_service = service.clone();
-    let mut mpris_config_arc = Arc::new(mpris_config);
+    let mpris_config_arc = Arc::new(mpris_config);
 
     if service.is_none() {
         state.clear_lyrics();
@@ -111,16 +111,6 @@ pub async fn listen(
                 }
             }
             _ = tokio::time::sleep(poll_interval) => {
-                if let Some(current_service) = &service {
-                    let active_players = crate::mpris::get_active_player_names().await.ok().unwrap_or_default();
-                    if !active_players.iter().any(|s| s == current_service) {
-                        service = active_players.into_iter().find(|s| !crate::mpris::is_blocked(s, &mpris_config_arc.block));
-                        let mut config_clone = (*mpris_config_arc).clone();
-                        config_clone.player_service = service.clone();
-                        mpris_config_arc = Arc::new(config_clone);
-                    }
-                }
-
                 if state.player_state.playing {
                     handle_poll(
                         &mut state,

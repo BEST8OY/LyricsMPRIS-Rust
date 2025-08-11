@@ -47,6 +47,7 @@ where
         Self::add_match_rule(&conn, MatchRule::new_signal(DBUS_PROPERTIES_INTERFACE, "PropertiesChanged").static_clone(), tx.clone()).await?;
         Self::add_match_rule(&conn, MatchRule::new_signal(DBUS_PROPERTIES_INTERFACE, "PropertiesChanged").with_sender(PLAYERCTL_SENDER).static_clone(), tx.clone()).await?;
         Self::add_match_rule(&conn, MatchRule::new_signal(MPRIS_PLAYER_INTERFACE, "Seeked").static_clone(), tx.clone()).await?;
+        Self::add_match_rule(&conn, MatchRule::new_signal("org.freedesktop.DBus", "NameOwnerChanged").static_clone(), tx.clone()).await?;
 
         let mut handler = Self {
             on_track_change,
@@ -60,11 +61,7 @@ where
         };
 
         // Initial player discovery
-        if let Ok(names) = get_active_player_names().await {
-            if let Some(service) = names.iter().find(|s| !is_blocked(s, &handler.block_list)) {
-                handler.update_current_player(service).await?;
-            }
-        }
+        handler.check_player_change().await?;
 
         Ok(handler)
     }
@@ -84,6 +81,22 @@ where
                 true
             }),
         );
+        Ok(())
+    }
+
+    async fn check_player_change(&mut self) -> Result<(), MprisError> {
+        if let Ok(names) = get_active_player_names().await {
+            if let Some(service) = names.iter().find(|s| !is_blocked(s, &self.block_list)) {
+                if *service != self.current_service {
+                    self.update_current_player(service).await?;
+                }
+            } else {
+                // No active, unblocked player found
+                self.current_service.clear();
+                let meta = TrackMetadata::default();
+                (self.on_track_change)(meta, 0.0, String::new());
+            }
+        }
         Ok(())
     }
 
@@ -112,7 +125,17 @@ where
         match (msg.interface().as_deref(), msg.member().as_deref()) {
             (Some(MPRIS_PLAYER_INTERFACE), Some("Seeked")) => self.handle_seek(msg).await?,
             (Some(DBUS_PROPERTIES_INTERFACE), _) => self.handle_properties_changed(msg).await?,
+            (Some("org.freedesktop.DBus"), Some("NameOwnerChanged")) => self.handle_name_owner_changed(msg).await?,
             _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_name_owner_changed(&mut self, msg: dbus::message::Message) -> Result<(), MprisError> {
+        if let Some(name) = msg.read1::<&str>().ok() {
+            if name.starts_with("org.mpris.MediaPlayer2.") {
+                self.check_player_change().await?;
+            }
         }
         Ok(())
     }
@@ -132,33 +155,17 @@ where
         if let Some(interface_name) = msg.read1::<&str>().ok() {
             match interface_name {
                 "org.mpris.MediaPlayer2" | "org.freedesktop.DBus.Properties" | "com.github.altdesktop.playerctld" => {
-                    self.handle_player_names_changed(msg).await?;
+                    let changed: Option<dbus::arg::PropMap> = msg.read2().ok().map(|(_, c): (String, dbus::arg::PropMap)| c);
+                    if let Some(changed) = changed {
+                        if changed.contains_key("PlayerNames") {
+                            self.check_player_change().await?;
+                        }
+                    }
                 }
                 MPRIS_PLAYER_INTERFACE => {
                     self.handle_player_properties_changed(msg).await?;
                 }
                 _ => {}
-            }
-        }
-        Ok(())
-    }
-
-    async fn handle_player_names_changed(&mut self, msg: dbus::message::Message) -> Result<(), MprisError> {
-        let changed: Option<dbus::arg::PropMap> = msg.read2().ok().map(|(_, c): (String, dbus::arg::PropMap)| c);
-        if let Some(changed) = changed {
-            if changed.contains_key("PlayerNames") {
-                if let Ok(names) = get_active_player_names().await {
-                    if let Some(service) = names.iter().find(|s| !is_blocked(s, &self.block_list)) {
-                        if *service != self.current_service {
-                            self.update_current_player(service).await?;
-                        }
-                    } else {
-                        // No active, unblocked player found
-                        self.current_service.clear();
-                        let meta = TrackMetadata::default();
-                        (self.on_track_change)(meta, 0.0, String::new());
-                    }
-                }
             }
         }
         Ok(())
