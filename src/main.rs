@@ -70,13 +70,29 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Always start the UI, even if no song is playing yet
     // Try to get current metadata/position, but ignore errors and let UI handle waiting
     let service = cfg.player_service.clone().unwrap_or_default();
-    let meta = get_metadata(&service).await.unwrap_or_default();
-    let pos = get_position(&service).await.unwrap_or(0.0);
+    let meta = match get_metadata(&service).await {
+        Ok(meta) => meta,
+        Err(e) => {
+            if cfg.debug_log {
+                eprintln!("[LyricsMPRIS] D-Bus error getting metadata: {}", e);
+            }
+            Default::default()
+        }
+    };
+    let pos = match get_position(&service).await {
+        Ok(pos) => pos,
+        Err(e) => {
+            if cfg.debug_log {
+                eprintln!("[LyricsMPRIS] D-Bus error getting position: {}", e);
+            }
+            0.0
+        }
+    };
 
     let result = if cfg.pipe {
-        crate::ui::display_lyrics_pipe(meta, pos, poll_interval, db.clone(), db_path.clone(), cfg.clone()).await
+        crate::ui::pipe::display_lyrics_pipe(meta, pos, poll_interval, db.clone(), db_path.clone(), cfg.clone()).await
     } else {
-        crate::ui::display_lyrics_modern(meta, pos, poll_interval, db.clone(), db_path.clone(), cfg.clone()).await
+        crate::ui::modern::display_lyrics_modern(meta, pos, poll_interval, db.clone(), db_path.clone(), cfg.clone()).await
     };
 
     // Print error if any, for better diagnostics

@@ -97,7 +97,19 @@ pub async fn fetch_and_update_lyrics(
         fetch_api_lyrics(meta, state, db, db_path, debug_log).await;
     }
     // After fetching, get the most up-to-date position
-    let position = crate::mpris::playback::get_position(player_service).await.unwrap_or(0.0);
+    let position = match crate::mpris::playback::get_position(player_service).await {
+        Ok(pos) => {
+            state.player_state.err = None;
+            pos
+        }
+        Err(e) => {
+            if debug_log {
+                eprintln!("[LyricsMPRIS] D-Bus error getting position: {}", e);
+            }
+            state.player_state.err = Some(format!("D-Bus: {}", e));
+            0.0
+        }
+    };
     state.update_index(position);
     state.player_state.reset_position_cache(position);
     position

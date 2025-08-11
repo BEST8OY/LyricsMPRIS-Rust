@@ -23,8 +23,15 @@ pub async fn listen(
     let mut mpris_config = mpris_config;
 
     // Find first unblocked player at startup
-    let mut service = crate::mpris::get_active_player_names().await.ok()
-        .and_then(|names| names.into_iter().find(|s| !crate::mpris::is_blocked(s, &mpris_config.block)));
+    let mut service = match crate::mpris::get_active_player_names().await {
+        Ok(names) => names.into_iter().find(|s| !crate::mpris::is_blocked(s, &mpris_config.block)),
+        Err(e) => {
+            if mpris_config.debug_log {
+                eprintln!("[LyricsMPRIS] D-Bus error getting active players: {}", e);
+            }
+            None
+        }
+    };
     mpris_config.player_service = service.clone();
     let mut mpris_config_arc = Arc::new(mpris_config);
 
@@ -35,7 +42,15 @@ pub async fn listen(
     }
 
     // Initial fetch (refactored for efficiency)
-    let meta = crate::mpris::metadata::get_metadata(service.as_deref().unwrap_or("")).await.unwrap_or_default();
+    let meta = match crate::mpris::metadata::get_metadata(service.as_deref().unwrap_or("")).await {
+        Ok(meta) => meta,
+        Err(e) => {
+            if mpris_config_arc.debug_log {
+                eprintln!("[LyricsMPRIS] D-Bus error getting metadata: {}", e);
+            }
+            Default::default()
+        }
+    };
     let position = crate::event::fetch_and_update_lyrics(
         &meta,
         &mut state,
