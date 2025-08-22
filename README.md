@@ -1,7 +1,4 @@
-# LyricsMPRIS for Rust
-
-[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
+# LyricsMPRIS-Rust
 
 **A sleek, real-time terminal lyrics viewer for Linux.**
 
@@ -14,6 +11,7 @@ LyricsMPRIS connects to any [MPRIS](https://specifications.freedesktop.org/mpris
 - **Real-Time Lyrics:** Automatically fetches and displays synced lyrics for the currently playing song.
 - **Modern Terminal UI:** A clean, centered, and highlighted interface that looks great in any terminal.
 - **Pipe Mode:** Output the current lyric line directly to `stdout`. Perfect for custom scripts, status bars (like `polybar` or `waybar`), or other tools.
+- **Multiple Lyric Providers:** Fetch lyrics from various sources.
 - **Wide Compatibility:** Works with any media player that implements the MPRIS D-Bus interface.
 - **Fast and Efficient:** Built with asynchronous Rust for a smooth, non-blocking experience.
 - **Local Lyrics:** (Optional) Use a local database for instant, offline lyric access.
@@ -55,28 +53,26 @@ The simplest way to run LyricsMPRIS is without any arguments, which will launch 
 lyricsmpris
 ```
 
+### Command-Line Options
+
 For more options, use the `--help` flag:
 
 ```sh
 $ lyricsmpris --help
-A modern, async terminal lyrics viewer for Linux via MPRIS.
-
-Usage: lyricsmpris [OPTIONS]
-
-Options:
-      --pipe
-          Pipe current lyric line to stdout (for scripting)
-      --database <path>
-          Path to local lyrics database
-      --block <SERVICES>
-          Blocklist for MPRIS player service names (comma-separated)
-      --debug-log
-          Enable backend error logging to stderr
-  -h, --help
-          Print help
-  -V, --version
-          Print version
 ```
+
+| Option | Description | Default Value |
+|---|---|---|
+| `--pipe` | Pipe current lyric line to stdout. | `false` |
+| `--database <PATH>` | Path to local lyrics database. | `None` |
+| `--block <SERVICES>` | Comma-separated list of player service names to block. | `[]` (empty list) |
+| `--debug-log` | Enable backend error logging to stderr. | `false` |
+| `--providers <PROVIDERS>` | Comma-separated list of lyric providers in preferred order. | `lrclib,musixmatch` |
+
+### Environment Variables
+
+- `LYRIC_PROVIDERS`: A comma-separated list of lyric providers to use, in preferred order. This is used as a fallback if the `--providers` option is not specified.
+- `MUSIXMATCH_USERTOKEN`: To use the Musixmatch provider, you need to provide a user token. You can get this from the Musixmatch desktop app or website.
 
 ### Examples
 
@@ -92,12 +88,17 @@ Options:
 
 - **Use a local lyrics database:**
   ```sh
-  lyricsmpris --poll 500 --database ~/.config/lyrics.db
+  lyricsmpris --database ~/.config/lyrics.db
   ```
 
 - **Ignore Spotify and VLC:**
   ```sh
   lyricsmpris --block spotify,vlc
+  ```
+
+- **Specify lyric providers:**
+  ```sh
+  lyricsmpris --providers musixmatch,lrclib
   ```
 
 ---
