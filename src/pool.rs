@@ -17,6 +17,12 @@ pub async fn listen(
     mut shutdown_rx: mpsc::Receiver<()>, 
     mpris_config: crate::Config,
 ) {
+    // Determine provider order from config (default is lrclib then musixmatch)
+    let providers: Vec<String> = if mpris_config.providers.is_empty() {
+        vec!["lrclib".to_string(), "musixmatch".to_string()]
+    } else {
+        mpris_config.providers.clone()
+    };
     let mut state = StateBundle::new();
     let (event_tx, mut event_rx) = mpsc::channel(8);
     let mut latest_meta: Option<(TrackMetadata, f64, String)> = None;
@@ -57,6 +63,7 @@ pub async fn listen(
         db.as_ref(),
         db_path.as_deref(),
         mpris_config_arc.debug_log,
+        &providers,
         service.as_deref().unwrap_or(""),
     ).await;
     state.player_state.position = position;
@@ -119,6 +126,7 @@ pub async fn listen(
                         &update_tx,
                         mpris_config_arc.debug_log,
                         &mut latest_meta,
+                        &providers,
                     ).await;
                 } else if let Some(paused_at) = paused_since {
                     if paused_at.elapsed() > pause_release_threshold {

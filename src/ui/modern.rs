@@ -14,7 +14,7 @@ use crate::ui::styles::LyricStyles;
 pub struct ModernUIState {
     pub last_update: Option<Update>,
     pub cached_lines: Option<Vec<String>>,
-    pub last_track_id: Option<(String, String)>,
+    pub last_track_id: Option<(String, String, String)>,
     pub should_exit: bool,
     
 }
@@ -70,7 +70,7 @@ pub async fn display_lyrics_modern(
             update = rx.recv() => {
                 // Robust track change detection for TUI mode
                 if let Some(ref upd) = update {
-                    let track_id = (upd.artist.clone(), upd.title.clone(), upd.album.clone());
+                    let track_id = crate::ui::track_id(upd);
                     if last_track_id.as_ref() != Some(&track_id) {
                         // Optionally, reset scroll or state here if needed
                         state.last_track_id = None;
@@ -101,10 +101,7 @@ fn update_cache_and_state(state: &mut ModernUIState, update: &Update) {
 /// Encapsulates all logic for updating ModernUIState from an Update.
 fn update_state(state: &mut ModernUIState, update: Option<Update>) {
     if let Some(update) = update {
-        let track_id = (
-            update.lines.get(0).map(|_| "has_lyrics").unwrap_or("no_lyrics").to_string(),
-            update.err.clone().unwrap_or_default(),
-        );
+    let track_id = crate::ui::track_id(&update);
         if update.lines.is_empty() && update.err.is_some() {
             if state.last_track_id.as_ref() != Some(&track_id) {
                 state.cached_lines = None;
@@ -175,10 +172,12 @@ fn process_event<B: tui::backend::Backend>(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Event::Key(key) = event {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+            KeyCode::Char('q') | KeyCode::Esc => {
                 state.should_exit = true;
-            },
-            
+            }
+            KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+                state.should_exit = true;
+            }
             _ => {}
         }
     }
@@ -291,19 +290,25 @@ fn draw_ui_with_cache<B: tui::backend::Backend>(
         let h = size.height as usize;
         let visible_spans = prepare_visible_spans(last_update, cached_lines, w, h, styles);
 
-        // Calculate vertical padding to center the entire block of text.
-        let top_padding = h.saturating_sub(visible_spans.len()) / 2;
-        let render_area = Rect {
-            x: size.x,
-            y: size.y + top_padding as u16,
-            width: size.width,
-            // Ensure height doesn't exceed the terminal boundary
-            height: (visible_spans.len() as u16).min(size.height),
-        };
+        if visible_spans.is_empty() {
+            // Render an empty paragraph to clear the area and avoid zero-height rendering.
+            let paragraph = Paragraph::new(vec![Spans::from(Span::raw(""))]).alignment(Alignment::Center);
+            f.render_widget(paragraph, size);
+        } else {
+            // Calculate vertical padding to center the entire block of text.
+            let top_padding = h.saturating_sub(visible_spans.len()) / 2;
+            let render_area = Rect {
+                x: size.x,
+                y: size.y + top_padding as u16,
+                width: size.width,
+                // Ensure height doesn't exceed the terminal boundary
+                height: (visible_spans.len() as u16).min(size.height),
+            };
 
-        // Create a Paragraph and let it handle the horizontal centering.
-        let paragraph = Paragraph::new(visible_spans).alignment(Alignment::Center);
-        f.render_widget(paragraph, render_area);
+            // Create a Paragraph and let it handle the horizontal centering.
+            let paragraph = Paragraph::new(visible_spans).alignment(Alignment::Center);
+            f.render_widget(paragraph, render_area);
+        }
     })
     .map_err(to_boxed_err)?;
     Ok(())

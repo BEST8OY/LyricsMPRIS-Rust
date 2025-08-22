@@ -32,6 +32,10 @@ pub struct Config {
     /// Enable backend error logging to stderr
     #[arg(long)]
     pub debug_log: bool,
+    /// Comma-separated list of lyric providers in preferred order (e.g. "lrclib,musixmatch").
+    /// If empty, the LYRIC_PROVIDERS env var will be used as a fallback.
+    #[arg(long, value_delimiter = ',')]
+    pub providers: Vec<String>,
     /// Cached current player service for efficient D-Bus queries
     pub player_service: Option<String>,
 }
@@ -43,7 +47,19 @@ impl Default for Config {
             database: None,
             block: vec![],
             debug_log: false,
+            providers: vec!["lrclib".to_string(), "musixmatch".to_string()],
             player_service: None,
+        }
+    }
+}
+
+fn providers_from_env_if_empty(cli: &mut Config) {
+    if cli.providers.is_empty() {
+        if let Ok(s) = std::env::var("LYRIC_PROVIDERS") {
+            let parts: Vec<String> = s.split(',').map(|p| p.trim().to_lowercase()).filter(|p| !p.is_empty()).collect();
+            if !parts.is_empty() {
+                cli.providers = parts;
+            }
         }
     }
 }
@@ -51,6 +67,8 @@ impl Default for Config {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cfg = Config::parse();
+    let mut cfg = cfg;
+    providers_from_env_if_empty(&mut cfg);
     let poll_interval = Duration::from_millis(1000);
     let db_path = cfg.database.clone();
 

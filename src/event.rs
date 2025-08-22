@@ -57,26 +57,83 @@ async fn try_db_lyrics(meta: &TrackMetadata, state: &mut StateBundle, db: &Arc<M
 }
 
 /// Fetch lyrics from API and update state. Save to DB if possible.
-async fn fetch_api_lyrics(meta: &TrackMetadata, state: &mut StateBundle, db: Option<&Arc<Mutex<LyricsDB>>>, db_path: Option<&str>, debug_log: bool) {
-    match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title).await {
-        Ok(synced) if !synced.is_empty() => {
-            state.update_lyrics(crate::lyrics::parse_synced_lyrics(&synced), meta, None);
-            if let Some((db, path)) = db.zip(db_path) {
-                let mut guard = db.lock().await;
-                guard.insert(&meta.artist, &meta.title, &synced);
-                let _ = guard.save(path);
+/// `providers` is the ordered list of providers to try (e.g. ["lrclib", "musixmatch"]).
+async fn fetch_api_lyrics(
+    meta: &TrackMetadata,
+    state: &mut StateBundle,
+    db: Option<&Arc<Mutex<LyricsDB>>>,
+    db_path: Option<&str>,
+    debug_log: bool,
+    providers: &[String],
+) {
+    // Try providers in order. If one returns non-empty lyrics, use it and save to DB if available.
+    for prov in providers {
+        match prov.as_str() {
+            "lrclib" => match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title).await {
+                Ok((lines, raw)) if !lines.is_empty() => {
+                    state.update_lyrics(lines, meta, None);
+                    if let Some((db, path)) = db.zip(db_path) {
+                        if let Some(raw_lrc) = raw {
+                            let mut guard = db.lock().await;
+                            guard.insert(&meta.artist, &meta.title, &raw_lrc);
+                            let _ = guard.save(path);
+                        }
+                    }
+                    return;
+                }
+                Ok((_lines, _)) => { /* empty, try next provider */ }
+                Err(e) => {
+                    if debug_log {
+                        eprintln!("[LyricsMPRIS] lrclib error: {}", e);
+                    }
+                    // Treat network errors as transient: try next provider; Api errors are fatal
+                    match e {
+                        crate::lyrics::LyricsError::Network(_) => { /* continue to next provider */ }
+                        _ => {
+                            state.update_lyrics(Vec::new(), meta, Some(e.to_string()));
+                            return;
+                        }
+                    }
+                }
+            },
+            "musixmatch" => {
+                // Use the desktop usertoken flow.
+                match crate::lyrics::fetch_lyrics_from_musixmatch_usertoken(&meta.artist, &meta.title).await {
+                    Ok((lines, raw)) if !lines.is_empty() => {
+                        state.update_lyrics(lines, meta, None);
+                        if let Some((db, path)) = db.zip(db_path) {
+                            if let Some(raw_lrc) = raw {
+                                let mut guard = db.lock().await;
+                                guard.insert(&meta.artist, &meta.title, &raw_lrc);
+                                let _ = guard.save(path);
+                            }
+                        }
+                        return;
+                    }
+                    Ok((_lines, _)) => { /* empty, try next provider */ }
+                    Err(e) => {
+                        if debug_log {
+                            eprintln!("[LyricsMPRIS] musixmatch error: {}", e);
+                        }
+                        match e {
+                            crate::lyrics::LyricsError::Network(_) => { /* transient, try next */ }
+                            _ => {
+                                state.update_lyrics(Vec::new(), meta, Some(e.to_string()));
+                                return;
+                            }
+                        }
+                    }
+                }
+            },
+            other => {
+                if debug_log {
+                    eprintln!("[LyricsMPRIS] unknown provider: {}", other);
+                }
             }
-        }
-        Ok(_) => {
-            state.update_lyrics(Vec::new(), meta, None);
-        }
-        Err(e) => {
-            if debug_log {
-                eprintln!("[LyricsMPRIS] API error: {}", e);
-            }
-            state.update_lyrics(Vec::new(), meta, Some(e.to_string()));
         }
     }
+    // No provider returned lyrics
+    state.update_lyrics(Vec::new(), meta, None);
 }
 
 /// Fetch lyrics (DB first, then API) and update state. Resync position and send update.
@@ -86,6 +143,7 @@ pub async fn fetch_and_update_lyrics(
     db: Option<&Arc<Mutex<LyricsDB>>>,
     db_path: Option<&str>,
     debug_log: bool,
+    providers: &[String],
     player_service: &str,
 ) -> f64 {
     let found = if let Some(db) = db {
@@ -94,7 +152,7 @@ pub async fn fetch_and_update_lyrics(
         false
     };
     if !found {
-        fetch_api_lyrics(meta, state, db, db_path, debug_log).await;
+        fetch_api_lyrics(meta, state, db, db_path, debug_log, providers).await;
     }
     // After fetching, get the most up-to-date position
     let position = match crate::mpris::playback::get_position(player_service).await {
@@ -186,11 +244,12 @@ async fn handle_latest_meta_update(
     db: Option<&Arc<Mutex<LyricsDB>>>,
     db_path: Option<&str>,
     debug_log: bool,
+    providers: &[String],
     update_tx: &mpsc::Sender<Update>,
 ) -> bool {
     if let Some((meta, _old_position, service)) = latest_meta.take() {
         // Fetch lyrics for the new track
-        let position = fetch_and_update_lyrics(&meta, state, db, db_path, debug_log, &service).await;
+        let position = fetch_and_update_lyrics(&meta, state, db, db_path, debug_log, providers, &service).await;
         state.update_index(position);
         state.player_state.reset_position_cache(position);
         send_update(state, update_tx, true).await;
@@ -219,10 +278,11 @@ pub async fn handle_poll(
     update_tx: &mpsc::Sender<Update>,
     debug_log: bool,
     latest_meta: &mut Option<(TrackMetadata, f64, String)>,
+    providers: &[String],
 ) {
     let mut should_send_update = false;
 
-    if handle_latest_meta_update(state, latest_meta, db, db_path, debug_log, update_tx).await {
+    if handle_latest_meta_update(state, latest_meta, db, db_path, debug_log, providers, update_tx).await {
         should_send_update = true;
     }
 

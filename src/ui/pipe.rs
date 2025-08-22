@@ -23,7 +23,7 @@ pub async fn display_lyrics_pipe(
     let mut last_line_idx = None;
 
     while let Some(upd) = rx.recv().await {
-        let track_id = (upd.artist.clone(), upd.title.clone(), upd.album.clone());
+    let track_id = crate::ui::track_id(&upd);
         let has_lyrics = !upd.lines.is_empty();
         let track_changed = last_track_id.as_ref() != Some(&track_id);
 
