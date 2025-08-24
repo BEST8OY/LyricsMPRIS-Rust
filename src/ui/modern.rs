@@ -10,7 +10,7 @@ use crossterm::{
 };
 use std::io::{self};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, mpsc};
 use tui::{
     Terminal,
@@ -26,6 +26,8 @@ pub struct ModernUIState {
     pub cached_lines: Option<Vec<String>>,
     pub last_track_id: Option<(String, String, String)>,
     pub should_exit: bool,
+    /// Instant when the last Update was received; used to estimate current position
+    pub last_update_instant: Option<Instant>,
 }
 
 impl ModernUIState {
@@ -35,6 +37,7 @@ impl ModernUIState {
             cached_lines: None,
             last_track_id: None,
             should_exit: false,
+            last_update_instant: None,
         }
     }
 }
@@ -80,6 +83,8 @@ pub async fn display_lyrics_modern(
     let styles = LyricStyles::default();
     let mut state = ModernUIState::new();
     let mut last_track_id: Option<(String, String, String)> = None;
+    // UI tick for smooth in-line progress updates (e.g. karaoke highlighting)
+    let mut ui_tick = tokio::time::interval(Duration::from_millis(100));
     while !state.should_exit {
         tokio::select! {
             update = rx.recv() => {
@@ -93,6 +98,20 @@ pub async fn display_lyrics_modern(
                     last_track_id = Some(track_id);
                 }
                 process_update(update, &mut state, &mut terminal, &styles)?;
+            }
+            // Periodic UI tick: update the displayed position based on elapsed time
+            _ = ui_tick.tick() => {
+                // If we have a last update, use its position + elapsed (when playing)
+                if let Some(ref last_upd) = state.last_update {
+                    let mut displayed = last_upd.clone();
+                    if displayed.playing {
+                        if let Some(since) = state.last_update_instant {
+                            displayed.position = displayed.position + since.elapsed().as_secs_f64();
+                        }
+                    }
+                    // Redraw using the estimated position
+                    draw_ui_with_cache(&mut terminal, &Some(displayed), &state.cached_lines, &styles)?;
+                }
             }
             maybe_event = tokio::task::spawn_blocking(|| crossterm::event::poll(std::time::Duration::from_millis(100))) => {
                 if let Ok(Ok(true)) = maybe_event {
@@ -111,6 +130,7 @@ pub async fn display_lyrics_modern(
 fn update_cache_and_state(state: &mut ModernUIState, update: &Update) {
     state.cached_lines = Some(update.lines.iter().map(|l| l.text.clone()).collect());
     state.last_update = Some(update.clone());
+    state.last_update_instant = Some(Instant::now());
 }
 
 /// Encapsulates all logic for updating ModernUIState from an Update.
@@ -135,6 +155,7 @@ fn update_state(state: &mut ModernUIState, update: Option<Update>) {
             update_cache_and_state(state, &update);
         } else if let Some(ref mut last_upd) = state.last_update {
             last_upd.index = update.index;
+            state.last_update_instant = Some(Instant::now());
         }
         state.last_track_id = Some(track_id);
     } else {
@@ -157,11 +178,11 @@ fn prepare_visible_spans<'a>(
                 .into_iter()
                 .map(|line| Spans::from(Span::styled(line, styles.current)))
                 .collect();
-        } else if let Some(cached) = cached_lines
+            } else if let Some(cached) = cached_lines
             && !cached.is_empty()
             && update.index < cached.len()
         {
-            return gather_visible_lines(update, cached, w, h, styles).into_vec();
+            return gather_visible_lines(update, cached, w, h, styles, update.position).into_vec();
         }
     }
     Vec::new()
@@ -268,15 +289,75 @@ fn gather_visible_lines<'a>(
     w: usize,
     h: usize,
     styles: &'a LyricStyles,
+    position: f64,
 ) -> VisibleLines<'a> {
     let wrapped_blocks: Vec<Vec<String>> = cached.iter().map(|l| wrap_text(l, w)).collect();
     let current_block = &wrapped_blocks[update.index];
     let current_height = current_block.len();
 
-    let current = current_block
-        .iter()
-        .map(|line| Spans::from(Span::styled(line.clone(), styles.current)))
-        .collect();
+    // For the current block, produce word-level spans with partial highlight based on position.
+    let mut current = Vec::new();
+    // Determine current and next timestamp
+    let start_time = update.lines.get(update.index).map(|l| l.time).unwrap_or(0.0);
+    let end_time = update
+        .lines
+        .get(update.index + 1)
+        .map(|l| l.time)
+        .unwrap_or(start_time + 3.0);
+    let progress = if end_time > start_time {
+        ((position - start_time) / (end_time - start_time)).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    for line in current_block.iter() {
+        // If provider supplied per-word timings, use them for precise karaoke highlighting.
+        if let Some(ly) = update.lines.get(update.index) {
+            if let Some(words) = &ly.words {
+                let mut spans = Vec::new();
+                for w in words {
+                    if position >= w.end {
+                        spans.push(Span::styled(format!("{} ", w.text), styles.current));
+                    } else if position < w.start {
+                        spans.push(Span::styled(format!("{} ", w.text), styles.after));
+                    } else {
+                        // partially through this word: highlight whole word for simplicity
+                        spans.push(Span::styled(format!("{} ", w.text), styles.current));
+                    }
+                }
+                current.push(Spans::from(spans));
+                continue;
+            }
+        }
+
+        // Fallback: split into words and compute how many chars to highlight based on progress
+        let total_chars: usize = line.chars().count();
+        let highlight_chars = ((total_chars as f64) * progress).round() as usize;
+        let mut accumulated = 0usize;
+        let mut spans = Vec::new();
+        for word in line.split_whitespace() {
+            let word_len = word.chars().count();
+            let start = accumulated;
+            let end = accumulated + word_len;
+            accumulated = end + 1; // account for space
+            if end <= highlight_chars {
+                spans.push(Span::styled(format!("{} ", word), styles.current));
+            } else if start >= highlight_chars {
+                spans.push(Span::styled(format!("{} ", word), styles.after));
+            } else {
+                // partially highlighted word: split by char count
+                let split_at = highlight_chars.saturating_sub(start);
+                let highlighted: String = word.chars().take(split_at).collect();
+                let rest: String = word.chars().skip(split_at).collect();
+                if !highlighted.is_empty() {
+                    spans.push(Span::styled(format!("{}", highlighted), styles.current));
+                }
+                if !rest.is_empty() {
+                    spans.push(Span::styled(format!("{} ", rest), styles.after));
+                };
+            }
+        }
+        current.push(Spans::from(spans));
+    }
 
     if current_height >= h {
         // If the current line alone fills the screen, just show that.

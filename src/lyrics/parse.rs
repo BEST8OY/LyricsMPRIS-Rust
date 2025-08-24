@@ -35,6 +35,7 @@ pub fn parse_synced_lyrics(synced: &str) -> Vec<LyricLine> {
             lines.push(LyricLine {
                 time,
                 text: text.clone(),
+                words: None,
             });
         }
     }

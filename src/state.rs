@@ -9,6 +9,7 @@ use std::time::Instant;
 pub struct Update {
     pub lines: Arc<Vec<LyricLine>>,
     pub index: usize,
+    pub position: f64,
     pub err: Option<String>,
     pub version: u64,
     pub playing: bool,

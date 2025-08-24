@@ -18,6 +18,15 @@ pub type ProviderResult = Result<(Vec<LyricLine>, Option<String>), LyricsError>;
 pub struct LyricLine {
     pub time: f64,
     pub text: String,
+    /// Optional per-word timings (start, end, text) for karaoke rendering.
+    pub words: Option<Vec<WordTiming>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WordTiming {
+    pub start: f64,
+    pub end: f64,
+    pub text: String,
 }
 
 #[derive(Error, Debug)]

@@ -100,6 +100,7 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(artist: &str, title: &str) -
         return Ok((Vec::new(), None));
     }
 
+    // Fallback simple per-line formatter (keeps old behavior)
     let make_lrc_from_array = |arr: &Vec<Value>, time_key: &str| -> (Vec<LyricLine>, String) {
         let mut out = String::new();
         let mut parsed = Vec::new();
@@ -116,14 +117,8 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(artist: &str, title: &str) -
             let minutes = ms / 60000;
             let seconds = (ms % 60000) / 1000;
             let centi = ms % 1000 / 10;
-            out.push_str(&format!(
-                "[{:02}:{:02}.{:02}]{}\n",
-                minutes, seconds, centi, text
-            ));
-            parsed.push(LyricLine {
-                time: t,
-                text: text.to_string(),
-            });
+            out.push_str(&format!("[{:02}:{:02}.{:02}]{}\n", minutes, seconds, centi, text));
+            parsed.push(LyricLine { time: t, text: text.to_string(), words: None });
         }
         (parsed, out)
     };
@@ -133,17 +128,50 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(artist: &str, title: &str) -
             .pointer("/message/header/status_code")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        if status == 200
-            && let Some(body) = rich.pointer("/message/body")
-            && let Some(richsync_body) = body
-                .get("richsync")
-                .and_then(|r| r.get("richsync_body"))
-                .and_then(|v| v.as_str())
-            && let Ok(lines_val) = serde_json::from_str::<Value>(richsync_body)
-            && let Some(arr) = lines_val.as_array()
-        {
-            let (parsed, raw) = make_lrc_from_array(&arr.to_vec(), "/ts");
-            return Ok((parsed, Some(raw)));
+        if status == 200 {
+            if let Some(body) = rich.pointer("/message/body") {
+                if let Some(richsync_body) = body
+                    .get("richsync")
+                    .and_then(|r| r.get("richsync_body"))
+                    .and_then(|v| v.as_str())
+                {
+                    if let Ok(lines_val) = serde_json::from_str::<Value>(richsync_body) {
+                        if let Some(arr) = lines_val.as_array() {
+                            // Parse per-word timings when available. Expected format is an array of lines,
+                            // where each line can contain `text` and `words` array with start/finish times.
+                            let mut parsed = Vec::new();
+                            let mut out = String::new();
+                            for line in arr {
+                                let t = line.pointer("/ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                let text = line.get("text").and_then(|v| v.as_str()).unwrap_or("\u{266a}");
+                                // Build raw LRC line
+                                let ms = (t * 1000.0).round() as u64;
+                                let minutes = ms / 60000;
+                                let seconds = (ms % 60000) / 1000;
+                                let centi = ms % 1000 / 10;
+                                out.push_str(&format!("[{:02}:{:02}.{:02}]{}\n", minutes, seconds, centi, text));
+
+                                // Parse words array if present
+                                let words = if let Some(words_arr) = line.get("words").and_then(|v| v.as_array()) {
+                                    let mut wts = Vec::new();
+                                    for w in words_arr {
+                                        let start = w.get("start").and_then(|v| v.as_f64()).unwrap_or(t);
+                                        let end = w.get("end").and_then(|v| v.as_f64()).unwrap_or(start);
+                                        let wtext = w.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                        wts.push(crate::lyrics::types::WordTiming { start, end, text: wtext });
+                                    }
+                                    if wts.is_empty() { None } else { Some(wts) }
+                                } else {
+                                    None
+                                };
+
+                                parsed.push(LyricLine { time: t, text: text.to_string(), words });
+                            }
+                            return Ok((parsed, Some(out)));
+                        }
+                    }
+                }
+            }
         }
     }
 
