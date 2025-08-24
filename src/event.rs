@@ -112,8 +112,10 @@ async fn fetch_api_lyrics(
                 .await
                 {
                     Ok((lines, raw)) if !lines.is_empty() => {
-                        // If provider supplied per-word timings (richsync), mark provider accordingly.
-                        let provider_tag = if lines.iter().any(|l| l.words.is_some()) {
+                        // If provider supplied per-word timings (richsync), or the raw LRC is marked, mark provider accordingly.
+                        let provider_tag = if lines.iter().any(|l| l.words.is_some())
+                            || raw.as_ref().map(|r| r.starts_with(";;richsync=1")).unwrap_or(false)
+                        {
                             Some(Provider::MusixmatchRichsync)
                         } else {
                             Some(Provider::MusixmatchSubtitles)

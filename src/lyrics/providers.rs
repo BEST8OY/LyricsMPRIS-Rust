@@ -59,6 +59,8 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(artist: &str, title: &str) -
         ("q_artist", artist),
         ("q_track", title),
         ("usertoken", &token),
+        // Request richsync optional call so `track.richsync.get` (and `richsync_body`) may be included
+        ("optional_calls", "track.richsync"),
     ];
 
     let final_url = base_url.to_string()
@@ -130,20 +132,29 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(artist: &str, title: &str) -
             .unwrap_or(0);
         if status == 200 {
             if let Some(body) = rich.pointer("/message/body") {
-                if let Some(richsync_body) = body
+                // Try to access richsync_body
+                let richsync_body_opt = body
                     .get("richsync")
                     .and_then(|r| r.get("richsync_body"))
-                    .and_then(|v| v.as_str())
-                {
+                    .and_then(|v| v.as_str());
+                if let Some(richsync_body) = richsync_body_opt {
+                    // richsync_body present
                     if let Ok(lines_val) = serde_json::from_str::<Value>(richsync_body) {
                         if let Some(arr) = lines_val.as_array() {
+                            // count lines and lines-with-words if needed
                             // Parse per-word timings when available. Expected format is an array of lines,
                             // where each line can contain `text` and `words` array with start/finish times.
                             let mut parsed = Vec::new();
                             let mut out = String::new();
-                            for line in arr {
+                            for line in arr.iter() {
                                 let t = line.pointer("/ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                                let text = line.get("text").and_then(|v| v.as_str()).unwrap_or("\u{266a}");
+                                let te = line.pointer("/te").and_then(|v| v.as_f64()).unwrap_or(t + 3.0);
+                                // 'x' field holds full text in many richsync formats; fall back to `text` if missing
+                                let text = line
+                                    .get("x")
+                                    .and_then(|v| v.as_str())
+                                    .or_else(|| line.get("text").and_then(|v| v.as_str()))
+                                    .unwrap_or("\u{266a}");
                                 // Build raw LRC line
                                 let ms = (t * 1000.0).round() as u64;
                                 let minutes = ms / 60000;
@@ -151,7 +162,9 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(artist: &str, title: &str) -
                                 let centi = ms % 1000 / 10;
                                 out.push_str(&format!("[{:02}:{:02}.{:02}]{}\n", minutes, seconds, centi, text));
 
-                                // Parse words array if present
+                                // Parse per-word timings. Two possible richsync shapes:
+                                // - explicit `words` array with {start,end,text}
+                                // - character-level `l` array with {c, o} items (offsets from ts)
                                 let words = if let Some(words_arr) = line.get("words").and_then(|v| v.as_array()) {
                                     let mut wts = Vec::new();
                                     for w in words_arr {
@@ -161,15 +174,56 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(artist: &str, title: &str) -
                                         wts.push(crate::lyrics::types::WordTiming { start, end, text: wtext });
                                     }
                                     if wts.is_empty() { None } else { Some(wts) }
+                                } else if let Some(l_arr) = line.get("l").and_then(|v| v.as_array()) {
+                                    // Group character entries into words using spaces as separators.
+                                    let mut wts = Vec::new();
+                                    let mut cur = String::new();
+                                    let mut cur_start: Option<f64> = None;
+                                    let mut last_offset: Option<f64> = None;
+                                    for elem in l_arr {
+                                        let ch = elem.get("c").and_then(|v| v.as_str()).unwrap_or("");
+                                        let o = elem.get("o").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                                        if ch.trim().is_empty() {
+                                            // space: end current word if any
+                                            if !cur.is_empty() {
+                                                let start = t + cur_start.unwrap_or(0.0);
+                                                let end = t + o;
+                                                wts.push(crate::lyrics::types::WordTiming { start, end, text: cur.clone() });
+                                                cur.clear();
+                                                cur_start = None;
+                                                last_offset = None;
+                                            }
+                                        } else {
+                                            if cur.is_empty() {
+                                                cur_start = Some(o);
+                                            }
+                                            cur.push_str(ch);
+                                            last_offset = Some(o);
+                                        }
+                                    }
+                                    // flush final word if present
+                                    if !cur.is_empty() {
+                                        let start = t + cur_start.unwrap_or(0.0);
+                                        let end = t + last_offset.unwrap_or(te - t);
+                                        wts.push(crate::lyrics::types::WordTiming { start, end, text: cur.clone() });
+                                    }
+                                    if wts.is_empty() { None } else { Some(wts) }
                                 } else {
                                     None
                                 };
 
                                 parsed.push(LyricLine { time: t, text: text.to_string(), words });
                             }
-                            return Ok((parsed, Some(out)));
+                            let out_with_marker = format!(";;richsync=1\n{}", out);
+                            return Ok((parsed, Some(out_with_marker)));
+                        } else {
+                            // richsync_body parsed but not an array
                         }
+                    } else {
+                        // failed to parse richsync_body JSON
                     }
+                } else {
+                    // richsync_body not present in track.richsync.get body
                 }
             }
         }

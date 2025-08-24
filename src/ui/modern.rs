@@ -88,20 +88,21 @@ pub async fn display_lyrics_modern(
     let styles = LyricStyles::default();
     let mut state = ModernUIState::new();
     state.karaoke_enabled = karaoke_enabled;
-    let mut last_track_id: Option<(String, String, String)> = None;
+    // use state.last_track_id for track-change detection; avoid redundant local copy
     // UI tick for smooth in-line progress updates (e.g. karaoke highlighting)
     let mut ui_tick = tokio::time::interval(Duration::from_millis(100));
     while !state.should_exit {
         tokio::select! {
             update = rx.recv() => {
                 // Robust track change detection for TUI mode
-                    if let Some(ref upd) = update {
+                if let Some(ref upd) = update {
                     let track_id = crate::ui::track_id(upd);
-                    if last_track_id.as_ref() != Some(&track_id) {
+                    if state.last_track_id.as_ref() != Some(&track_id) {
                         // Optionally, reset scroll or state here if needed
                         state.last_track_id = None;
+                        // set new track id so update_state/draw see it immediately
+                        state.last_track_id = Some(track_id);
                     }
-                    last_track_id = Some(track_id);
                 }
                 process_update(update, &mut state, &mut terminal, &styles)?;
             }
@@ -311,21 +312,17 @@ fn gather_visible_lines<'a>(
     let mut current = Vec::new();
     // Determine current and next timestamp
     let start_time = update.lines.get(update.index).map(|l| l.time).unwrap_or(0.0);
-    let end_time = update
+    let _end_time = update
         .lines
         .get(update.index + 1)
         .map(|l| l.time)
         .unwrap_or(start_time + 3.0);
-    let progress = if end_time > start_time {
-        ((position - start_time) / (end_time - start_time)).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
+    // progress not used when only per-word timings drive karaoke
     for line in current_block.iter() {
         // If provider supplied per-word timings, use them for precise karaoke highlighting.
         if let Some(ly) = update.lines.get(update.index) {
             // Only enable karaoke when the user enabled it and the provider is musixmatch.richsync or subtitles
-            if karaoke_enabled && matches!(update.provider, Some(Provider::MusixmatchRichsync) | Some(Provider::MusixmatchSubtitles)) {
+            if karaoke_enabled && matches!(update.provider, Some(Provider::MusixmatchRichsync)) {
                 if let Some(words) = &ly.words {
                 let mut spans = Vec::new();
                 for w in words {
@@ -344,40 +341,8 @@ fn gather_visible_lines<'a>(
             }
         }
 
-    // Perform progressive karaoke when musixmatch richsync or subtitles are available.
-    if karaoke_enabled && matches!(update.provider, Some(crate::state::Provider::MusixmatchRichsync) | Some(crate::state::Provider::MusixmatchSubtitles)) {
-            // Fallback: split into words and compute how many chars to highlight based on progress
-            let total_chars: usize = line.chars().count();
-            let highlight_chars = ((total_chars as f64) * progress).round() as usize;
-            let mut accumulated = 0usize;
-            let mut spans = Vec::new();
-            for word in line.split_whitespace() {
-                let word_len = word.chars().count();
-                let start = accumulated;
-                let end = accumulated + word_len;
-                accumulated = end + 1; // account for space
-                if end <= highlight_chars {
-                    spans.push(Span::styled(format!("{} ", word), styles.current));
-                } else if start >= highlight_chars {
-                    spans.push(Span::styled(format!("{} ", word), styles.after));
-                } else {
-                    // partially highlighted word: split by char count
-                    let split_at = highlight_chars.saturating_sub(start);
-                    let highlighted: String = word.chars().take(split_at).collect();
-                    let rest: String = word.chars().skip(split_at).collect();
-                    if !highlighted.is_empty() {
-                        spans.push(Span::styled(format!("{}", highlighted), styles.current));
-                    }
-                    if !rest.is_empty() {
-                        spans.push(Span::styled(format!("{} ", rest), styles.after));
-                    };
-                }
-            }
-            current.push(Spans::from(spans));
-        } else {
-            // Not richsync: render the current line fully highlighted (no progressive karaoke)
-            current.push(Spans::from(Span::styled(line.clone(), styles.current)));
-        }
+    // No per-word timings available (or karaoke disabled): render the current line fully highlighted
+    current.push(Spans::from(Span::styled(line.clone(), styles.current)));
     }
 
     if current_height >= h {
