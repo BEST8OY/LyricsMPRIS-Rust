@@ -1,5 +1,5 @@
-pub mod pipe;
 pub mod modern;
+pub mod pipe;
 pub mod styles;
 pub mod util;
 

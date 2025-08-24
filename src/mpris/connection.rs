@@ -1,7 +1,7 @@
 //! Minimal D-Bus connection and player discovery for MPRIS.
 
-use dbus::nonblock::{SyncConnection, Proxy};
 use dbus::nonblock::stdintf::org_freedesktop_dbus::Properties;
+use dbus::nonblock::{Proxy, SyncConnection};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,9 +20,9 @@ pub async fn get_dbus_conn() -> Result<Arc<SyncConnection>, MprisError> {
     if let Some(conn) = ONCE.get() {
         return Ok(conn.clone());
     }
-    let (resource, conn) = dbus_tokio::connection::new_session_sync()
-        .map_err(|_| MprisError::NoConnection)?;
-    tokio::spawn(async move { resource.await });
+    let (resource, conn) =
+        dbus_tokio::connection::new_session_sync().map_err(|_| MprisError::NoConnection)?;
+    tokio::spawn(resource);
     let _ = ONCE.set(conn.clone());
     Ok(conn)
 }
@@ -40,5 +40,7 @@ pub async fn get_active_player_names() -> Result<Vec<String>, MprisError> {
 }
 
 pub fn is_blocked(service: &str, block_list: &[String]) -> bool {
-    block_list.iter().any(|b| service.to_lowercase().contains(b))
+    block_list
+        .iter()
+        .any(|b| service.to_lowercase().contains(b))
 }

@@ -1,12 +1,12 @@
 // Minimal central event loop for polling and event-based updates
 
+use crate::event::{Event, MprisEvent, handle_poll, process_event, send_update};
 use crate::lyricsdb::LyricsDB;
 use crate::mpris::TrackMetadata;
-use crate::state::{StateBundle, Update};
-use crate::event::{Event, MprisEvent, process_event, handle_poll, send_update};
 use crate::mpris::events::MprisEventHandler;
-use tokio::sync::{mpsc, Mutex};
+use crate::state::{StateBundle, Update};
 use std::sync::Arc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Duration, Instant};
 
 pub async fn listen(
@@ -14,7 +14,7 @@ pub async fn listen(
     poll_interval: Duration,
     mut db: Option<Arc<Mutex<LyricsDB>>>,
     db_path: Option<String>,
-    mut shutdown_rx: mpsc::Receiver<()>, 
+    mut shutdown_rx: mpsc::Receiver<()>,
     mpris_config: crate::Config,
 ) {
     // Determine provider order from config (default is lrclib then musixmatch)
@@ -30,7 +30,9 @@ pub async fn listen(
 
     // Find first unblocked player at startup
     let service = match crate::mpris::get_active_player_names().await {
-        Ok(names) => names.into_iter().find(|s| !crate::mpris::is_blocked(s, &mpris_config.block)),
+        Ok(names) => names
+            .into_iter()
+            .find(|s| !crate::mpris::is_blocked(s, &mpris_config.block)),
         Err(e) => {
             if mpris_config.debug_log {
                 eprintln!("[LyricsMPRIS] D-Bus error getting active players: {}", e);
@@ -65,7 +67,8 @@ pub async fn listen(
         mpris_config_arc.debug_log,
         &providers,
         service.as_deref().unwrap_or(""),
-    ).await;
+    )
+    .await;
     state.player_state.position = position;
 
     let mut paused_since: Option<Instant> = None;
@@ -79,13 +82,17 @@ pub async fn listen(
     tokio::spawn(async move {
         let mut event_handler = MprisEventHandler::new(
             move |meta, pos, service| {
-                let _ = event_tx_update.try_send(Event::Mpris(MprisEvent::PlayerUpdate(meta, pos, service)));
+                let _ = event_tx_update
+                    .try_send(Event::Mpris(MprisEvent::PlayerUpdate(meta, pos, service)));
             },
             move |meta, pos, service| {
-                let _ = event_tx_seek.try_send(Event::Mpris(MprisEvent::Seeked(meta, pos, service)));
+                let _ =
+                    event_tx_seek.try_send(Event::Mpris(MprisEvent::Seeked(meta, pos, service)));
             },
             block_list,
-        ).await.expect("Failed to create MPRIS event handler");
+        )
+        .await
+        .expect("Failed to create MPRIS event handler");
         let _ = event_handler.handle_events().await;
     });
 
@@ -105,12 +112,8 @@ pub async fn listen(
                             false => paused_since = Some(Instant::now()),
                             true => {
                                 paused_since = None;
-                                if db.is_none() {
-                                    if let Some(ref path) = db_path {
-                                        if let Ok(new_db) = LyricsDB::load(path) {
-                                            db = Some(Arc::new(Mutex::new(new_db)));
-                                        }
-                                    }
+                                if db.is_none() && let Some(ref path) = db_path && let Ok(new_db) = LyricsDB::load(path) {
+                                    db = Some(Arc::new(Mutex::new(new_db)));
                                 }
                             }
                         }
@@ -128,10 +131,8 @@ pub async fn listen(
                         &mut latest_meta,
                         &providers,
                     ).await;
-                } else if let Some(paused_at) = paused_since {
-                    if paused_at.elapsed() > pause_release_threshold {
-                        db = None;
-                    }
+                } else if let Some(paused_at) = paused_since && paused_at.elapsed() > pause_release_threshold {
+                    db = None;
                 }
             }
         }

@@ -1,20 +1,19 @@
+mod event;
 mod lyrics;
+mod lyricsdb;
 mod mpris;
 mod pool;
-mod ui;
-mod lyricsdb;
-mod text_utils;
 mod state;
-mod event;
+mod text_utils;
+mod ui;
 
-use clap::Parser;
-use std::time::Duration;
-use std::error::Error;
-use tokio::sync::Mutex;
-use std::sync::Arc;
 use crate::mpris::metadata::get_metadata;
 use crate::mpris::playback::get_position;
-
+use clap::Parser;
+use std::error::Error;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::Mutex;
 
 /// Application configuration from CLI
 #[derive(Parser, Debug, Clone)]
@@ -27,7 +26,11 @@ pub struct Config {
     #[arg(long)]
     database: Option<String>,
     /// Blocklist for MPRIS player service names (comma-separated, case-insensitive)
-    #[arg(long = "block", value_name = "SERVICE1,SERVICE2", value_delimiter = ',')]
+    #[arg(
+        long = "block",
+        value_name = "SERVICE1,SERVICE2",
+        value_delimiter = ','
+    )]
     block: Vec<String>,
     /// Enable backend error logging to stderr
     #[arg(long)]
@@ -54,12 +57,16 @@ impl Default for Config {
 }
 
 fn providers_from_env_if_empty(cli: &mut Config) {
-    if cli.providers.is_empty() {
-        if let Ok(s) = std::env::var("LYRIC_PROVIDERS") {
-            let parts: Vec<String> = s.split(',').map(|p| p.trim().to_lowercase()).filter(|p| !p.is_empty()).collect();
-            if !parts.is_empty() {
-                cli.providers = parts;
-            }
+    if cli.providers.is_empty()
+        && let Ok(s) = std::env::var("LYRIC_PROVIDERS")
+    {
+        let parts: Vec<String> = s
+            .split(',')
+            .map(|p| p.trim().to_lowercase())
+            .filter(|p| !p.is_empty())
+            .collect();
+        if !parts.is_empty() {
+            cli.providers = parts;
         }
     }
 }
@@ -108,9 +115,25 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
 
     let result = if cfg.pipe {
-        crate::ui::pipe::display_lyrics_pipe(meta, pos, poll_interval, db.clone(), db_path.clone(), cfg.clone()).await
+        crate::ui::pipe::display_lyrics_pipe(
+            meta,
+            pos,
+            poll_interval,
+            db.clone(),
+            db_path.clone(),
+            cfg.clone(),
+        )
+        .await
     } else {
-        crate::ui::modern::display_lyrics_modern(meta, pos, poll_interval, db.clone(), db_path.clone(), cfg.clone()).await
+        crate::ui::modern::display_lyrics_modern(
+            meta,
+            pos,
+            poll_interval,
+            db.clone(),
+            db_path.clone(),
+            cfg.clone(),
+        )
+        .await
     };
 
     // Print error if any, for better diagnostics

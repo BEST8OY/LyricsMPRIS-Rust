@@ -1,13 +1,13 @@
 //! Event watching and event handler registration for MPRIS.
 
+use crate::mpris::connection::{MprisError, TIMEOUT, get_active_player_names, is_blocked};
+use crate::mpris::metadata::{TrackMetadata, extract_metadata};
+use dbus::channel::MatchingReceiver;
+use dbus::message::MatchRule;
 use dbus::nonblock::Proxy;
 use dbus::nonblock::stdintf::org_freedesktop_dbus::Properties;
-use dbus::message::MatchRule;
-use dbus::channel::MatchingReceiver;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use crate::mpris::connection::{get_active_player_names, is_blocked, TIMEOUT, MprisError};
-use crate::mpris::metadata::{TrackMetadata, extract_metadata};
 
 const MPRIS_PLAYER_INTERFACE: &str = "org.mpris.MediaPlayer2.Player";
 const DBUS_PROPERTIES_INTERFACE: &str = "org.freedesktop.DBus.Properties";
@@ -38,15 +38,32 @@ where
         on_seek: G,
         block_list: Vec<String>,
     ) -> Result<Self, MprisError> {
-        let (resource, conn) = dbus_tokio::connection::new_session_sync()
-            .map_err(|_| MprisError::NoConnection)?;
-        tokio::spawn(async move { resource.await });
+        let (resource, conn) =
+            dbus_tokio::connection::new_session_sync().map_err(|_| MprisError::NoConnection)?;
+        tokio::spawn(resource);
 
         let (tx, rx) = mpsc::channel::<dbus::message::Message>(8);
 
-        Self::add_match_rule(&conn, MatchRule::new_signal(DBUS_PROPERTIES_INTERFACE, "PropertiesChanged").static_clone(), tx.clone()).await?;
-        Self::add_match_rule(&conn, MatchRule::new_signal(DBUS_PROPERTIES_INTERFACE, "PropertiesChanged").with_sender(PLAYERCTL_SENDER).static_clone(), tx.clone()).await?;
-        Self::add_match_rule(&conn, MatchRule::new_signal(MPRIS_PLAYER_INTERFACE, "Seeked").static_clone(), tx.clone()).await?;
+        Self::add_match_rule(
+            &conn,
+            MatchRule::new_signal(DBUS_PROPERTIES_INTERFACE, "PropertiesChanged").static_clone(),
+            tx.clone(),
+        )
+        .await?;
+        Self::add_match_rule(
+            &conn,
+            MatchRule::new_signal(DBUS_PROPERTIES_INTERFACE, "PropertiesChanged")
+                .with_sender(PLAYERCTL_SENDER)
+                .static_clone(),
+            tx.clone(),
+        )
+        .await?;
+        Self::add_match_rule(
+            &conn,
+            MatchRule::new_signal(MPRIS_PLAYER_INTERFACE, "Seeked").static_clone(),
+            tx.clone(),
+        )
+        .await?;
 
         let mut handler = Self {
             on_track_change,
@@ -100,11 +117,29 @@ where
     }
 
     async fn update_current_player(&mut self, service: &str) -> Result<(), MprisError> {
-        let proxy = Proxy::new(service, "/org/mpris/MediaPlayer2", TIMEOUT, self.conn.clone());
-        let metadata: Option<dbus::arg::PropMap> = Properties::get(&proxy, MPRIS_PLAYER_INTERFACE, "Metadata").await.ok();
-        let meta = metadata.map(|map| extract_metadata(&map)).unwrap_or_default();
-        let position: f64 = Properties::get::<i64>(&proxy, MPRIS_PLAYER_INTERFACE, "Position").await.ok().map(|p| p as f64 / 1_000_000.0).unwrap_or(0.0);
-        let playback_status: String = Properties::get::<String>(&proxy, MPRIS_PLAYER_INTERFACE, "PlaybackStatus").await.ok().unwrap_or_else(|| "Stopped".to_string());
+        let proxy = Proxy::new(
+            service,
+            "/org/mpris/MediaPlayer2",
+            TIMEOUT,
+            self.conn.clone(),
+        );
+        let metadata: Option<dbus::arg::PropMap> =
+            Properties::get(&proxy, MPRIS_PLAYER_INTERFACE, "Metadata")
+                .await
+                .ok();
+        let meta = metadata
+            .map(|map| extract_metadata(&map))
+            .unwrap_or_default();
+        let position: f64 = Properties::get::<i64>(&proxy, MPRIS_PLAYER_INTERFACE, "Position")
+            .await
+            .ok()
+            .map(|p| p as f64 / 1_000_000.0)
+            .unwrap_or(0.0);
+        let playback_status: String =
+            Properties::get::<String>(&proxy, MPRIS_PLAYER_INTERFACE, "PlaybackStatus")
+                .await
+                .ok()
+                .unwrap_or_else(|| "Stopped".to_string());
 
         self.current_service = service.to_string();
         self.last_track = meta.clone();
@@ -133,22 +168,26 @@ where
         if self.current_service.is_empty() {
             return Ok(());
         }
-        if let Some(pos) = msg.read1::<i64>().ok() {
+        if let Ok(pos) = msg.read1::<i64>() {
             let sec = pos as f64 / 1_000_000.0;
             (self.on_seek)(self.last_track.clone(), sec, self.current_service.clone());
         }
         Ok(())
     }
 
-    async fn handle_properties_changed(&mut self, msg: dbus::message::Message) -> Result<(), MprisError> {
-        if let Some(interface_name) = msg.read1::<&str>().ok() {
+    async fn handle_properties_changed(
+        &mut self,
+        msg: dbus::message::Message,
+    ) -> Result<(), MprisError> {
+        if let Ok(interface_name) = msg.read1::<&str>() {
             match interface_name {
-                "org.mpris.MediaPlayer2" | "org.freedesktop.DBus.Properties" | "com.github.altdesktop.playerctld" => {
-                    let changed: Option<dbus::arg::PropMap> = msg.read2().ok().map(|(_, c): (String, dbus::arg::PropMap)| c);
-                    if let Some(changed) = changed {
-                        if changed.contains_key("PlayerNames") {
-                            self.check_player_change().await?;
-                        }
+                "org.mpris.MediaPlayer2"
+                | "org.freedesktop.DBus.Properties"
+                | "com.github.altdesktop.playerctld" => {
+                    if let Ok((_, changed)) = msg.read2::<String, dbus::arg::PropMap>()
+                        && changed.contains_key("PlayerNames")
+                    {
+                        self.check_player_change().await?;
                     }
                 }
                 MPRIS_PLAYER_INTERFACE => {
@@ -160,7 +199,10 @@ where
         Ok(())
     }
 
-    async fn handle_player_properties_changed(&mut self, msg: dbus::message::Message) -> Result<(), MprisError> {
+    async fn handle_player_properties_changed(
+        &mut self,
+        msg: dbus::message::Message,
+    ) -> Result<(), MprisError> {
         if self.current_service.is_empty() {
             return Ok(());
         }
@@ -170,45 +212,61 @@ where
             TIMEOUT,
             self.conn.clone(),
         );
-        let changed: Option<dbus::arg::PropMap> = msg.read2().ok().map(|(_, c): (String, dbus::arg::PropMap)| c);
+        let changed: Option<dbus::arg::PropMap> = msg
+            .read2()
+            .ok()
+            .map(|(_, c): (String, dbus::arg::PropMap)| c);
         if let Some(changed) = changed {
             let mut metadata_changed = false;
             let mut status_changed = false;
 
-            if changed.contains_key("Metadata") {
-                if let Ok(metadata) = Properties::get::<dbus::arg::PropMap>(&player_proxy, MPRIS_PLAYER_INTERFACE, "Metadata").await {
-                    let new_track = extract_metadata(&metadata);
-                    if new_track != self.last_track {
-                        self.last_track = new_track;
-                        metadata_changed = true;
-                    }
+            if changed.contains_key("Metadata")
+                && let Ok(metadata) = Properties::get::<dbus::arg::PropMap>(
+                    &player_proxy,
+                    MPRIS_PLAYER_INTERFACE,
+                    "Metadata",
+                )
+                .await
+            {
+                let new_track = extract_metadata(&metadata);
+                if new_track != self.last_track {
+                    self.last_track = new_track;
+                    metadata_changed = true;
                 }
             }
 
-            if changed.contains_key("PlaybackStatus") {
-                if let Ok(status) = Properties::get::<String>(&player_proxy, MPRIS_PLAYER_INTERFACE, "PlaybackStatus").await {
-                    if status != self.last_playback_status {
-                        self.last_playback_status = status;
-                        status_changed = true;
-                    }
-                }
+            if changed.contains_key("PlaybackStatus")
+                && let Ok(status) = Properties::get::<String>(
+                    &player_proxy,
+                    MPRIS_PLAYER_INTERFACE,
+                    "PlaybackStatus",
+                )
+                .await
+                && status != self.last_playback_status
+            {
+                self.last_playback_status = status;
+                status_changed = true;
             }
 
-            if changed.contains_key("Position") {
-                if let Some(pos_var) = changed.get("Position") {
-                    if let Some(pos) = pos_var.0.as_i64() {
-                        let sec = pos as f64 / 1_000_000.0;
-                        (self.on_seek)(self.last_track.clone(), sec, self.current_service.clone());
-                    }
-                }
+            if changed.contains_key("Position")
+                && let Some(pos_var) = changed.get("Position")
+                && let Some(pos) = pos_var.0.as_i64()
+            {
+                let sec = pos as f64 / 1_000_000.0;
+                (self.on_seek)(self.last_track.clone(), sec, self.current_service.clone());
             }
 
             if metadata_changed || status_changed {
-                let position = Properties::get::<i64>(&player_proxy, MPRIS_PLAYER_INTERFACE, "Position")
-                    .await
-                    .map(|p| p as f64 / 1_000_000.0)
-                    .unwrap_or(0.0);
-                (self.on_track_change)(self.last_track.clone(), position, self.current_service.clone());
+                let position =
+                    Properties::get::<i64>(&player_proxy, MPRIS_PLAYER_INTERFACE, "Position")
+                        .await
+                        .map(|p| p as f64 / 1_000_000.0)
+                        .unwrap_or(0.0);
+                (self.on_track_change)(
+                    self.last_track.clone(),
+                    position,
+                    self.current_service.clone(),
+                );
             }
         }
         Ok(())

@@ -1,14 +1,24 @@
-use crate::state::Update;
-use crate::pool;
 use crate::lyricsdb::LyricsDB;
-use crossterm::{execute, terminal::{enable_raw_mode, disable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen}, event::{Event, KeyCode}};
-use std::io::{self};
-use tui::{backend::CrosstermBackend, Terminal, widgets::Paragraph, text::{Span, Spans}, layout::{Alignment, Rect}};
-use tokio::sync::{mpsc, Mutex};
-use std::time::Duration;
-use std::sync::Arc;
+use crate::pool;
+use crate::state::Update;
 use crate::text_utils::wrap_text;
 use crate::ui::styles::LyricStyles;
+use crossterm::{
+    event::{Event, KeyCode},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use std::io::{self};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{Mutex, mpsc};
+use tui::{
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Alignment, Rect},
+    text::{Span, Spans},
+    widgets::Paragraph,
+};
 
 /// UI state for the modern TUI mode
 pub struct ModernUIState {
@@ -16,7 +26,6 @@ pub struct ModernUIState {
     pub cached_lines: Option<Vec<String>>,
     pub last_track_id: Option<(String, String, String)>,
     pub should_exit: bool,
-    
 }
 
 impl ModernUIState {
@@ -26,7 +35,6 @@ impl ModernUIState {
             cached_lines: None,
             last_track_id: None,
             should_exit: false,
-            
         }
     }
 }
@@ -56,7 +64,14 @@ pub async fn display_lyrics_modern(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, mut rx) = mpsc::channel(32);
     let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
-    tokio::spawn(pool::listen(tx, poll_interval, db.clone(), db_path.clone(), shutdown_rx, mpris_config.clone()));
+    tokio::spawn(pool::listen(
+        tx,
+        poll_interval,
+        db.clone(),
+        db_path.clone(),
+        shutdown_rx,
+        mpris_config.clone(),
+    ));
     enable_raw_mode().map_err(to_boxed_err)?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).map_err(to_boxed_err)?;
@@ -101,7 +116,7 @@ fn update_cache_and_state(state: &mut ModernUIState, update: &Update) {
 /// Encapsulates all logic for updating ModernUIState from an Update.
 fn update_state(state: &mut ModernUIState, update: Option<Update>) {
     if let Some(update) = update {
-    let track_id = crate::ui::track_id(&update);
+        let track_id = crate::ui::track_id(&update);
         if update.lines.is_empty() && update.err.is_some() {
             if state.last_track_id.as_ref() != Some(&track_id) {
                 state.cached_lines = None;
@@ -142,10 +157,11 @@ fn prepare_visible_spans<'a>(
                 .into_iter()
                 .map(|line| Spans::from(Span::styled(line, styles.current)))
                 .collect();
-        } else if let Some(cached) = cached_lines {
-            if !cached.is_empty() && update.index < cached.len() {
-                return gather_visible_lines(update, cached, w, h, styles).into_vec();
-            }
+        } else if let Some(cached) = cached_lines
+            && !cached.is_empty()
+            && update.index < cached.len()
+        {
+            return gather_visible_lines(update, cached, w, h, styles).into_vec();
         }
     }
     Vec::new()
@@ -175,7 +191,11 @@ fn process_event<B: tui::backend::Backend>(
             KeyCode::Char('q') | KeyCode::Esc => {
                 state.should_exit = true;
             }
-            KeyCode::Char('c') if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) => {
+            KeyCode::Char('c')
+                if key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+            {
                 state.should_exit = true;
             }
             _ => {}
@@ -188,7 +208,9 @@ fn process_event<B: tui::backend::Backend>(
     Ok(())
 }
 
-fn to_boxed_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> Box<dyn std::error::Error + Send + Sync> {
+fn to_boxed_err<E: std::error::Error + Send + Sync + 'static>(
+    e: E,
+) -> Box<dyn std::error::Error + Send + Sync> {
     Box::new(e)
 }
 
@@ -270,12 +292,25 @@ fn gather_visible_lines<'a>(
     let lines_needed_before = context_lines / 2;
     let lines_needed_after = context_lines - lines_needed_before;
 
-    let before = collect_before_spans(update.index, &wrapped_blocks, lines_needed_before, styles.before);
-    let after = collect_after_spans(update.index, &wrapped_blocks, lines_needed_after, styles.after);
+    let before = collect_before_spans(
+        update.index,
+        &wrapped_blocks,
+        lines_needed_before,
+        styles.before,
+    );
+    let after = collect_after_spans(
+        update.index,
+        &wrapped_blocks,
+        lines_needed_after,
+        styles.after,
+    );
 
-    VisibleLines { before, current, after }
+    VisibleLines {
+        before,
+        current,
+        after,
+    }
 }
-
 
 /// Renders the UI, now using the TUI Paragraph widget for centering.
 fn draw_ui_with_cache<B: tui::backend::Backend>(
@@ -284,32 +319,34 @@ fn draw_ui_with_cache<B: tui::backend::Backend>(
     cached_lines: &Option<Vec<String>>,
     styles: &LyricStyles,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    terminal.draw(|f| {
-        let size = f.size();
-        let w = size.width as usize;
-        let h = size.height as usize;
-        let visible_spans = prepare_visible_spans(last_update, cached_lines, w, h, styles);
+    terminal
+        .draw(|f| {
+            let size = f.size();
+            let w = size.width as usize;
+            let h = size.height as usize;
+            let visible_spans = prepare_visible_spans(last_update, cached_lines, w, h, styles);
 
-        if visible_spans.is_empty() {
-            // Render an empty paragraph to clear the area and avoid zero-height rendering.
-            let paragraph = Paragraph::new(vec![Spans::from(Span::raw(""))]).alignment(Alignment::Center);
-            f.render_widget(paragraph, size);
-        } else {
-            // Calculate vertical padding to center the entire block of text.
-            let top_padding = h.saturating_sub(visible_spans.len()) / 2;
-            let render_area = Rect {
-                x: size.x,
-                y: size.y + top_padding as u16,
-                width: size.width,
-                // Ensure height doesn't exceed the terminal boundary
-                height: (visible_spans.len() as u16).min(size.height),
-            };
+            if visible_spans.is_empty() {
+                // Render an empty paragraph to clear the area and avoid zero-height rendering.
+                let paragraph =
+                    Paragraph::new(vec![Spans::from(Span::raw(""))]).alignment(Alignment::Center);
+                f.render_widget(paragraph, size);
+            } else {
+                // Calculate vertical padding to center the entire block of text.
+                let top_padding = h.saturating_sub(visible_spans.len()) / 2;
+                let render_area = Rect {
+                    x: size.x,
+                    y: size.y + top_padding as u16,
+                    width: size.width,
+                    // Ensure height doesn't exceed the terminal boundary
+                    height: (visible_spans.len() as u16).min(size.height),
+                };
 
-            // Create a Paragraph and let it handle the horizontal centering.
-            let paragraph = Paragraph::new(visible_spans).alignment(Alignment::Center);
-            f.render_widget(paragraph, render_area);
-        }
-    })
-    .map_err(to_boxed_err)?;
+                // Create a Paragraph and let it handle the horizontal centering.
+                let paragraph = Paragraph::new(visible_spans).alignment(Alignment::Center);
+                f.render_widget(paragraph, render_area);
+            }
+        })
+        .map_err(to_boxed_err)?;
     Ok(())
 }

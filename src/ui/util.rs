@@ -1,7 +1,6 @@
-/// UI-local utilities.
-///
-/// This module intentionally lives under `ui` because its helpers are only
-/// relevant to UI code (track id creation for UI modules).
+//! UI-local utilities.
+//! This module intentionally lives under `ui` because its helpers are only
+//! relevant to UI code (track id creation for UI modules).
 
 /// Trait for types that can produce a canonical (artist, title, album) track id.
 pub trait AsTrackId {

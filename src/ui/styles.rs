@@ -6,13 +6,13 @@ pub struct LyricStyles {
     pub after: style::Style,
 }
 
-impl LyricStyles {
-}
+impl LyricStyles {}
 
 impl Default for LyricStyles {
     fn default() -> Self {
         Self {
-            before: style::Style::default().add_modifier(style::Modifier::ITALIC | style::Modifier::DIM),
+            before: style::Style::default()
+                .add_modifier(style::Modifier::ITALIC | style::Modifier::DIM),
             current: style::Style::default()
                 .fg(style::Color::Green)
                 .add_modifier(style::Modifier::BOLD),

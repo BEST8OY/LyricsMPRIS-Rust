@@ -48,11 +48,11 @@ impl PlayerState {
         self.position = position;
     }
     pub fn estimate_position(&self) -> f64 {
-        if self.playing {
-            if let Some(instant) = self.last_update {
-                let elapsed = instant.elapsed().as_secs_f64();
-                return self.last_position + elapsed;
-            }
+        if self.playing
+            && let Some(instant) = self.last_update
+        {
+            let elapsed = instant.elapsed().as_secs_f64();
+            return self.last_position + elapsed;
         }
         self.last_position
     }
@@ -80,12 +80,12 @@ impl LyricState {
         if position.is_nan() || self.lines.iter().any(|line| line.time.is_nan()) {
             return 0;
         }
-        match self.lines.binary_search_by(|line| {
-            match line.time.partial_cmp(&position) {
+        match self
+            .lines
+            .binary_search_by(|line| match line.time.partial_cmp(&position) {
                 Some(ord) => ord,
                 _ => std::cmp::Ordering::Less,
-            }
-        }) {
+            }) {
             Ok(idx) => idx,
             Err(0) => 0,
             Err(idx) => idx - 1,
@@ -124,7 +124,12 @@ impl StateBundle {
         self.lyric_state.index = 0;
         self.version += 1;
     }
-    pub fn update_lyrics(&mut self, lines: Vec<LyricLine>, meta: &TrackMetadata, err: Option<String>) {
+    pub fn update_lyrics(
+        &mut self,
+        lines: Vec<LyricLine>,
+        meta: &TrackMetadata,
+        err: Option<String>,
+    ) {
         self.lyric_state.update_lines(lines);
         self.player_state.err = err;
         self.player_state.update_from_metadata(meta);

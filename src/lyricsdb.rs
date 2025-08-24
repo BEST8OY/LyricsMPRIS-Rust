@@ -1,11 +1,11 @@
 // lyricsdb.rs: Simple local lyrics database (JSON file, only stores synced lyrics)
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
-use serde::{Serialize, Deserialize};
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
+use std::path::Path;
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct LyricsDB {
