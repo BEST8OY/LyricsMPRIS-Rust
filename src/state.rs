@@ -5,6 +5,15 @@ use crate::mpris::TrackMetadata;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Which provider supplied the current lyrics.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Provider {
+    Lrclib,
+    MusixmatchRichsync,
+    MusixmatchSubtitles,
+    Db,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Update {
     pub lines: Arc<Vec<LyricLine>>,
@@ -16,6 +25,8 @@ pub struct Update {
     pub artist: String,
     pub title: String,
     pub album: String,
+    /// Provider that supplied the current lyrics.
+    pub provider: Option<Provider>,
 }
 
 #[derive(Debug, PartialEq, Default)]
@@ -110,6 +121,8 @@ pub struct StateBundle {
     pub lyric_state: LyricState,
     pub player_state: PlayerState,
     pub version: u64,
+    /// Provider that supplied current lyrics
+    pub provider: Option<Provider>,
 }
 
 impl StateBundle {
@@ -118,6 +131,7 @@ impl StateBundle {
             lyric_state: LyricState::default(),
             player_state: PlayerState::default(),
             version: 0,
+            provider: None,
         }
     }
     pub fn clear_lyrics(&mut self) {
@@ -126,15 +140,18 @@ impl StateBundle {
         self.version += 1;
     }
     pub fn update_lyrics(
-        &mut self,
-        lines: Vec<LyricLine>,
-        meta: &TrackMetadata,
-        err: Option<String>,
+    &mut self,
+    lines: Vec<LyricLine>,
+    meta: &TrackMetadata,
+    err: Option<String>,
+    provider: Option<Provider>,
     ) {
         self.lyric_state.update_lines(lines);
         self.player_state.err = err;
         self.player_state.update_from_metadata(meta);
         self.version += 1;
+        // Store provider so callers can know which provider supplied the current lyrics
+        self.provider = provider;
     }
     pub fn update_index(&mut self, position: f64) -> bool {
         let new_index = self.lyric_state.get_index(position);

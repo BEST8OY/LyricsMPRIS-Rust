@@ -2,7 +2,7 @@
 
 use crate::lyricsdb::LyricsDB;
 use crate::mpris::TrackMetadata;
-use crate::state::{StateBundle, Update};
+use crate::state::{StateBundle, Update, Provider};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 
@@ -37,6 +37,7 @@ pub async fn send_update(state: &StateBundle, update_tx: &mpsc::Sender<Update>, 
         artist: state.player_state.artist.clone(),
         title: state.player_state.title.clone(),
         album: state.player_state.album.clone(),
+    provider: state.provider.clone(),
     };
     if force || !update.lines.is_empty() || update.err.is_some() {
         let _ = update_tx.send(update).await;
@@ -52,10 +53,10 @@ async fn try_db_lyrics(
 ) -> bool {
     let guard = db.lock().await;
     if let Some(synced) = guard.get(&meta.artist, &meta.title) {
-        state.update_lyrics(crate::lyrics::parse_synced_lyrics(&synced), meta, None);
+        state.update_lyrics(crate::lyrics::parse_synced_lyrics(&synced), meta, None, Some(Provider::Db));
         true
     } else {
-        state.update_lyrics(Vec::new(), meta, None);
+        state.update_lyrics(Vec::new(), meta, None, None);
         false
     }
 }
@@ -76,7 +77,7 @@ async fn fetch_api_lyrics(
             "lrclib" => {
                 match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title).await {
                     Ok((lines, raw)) if !lines.is_empty() => {
-                        state.update_lyrics(lines, meta, None);
+                        state.update_lyrics(lines, meta, None, Some(Provider::Lrclib));
                         if let Some((db, path)) = db.zip(db_path)
                             && let Some(raw_lrc) = raw
                         {
@@ -93,10 +94,9 @@ async fn fetch_api_lyrics(
                         }
                         // Treat network errors as transient: try next provider; Api errors are fatal
                         match e {
-                            crate::lyrics::LyricsError::Network(_) => { /* continue to next provider */
-                            }
+                            crate::lyrics::LyricsError::Network(_) => { /* continue to next provider */ }
                             _ => {
-                                state.update_lyrics(Vec::new(), meta, Some(e.to_string()));
+                                state.update_lyrics(Vec::new(), meta, Some(e.to_string()), None);
                                 return;
                             }
                         }
@@ -112,7 +112,13 @@ async fn fetch_api_lyrics(
                 .await
                 {
                     Ok((lines, raw)) if !lines.is_empty() => {
-                        state.update_lyrics(lines, meta, None);
+                        // If provider supplied per-word timings (richsync), mark provider accordingly.
+                        let provider_tag = if lines.iter().any(|l| l.words.is_some()) {
+                            Some(Provider::MusixmatchRichsync)
+                        } else {
+                            Some(Provider::MusixmatchSubtitles)
+                        };
+                        state.update_lyrics(lines, meta, None, provider_tag);
                         if let Some((db, path)) = db.zip(db_path)
                             && let Some(raw_lrc) = raw
                         {
@@ -130,7 +136,7 @@ async fn fetch_api_lyrics(
                         match e {
                             crate::lyrics::LyricsError::Network(_) => { /* transient, try next */ }
                             _ => {
-                                state.update_lyrics(Vec::new(), meta, Some(e.to_string()));
+                                state.update_lyrics(Vec::new(), meta, Some(e.to_string()), None);
                                 return;
                             }
                         }
@@ -145,7 +151,7 @@ async fn fetch_api_lyrics(
         }
     }
     // No provider returned lyrics
-    state.update_lyrics(Vec::new(), meta, None);
+    state.update_lyrics(Vec::new(), meta, None, None);
 }
 
 /// Fetch lyrics (DB first, then API) and update state. Resync position and send update.

@@ -1,6 +1,7 @@
 use crate::lyricsdb::LyricsDB;
 use crate::pool;
 use crate::state::Update;
+use crate::state::Provider;
 use crate::text_utils::wrap_text;
 use crate::ui::styles::LyricStyles;
 use crossterm::{
@@ -28,6 +29,8 @@ pub struct ModernUIState {
     pub should_exit: bool,
     /// Instant when the last Update was received; used to estimate current position
     pub last_update_instant: Option<Instant>,
+    /// Runtime karaoke toggle (can be toggled with 'k')
+    pub karaoke_enabled: bool,
 }
 
 impl ModernUIState {
@@ -38,6 +41,7 @@ impl ModernUIState {
             last_track_id: None,
             should_exit: false,
             last_update_instant: None,
+            karaoke_enabled: true,
         }
     }
 }
@@ -64,6 +68,7 @@ pub async fn display_lyrics_modern(
     db: Option<Arc<Mutex<LyricsDB>>>,
     db_path: Option<String>,
     mpris_config: crate::Config,
+    karaoke_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, mut rx) = mpsc::channel(32);
     let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
@@ -82,6 +87,7 @@ pub async fn display_lyrics_modern(
     let mut terminal = Terminal::new(backend).map_err(to_boxed_err)?;
     let styles = LyricStyles::default();
     let mut state = ModernUIState::new();
+    state.karaoke_enabled = karaoke_enabled;
     let mut last_track_id: Option<(String, String, String)> = None;
     // UI tick for smooth in-line progress updates (e.g. karaoke highlighting)
     let mut ui_tick = tokio::time::interval(Duration::from_millis(100));
@@ -89,7 +95,7 @@ pub async fn display_lyrics_modern(
         tokio::select! {
             update = rx.recv() => {
                 // Robust track change detection for TUI mode
-                if let Some(ref upd) = update {
+                    if let Some(ref upd) = update {
                     let track_id = crate::ui::track_id(upd);
                     if last_track_id.as_ref() != Some(&track_id) {
                         // Optionally, reset scroll or state here if needed
@@ -99,7 +105,7 @@ pub async fn display_lyrics_modern(
                 }
                 process_update(update, &mut state, &mut terminal, &styles)?;
             }
-            // Periodic UI tick: update the displayed position based on elapsed time
+        // Periodic UI tick: update the displayed position based on elapsed time
             _ = ui_tick.tick() => {
                 // If we have a last update, use its position + elapsed (when playing)
                 if let Some(ref last_upd) = state.last_update {
@@ -109,8 +115,8 @@ pub async fn display_lyrics_modern(
                             displayed.position = displayed.position + since.elapsed().as_secs_f64();
                         }
                     }
-                    // Redraw using the estimated position
-                    draw_ui_with_cache(&mut terminal, &Some(displayed), &state.cached_lines, &styles)?;
+            // Redraw using the estimated position
+            draw_ui_with_cache(&mut terminal, &Some(displayed), &state.cached_lines, &styles, state.karaoke_enabled)?;
                 }
             }
             maybe_event = tokio::task::spawn_blocking(|| crossterm::event::poll(std::time::Duration::from_millis(100))) => {
@@ -170,6 +176,7 @@ fn prepare_visible_spans<'a>(
     w: usize,
     h: usize,
     styles: &'a LyricStyles,
+    karaoke_enabled: bool,
 ) -> Vec<Spans<'a>> {
     if let Some(update) = last_update {
         if let Some(ref err) = update.err {
@@ -182,7 +189,7 @@ fn prepare_visible_spans<'a>(
             && !cached.is_empty()
             && update.index < cached.len()
         {
-            return gather_visible_lines(update, cached, w, h, styles, update.position).into_vec();
+            return gather_visible_lines(update, cached, w, h, styles, update.position, karaoke_enabled).into_vec();
         }
     }
     Vec::new()
@@ -196,7 +203,7 @@ fn process_update<B: tui::backend::Backend>(
     styles: &LyricStyles,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     update_state(state, update);
-    draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
+    draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles, state.karaoke_enabled)?;
     Ok(())
 }
 
@@ -212,6 +219,10 @@ fn process_event<B: tui::backend::Backend>(
             KeyCode::Char('q') | KeyCode::Esc => {
                 state.should_exit = true;
             }
+            KeyCode::Char('k') => {
+                // Toggle karaoke at runtime
+                state.karaoke_enabled = !state.karaoke_enabled;
+            }
             KeyCode::Char('c')
                 if key
                     .modifiers
@@ -224,7 +235,7 @@ fn process_event<B: tui::backend::Backend>(
     }
     // Only redraw if state changed (scroll or exit)
     if !state.should_exit {
-        draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles)?;
+    draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles, state.karaoke_enabled)?;
     }
     Ok(())
 }
@@ -290,6 +301,7 @@ fn gather_visible_lines<'a>(
     h: usize,
     styles: &'a LyricStyles,
     position: f64,
+    karaoke_enabled: bool,
 ) -> VisibleLines<'a> {
     let wrapped_blocks: Vec<Vec<String>> = cached.iter().map(|l| wrap_text(l, w)).collect();
     let current_block = &wrapped_blocks[update.index];
@@ -312,7 +324,9 @@ fn gather_visible_lines<'a>(
     for line in current_block.iter() {
         // If provider supplied per-word timings, use them for precise karaoke highlighting.
         if let Some(ly) = update.lines.get(update.index) {
-            if let Some(words) = &ly.words {
+            // Only enable karaoke when the user enabled it and the provider is musixmatch.richsync or subtitles
+            if karaoke_enabled && matches!(update.provider, Some(Provider::MusixmatchRichsync) | Some(Provider::MusixmatchSubtitles)) {
+                if let Some(words) = &ly.words {
                 let mut spans = Vec::new();
                 for w in words {
                     if position >= w.end {
@@ -326,37 +340,44 @@ fn gather_visible_lines<'a>(
                 }
                 current.push(Spans::from(spans));
                 continue;
+                }
             }
         }
 
-        // Fallback: split into words and compute how many chars to highlight based on progress
-        let total_chars: usize = line.chars().count();
-        let highlight_chars = ((total_chars as f64) * progress).round() as usize;
-        let mut accumulated = 0usize;
-        let mut spans = Vec::new();
-        for word in line.split_whitespace() {
-            let word_len = word.chars().count();
-            let start = accumulated;
-            let end = accumulated + word_len;
-            accumulated = end + 1; // account for space
-            if end <= highlight_chars {
-                spans.push(Span::styled(format!("{} ", word), styles.current));
-            } else if start >= highlight_chars {
-                spans.push(Span::styled(format!("{} ", word), styles.after));
-            } else {
-                // partially highlighted word: split by char count
-                let split_at = highlight_chars.saturating_sub(start);
-                let highlighted: String = word.chars().take(split_at).collect();
-                let rest: String = word.chars().skip(split_at).collect();
-                if !highlighted.is_empty() {
-                    spans.push(Span::styled(format!("{}", highlighted), styles.current));
+    // Perform progressive karaoke when musixmatch richsync or subtitles are available.
+    if karaoke_enabled && matches!(update.provider, Some(crate::state::Provider::MusixmatchRichsync) | Some(crate::state::Provider::MusixmatchSubtitles)) {
+            // Fallback: split into words and compute how many chars to highlight based on progress
+            let total_chars: usize = line.chars().count();
+            let highlight_chars = ((total_chars as f64) * progress).round() as usize;
+            let mut accumulated = 0usize;
+            let mut spans = Vec::new();
+            for word in line.split_whitespace() {
+                let word_len = word.chars().count();
+                let start = accumulated;
+                let end = accumulated + word_len;
+                accumulated = end + 1; // account for space
+                if end <= highlight_chars {
+                    spans.push(Span::styled(format!("{} ", word), styles.current));
+                } else if start >= highlight_chars {
+                    spans.push(Span::styled(format!("{} ", word), styles.after));
+                } else {
+                    // partially highlighted word: split by char count
+                    let split_at = highlight_chars.saturating_sub(start);
+                    let highlighted: String = word.chars().take(split_at).collect();
+                    let rest: String = word.chars().skip(split_at).collect();
+                    if !highlighted.is_empty() {
+                        spans.push(Span::styled(format!("{}", highlighted), styles.current));
+                    }
+                    if !rest.is_empty() {
+                        spans.push(Span::styled(format!("{} ", rest), styles.after));
+                    };
                 }
-                if !rest.is_empty() {
-                    spans.push(Span::styled(format!("{} ", rest), styles.after));
-                };
             }
+            current.push(Spans::from(spans));
+        } else {
+            // Not richsync: render the current line fully highlighted (no progressive karaoke)
+            current.push(Spans::from(Span::styled(line.clone(), styles.current)));
         }
-        current.push(Spans::from(spans));
     }
 
     if current_height >= h {
@@ -399,13 +420,14 @@ fn draw_ui_with_cache<B: tui::backend::Backend>(
     last_update: &Option<Update>,
     cached_lines: &Option<Vec<String>>,
     styles: &LyricStyles,
+    karaoke_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     terminal
         .draw(|f| {
             let size = f.size();
             let w = size.width as usize;
             let h = size.height as usize;
-            let visible_spans = prepare_visible_spans(last_update, cached_lines, w, h, styles);
+            let visible_spans = prepare_visible_spans(last_update, cached_lines, w, h, styles, karaoke_enabled);
 
             if visible_spans.is_empty() {
                 // Render an empty paragraph to clear the area and avoid zero-height rendering.
