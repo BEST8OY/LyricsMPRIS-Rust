@@ -1,7 +1,6 @@
 use crate::lyricsdb::LyricsDB;
 use crate::pool;
 use crate::state::Update;
-use crate::state::Provider;
 use crate::text_utils::wrap_text;
 use crate::ui::styles::LyricStyles;
 use crossterm::{
@@ -20,6 +19,8 @@ use tui::{
     text::{Span, Spans},
     widgets::Paragraph,
 };
+
+use crate::ui::modern_helpers::gather_visible_lines;
 
 /// UI state for the modern TUI mode
 pub struct ModernUIState {
@@ -46,19 +47,7 @@ impl ModernUIState {
     }
 }
 
-/// A collection of styled text lines (Spans) ready for rendering.
-struct VisibleLines<'a> {
-    before: Vec<Spans<'a>>,
-    current: Vec<Spans<'a>>,
-    after: Vec<Spans<'a>>,
-}
-
-impl<'a> VisibleLines<'a> {
-    /// Combines before, current, and after spans into a single Vec for rendering.
-    fn into_vec(self) -> Vec<Spans<'a>> {
-        [self.before, self.current, self.after].concat()
-    }
-}
+// VisibleLines and gather_visible_lines live in `modern_helpers` to keep this file small.
 
 /// Display lyrics in modern TUI mode (centered, highlighted, real-time)
 pub async fn display_lyrics_modern(
@@ -247,158 +236,7 @@ fn to_boxed_err<E: std::error::Error + Send + Sync + 'static>(
     Box::new(e)
 }
 
-/// Collects the styled lines that should appear *before* the current lyric.
-fn collect_before_spans<'a>(
-    current_index: usize,
-    wrapped_blocks: &[Vec<String>],
-    mut lines_needed: usize,
-    style: tui::style::Style,
-) -> Vec<Spans<'a>> {
-    let mut before_spans = Vec::new();
-    let mut i = current_index;
-    while i > 0 && lines_needed > 0 {
-        i -= 1;
-        let block_to_take_from = &wrapped_blocks[i];
-        let take = block_to_take_from.len().min(lines_needed);
-        let start = block_to_take_from.len() - take;
-
-        let spans = block_to_take_from[start..]
-            .iter()
-            .map(|line| Spans::from(Span::styled(line.clone(), style)));
-        before_spans.splice(0..0, spans); // Prepend to maintain order
-        lines_needed -= take;
-    }
-    before_spans
-}
-
-/// Collects the styled lines that should appear *after* the current lyric.
-fn collect_after_spans<'a>(
-    current_index: usize,
-    wrapped_blocks: &[Vec<String>],
-    mut lines_needed: usize,
-    style: tui::style::Style,
-) -> Vec<Spans<'a>> {
-    let mut after_spans = Vec::new();
-    let mut j = current_index + 1;
-    while j < wrapped_blocks.len() && lines_needed > 0 {
-        let block_to_take_from = &wrapped_blocks[j];
-        let take = block_to_take_from.len().min(lines_needed);
-
-        let spans = block_to_take_from[..take]
-            .iter()
-            .map(|line| Spans::from(Span::styled(line.clone(), style)));
-        after_spans.extend(spans);
-        lines_needed -= take;
-        j += 1;
-    }
-    after_spans
-}
-
-/// Gathers all visible lines (before, current, after) based on the current state and screen size.
-fn gather_visible_lines<'a>(
-    update: &Update,
-    cached: &[String],
-    w: usize,
-    h: usize,
-    styles: &'a LyricStyles,
-    position: f64,
-    karaoke_enabled: bool,
-) -> VisibleLines<'a> {
-    let wrapped_blocks: Vec<Vec<String>> = cached.iter().map(|l| wrap_text(l, w)).collect();
-    let current_block = &wrapped_blocks[update.index];
-    let current_height = current_block.len();
-
-    // For the current block, produce word-level spans with partial highlight based on position.
-    let mut current = Vec::new();
-    // Determine current and next timestamp
-    let start_time = update.lines.get(update.index).map(|l| l.time).unwrap_or(0.0);
-    let _end_time = update
-        .lines
-        .get(update.index + 1)
-        .map(|l| l.time)
-        .unwrap_or(start_time + 3.0);
-    // progress not used when only per-word timings drive karaoke
-    for line in current_block.iter() {
-        // If provider supplied per-word timings, use them for precise karaoke highlighting.
-        if let Some(ly) = update.lines.get(update.index) {
-            // Only enable karaoke when the user enabled it and the provider is musixmatch.richsync or subtitles
-            if karaoke_enabled && matches!(update.provider, Some(Provider::MusixmatchRichsync)) {
-                if let Some(words) = &ly.words {
-                let mut spans = Vec::new();
-                for w in words {
-                    if position >= w.end {
-                        // fully past: fully highlighted
-                        spans.push(Span::styled(format!("{} ", w.text), styles.current));
-                        continue;
-                    }
-                    if position < w.start {
-                        // not yet reached: render as after
-                        spans.push(Span::styled(format!("{} ", w.text), styles.after));
-                        continue;
-                    }
-
-                    // partially through this word: highlight progressively per character
-                    let dur = (w.end - w.start).max(std::f64::EPSILON);
-                    let frac = ((position - w.start) / dur).clamp(0.0, 1.0);
-                    // split on unicode scalar (chars) boundaries; this is a pragmatic approach
-                    let chars: Vec<char> = w.text.chars().collect();
-                    let total = chars.len();
-                    let highlight_chars = ((frac * total as f64).floor() as usize).min(total);
-
-                    if highlight_chars == 0 {
-                        spans.push(Span::styled(format!("{} ", w.text), styles.after));
-                    } else if highlight_chars >= total {
-                        spans.push(Span::styled(format!("{} ", w.text), styles.current));
-                    } else {
-                        let highlighted: String = chars[..highlight_chars].iter().collect();
-                        let remaining: String = chars[highlight_chars..].iter().collect();
-                        spans.push(Span::styled(highlighted, styles.current));
-                        spans.push(Span::styled(format!("{} ", remaining), styles.after));
-                    }
-                }
-                current.push(Spans::from(spans));
-                continue;
-                }
-            }
-        }
-
-    // No per-word timings available (or karaoke disabled): render the current line fully highlighted
-    current.push(Spans::from(Span::styled(line.clone(), styles.current)));
-    }
-
-    if current_height >= h {
-        // If the current line alone fills the screen, just show that.
-        return VisibleLines {
-            before: Vec::new(),
-            current,
-            after: Vec::new(),
-        };
-    }
-
-    // Otherwise, calculate context lines to show before and after.
-    let context_lines = h - current_height;
-    let lines_needed_before = context_lines / 2;
-    let lines_needed_after = context_lines - lines_needed_before;
-
-    let before = collect_before_spans(
-        update.index,
-        &wrapped_blocks,
-        lines_needed_before,
-        styles.before,
-    );
-    let after = collect_after_spans(
-        update.index,
-        &wrapped_blocks,
-        lines_needed_after,
-        styles.after,
-    );
-
-    VisibleLines {
-        before,
-        current,
-        after,
-    }
-}
+// Helpers for wrapping and visible-line selection live in `modern_helpers`.
 
 /// Renders the UI, now using the TUI Paragraph widget for centering.
 fn draw_ui_with_cache<B: tui::backend::Backend>(
