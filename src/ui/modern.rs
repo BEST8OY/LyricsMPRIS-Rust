@@ -327,12 +327,33 @@ fn gather_visible_lines<'a>(
                 let mut spans = Vec::new();
                 for w in words {
                     if position >= w.end {
+                        // fully past: fully highlighted
                         spans.push(Span::styled(format!("{} ", w.text), styles.current));
-                    } else if position < w.start {
+                        continue;
+                    }
+                    if position < w.start {
+                        // not yet reached: render as after
                         spans.push(Span::styled(format!("{} ", w.text), styles.after));
-                    } else {
-                        // partially through this word: highlight whole word for simplicity
+                        continue;
+                    }
+
+                    // partially through this word: highlight progressively per character
+                    let dur = (w.end - w.start).max(std::f64::EPSILON);
+                    let frac = ((position - w.start) / dur).clamp(0.0, 1.0);
+                    // split on unicode scalar (chars) boundaries; this is a pragmatic approach
+                    let chars: Vec<char> = w.text.chars().collect();
+                    let total = chars.len();
+                    let highlight_chars = ((frac * total as f64).floor() as usize).min(total);
+
+                    if highlight_chars == 0 {
+                        spans.push(Span::styled(format!("{} ", w.text), styles.after));
+                    } else if highlight_chars >= total {
                         spans.push(Span::styled(format!("{} ", w.text), styles.current));
+                    } else {
+                        let highlighted: String = chars[..highlight_chars].iter().collect();
+                        let remaining: String = chars[highlight_chars..].iter().collect();
+                        spans.push(Span::styled(highlighted, styles.current));
+                        spans.push(Span::styled(format!("{} ", remaining), styles.after));
                     }
                 }
                 current.push(Spans::from(spans));

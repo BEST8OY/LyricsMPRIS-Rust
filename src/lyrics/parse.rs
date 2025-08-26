@@ -1,6 +1,7 @@
 use crate::lyrics::types::LyricLine;
 use once_cell::sync::Lazy;
 use regex::Regex;
+use serde_json::Value;
 
 static SYNCED_LYRICS_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\[(\d{1,2}):(\d{2})[.](\d{1,2})\]").unwrap());
@@ -40,4 +41,81 @@ pub fn parse_synced_lyrics(synced: &str) -> Vec<LyricLine> {
         }
     }
     lines
+}
+
+/// Try to parse a musixmatch "richsync_body" JSON string into lyric lines with optional per-word timings.
+/// Returns Some((lines, raw_lrc_with_marker)) on success, or None if parsing/shape doesn't match.
+pub fn parse_richsync_body(richsync_body: &str) -> Option<(Vec<LyricLine>, String)> {
+    if let Ok(lines_val) = serde_json::from_str::<Value>(richsync_body) {
+        if let Some(arr) = lines_val.as_array() {
+            let mut parsed = Vec::new();
+            let mut out = String::new();
+            for line in arr.iter() {
+                let t = line.pointer("/ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let te = line.pointer("/te").and_then(|v| v.as_f64()).unwrap_or(t + 3.0);
+                let text = line
+                    .get("x")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| line.get("text").and_then(|v| v.as_str()))
+                    .unwrap_or("\u{266a}");
+                let ms = (t * 1000.0).round() as u64;
+                let minutes = ms / 60000;
+                let seconds = (ms % 60000) / 1000;
+                let centi = ms % 1000 / 10;
+                out.push_str(&format!("[{:02}:{:02}.{:02}]{}\n", minutes, seconds, centi, text));
+
+                // Parse per-word timings. Two possible richsync shapes:
+                // - explicit `words` array with {start,end,text}
+                // - character-level `l` array with {c, o} items (offsets from ts)
+                let words = if let Some(words_arr) = line.get("words").and_then(|v| v.as_array()) {
+                    let mut wts = Vec::new();
+                    for w in words_arr {
+                        let start = w.get("start").and_then(|v| v.as_f64()).unwrap_or(t);
+                        let end = w.get("end").and_then(|v| v.as_f64()).unwrap_or(start);
+                        let wtext = w.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        wts.push(crate::lyrics::types::WordTiming { start, end, text: wtext });
+                    }
+                    if wts.is_empty() { None } else { Some(wts) }
+                } else if let Some(l_arr) = line.get("l").and_then(|v| v.as_array()) {
+                    let mut wts = Vec::new();
+                    let mut cur = String::new();
+                    let mut cur_start: Option<f64> = None;
+                    let mut last_offset: Option<f64> = None;
+                    for elem in l_arr {
+                        let ch = elem.get("c").and_then(|v| v.as_str()).unwrap_or("");
+                        let o = elem.get("o").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        if ch.trim().is_empty() {
+                            if !cur.is_empty() {
+                                let start = t + cur_start.unwrap_or(0.0);
+                                let end = t + o;
+                                wts.push(crate::lyrics::types::WordTiming { start, end, text: cur.clone() });
+                                cur.clear();
+                                cur_start = None;
+                                last_offset = None;
+                            }
+                        } else {
+                            if cur.is_empty() {
+                                cur_start = Some(o);
+                            }
+                            cur.push_str(ch);
+                            last_offset = Some(o);
+                        }
+                    }
+                    if !cur.is_empty() {
+                        let start = t + cur_start.unwrap_or(0.0);
+                        let end = t + last_offset.unwrap_or(te - t);
+                        wts.push(crate::lyrics::types::WordTiming { start, end, text: cur.clone() });
+                    }
+                    if wts.is_empty() { None } else { Some(wts) }
+                } else {
+                    None
+                };
+
+                parsed.push(LyricLine { time: t, text: text.to_string(), words });
+            }
+            let out_with_marker = format!(";;richsync=1\n{}", out);
+            return Some((parsed, out_with_marker));
+        }
+    }
+    None
 }
