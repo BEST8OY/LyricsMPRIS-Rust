@@ -1,128 +1,83 @@
-# LyricsMPRIS-Rust
+ # LyricsMPRIS
 
-**A sleek, real-time terminal lyrics viewer for Linux.**
+ Lightweight TUI and pipe-mode lyrics viewer that listens to MPRIS players and displays synchronized lyrics.
 
-LyricsMPRIS connects to any [MPRIS](https://specifications.freedesktop.org/mpris-spec/latest/)-compatible music player (like Spotify, VLC, or mpv) and displays the current song's lyrics right in your terminal. It offers a beautiful, focused TUI and a simple "pipe" mode for scripting and status bars.
+ ## Features
 
----
+ - Modern terminal UI with centered lyric display and optional per-word (karaoke) highlighting.
+ - Pipe mode for piping current lyric line to stdout (script-friendly).
+ - Multiple lyric providers (built-in `lrclib`, `musixmatch`), configurable order.
+ - Local lyrics database support and simple blocklist for player services.
 
-## Features
 
-- **Real-Time Lyrics:** Automatically fetches and displays synced lyrics for the currently playing song.
-- **Modern Terminal UI:** A clean, centered, and highlighted interface that looks great in any terminal.
-- **Pipe Mode:** Output the current lyric line directly to `stdout`. Perfect for custom scripts, status bars (like `polybar` or `waybar`), or other tools.
-- **Multiple Lyric Providers:** Fetch lyrics from various sources.
-- **Wide Compatibility:** Works with any media player that implements the MPRIS D-Bus interface.
-- **Fast and Efficient:** Built with asynchronous Rust for a smooth, non-blocking experience.
-- **Local Lyrics:** (Optional) Use a local database for instant, offline lyric access.
-- **Player Blocklist:** Ignore specific media players you don't want to track.
+ Lightweight TUI and pipe-mode lyrics viewer that listens to MPRIS players and displays synchronized lyrics.
 
----
+ ## Quick start
 
-## Installation
+ ### Prerequisites
 
-### Prerequisites
+ - Rust toolchain (rustc + cargo) installed. See https://rust-lang.org for setup.
 
-- A Linux-based OS with D-Bus.
-- The [Rust toolchain](https://rustup.rs/) (to build from source).
-- An MPRIS-compatible media player.
+ ### Build
 
-### Build from Source
+ ```
+ # build debug
+ cargo build
 
-1.  **Clone the repository:**
-    ```sh
-    git clone https://github.com/your-username/LyricsMPRIS-Rust.git
-    cd LyricsMPRIS-Rust
-    ```
+ # build optimized release
+ cargo build --release
+ ```
 
-2.  **Build the release binary:**
-    ```sh
-    cargo build --release
-    ```
+ ### Run (examples)
 
-3.  **Run the application:**
-    The executable will be at `./target/release/lyricsmpris`. You can copy it to a directory in your `$PATH` for easy access (e.g., `~/.local/bin`).
+ Run the release binary directly from target:
 
----
+ ```
+ ./target/release/lyricsmpris -h
+ ```
 
-## Usage
+ Or via cargo (debug):
 
-The simplest way to run LyricsMPRIS is without any arguments, which will launch the TUI.
+ ```
+ cargo run -- --no-karaoke
+ ```
 
-```sh
-lyricsmpris
-```
+ ## Environment variables
 
-### Command-Line Options
+ - `MUSIXMATCH_USERTOKEN` — Optional: API user token for the Musixmatch provider. If you plan to use `musixmatch` as a provider, set this environment variable to your Musixmatch token:
 
-For more options, use the `--help` flag:
+ ```fish
+ set -x MUSIXMATCH_USERTOKEN "your-token-here"
+ ```
 
-```sh
-$ lyricsmpris --help
-```
+ - `LYRIC_PROVIDERS` — Comma-separated provider list used as a fallback when `--providers` is not provided on the command line.
 
-| Option | Description | Default Value |
-|---|---|---|
-| `--pipe` | Pipe current lyric line to stdout. | `false` |
-| `--database <PATH>` | Path to local lyrics database. | `None` |
-| `--block <SERVICES>` | Comma-separated list of player service names to block. | `[]` (empty list) |
-| `--debug-log` | Enable backend error logging to stderr. | `false` |
-| `--providers <PROVIDERS>` | Comma-separated list of lyric providers in preferred order. | `lrclib,musixmatch` |
+ ## Command line flags
 
-### Environment Variables
+ - `--no-karaoke` — Disable per-word karaoke highlighting. Karaoke is enabled by default; pass `--no-karaoke` to turn it off.
+ - `--pipe` — Run in pipe mode (prints current lyric line to stdout) instead of the modern TUI.
+ - `--database <PATH>` — Path to a local lyrics database file.
+ - `--block SERVICE1,SERVICE2` — Comma-separated, case-insensitive list of MPRIS service names to ignore.
+ - `--debug-log` — Enable backend error logging to stderr.
+ - `--providers lrclib,musixmatch` — Comma-separated provider list in preferred order. If omitted, the `LYRIC_PROVIDERS` environment variable is used as a fallback.
 
-- `LYRIC_PROVIDERS`: A comma-separated list of lyric providers to use, in preferred order. This is used as a fallback if the `--providers` option is not specified.
-- `MUSIXMATCH_USERTOKEN`: To use the Musixmatch provider, you need to provide a user token. You can get this from the Musixmatch desktop app or website.
+ ## Runtime controls (TUI)
 
-### Examples
+ - Press `k` to toggle karaoke highlighting at runtime.
+ - Press `q` or `Esc` to quit the TUI.
 
-- **Launch the default TUI:**
-  ```sh
-  lyricsmpris
-  ```
+ ## Development environment
 
-- **Pipe lyrics to your status bar:**
-  ```sh
-  lyricsmpris --pipe
-  ```
+ This project was developed in Visual Studio Code and authored with the assistance of GitHub Copilot.
 
-- **Use a local lyrics database:**
-  ```sh
-  lyricsmpris --database ~/.config/lyrics.db
-  ```
+ ## Contributing
 
-- **Ignore Spotify and VLC:**
-  ```sh
-  lyricsmpris --block spotify,vlc
-  ```
+ - Issues and PRs welcome. Keep changes small and test the TUI and pipe modes.
 
-- **Specify lyric providers:**
-  ```sh
-  lyricsmpris --providers musixmatch,lrclib
-  ```
+ ## License
 
----
+ - See the `LICENSE` file in this repository for license details.
 
-## Supported Players
+ ## Acknowledgements
 
-LyricsMPRIS should work with any media player that implements the MPRIS D-Bus interface. This includes, but is not limited to:
-
-- Spotify
-- VLC
-- mpv (with an MPRIS plugin)
-- Rhythmbox
-- Audacious
-- Elisa
-- And many more...
-
----
-
-## Contributing
-
-Contributions are welcome! If you have a feature request, bug report, or pull request, please feel free to open an issue or PR on the GitHub repository.
-
----
-
-## License
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+ - This project uses several community crates — see `Cargo.toml` for dependencies.

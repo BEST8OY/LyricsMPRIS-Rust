@@ -35,9 +35,9 @@ pub struct Config {
     /// Enable backend error logging to stderr
     #[arg(long)]
     pub debug_log: bool,
-    /// Enable karaoke highlighting (per-word). Use --no-karaoke to disable.
-    #[arg(long = "karaoke", default_value_t = true)]
-    pub karaoke: bool,
+    /// Disable karaoke highlighting (per-word). Use --no-karaoke to disable karaoke (default: enabled).
+    #[arg(long = "no-karaoke")]
+    pub no_karaoke: bool,
     /// Comma-separated list of lyric providers in preferred order (e.g. "lrclib,musixmatch").
     /// If empty, the LYRIC_PROVIDERS env var will be used as a fallback.
     #[arg(long, value_delimiter = ',')]
@@ -55,7 +55,7 @@ impl Default for Config {
             debug_log: false,
             providers: vec!["lrclib".to_string(), "musixmatch".to_string()],
             player_service: None,
-            karaoke: true,
+            no_karaoke: false,
         }
     }
 }
@@ -136,7 +136,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             db.clone(),
             db_path.clone(),
             cfg.clone(),
-            cfg.karaoke,
+            !cfg.no_karaoke,
         )
         .await
     };
