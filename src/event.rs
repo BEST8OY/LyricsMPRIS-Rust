@@ -76,6 +76,23 @@ async fn fetch_api_lyrics(
     debug_log: bool,
     providers: &[String],
 ) {
+    // Helper to persist raw LRC to DB when both db and path are provided.
+    async fn save_raw_to_db(
+        db: Option<&Arc<Mutex<LyricsDB>>>,
+        db_path: Option<&str>,
+        artist: &str,
+        title: &str,
+        raw: Option<String>,
+    ) {
+        if let Some((db, path)) = db.zip(db_path) {
+            if let Some(raw_lrc) = raw {
+                let mut guard = db.lock().await;
+                guard.insert(artist, title, &raw_lrc);
+                let _ = guard.save(path);
+            }
+        }
+    }
+
     // Try providers in order. If one returns non-empty lyrics, use it and save to DB if available.
     for prov in providers {
         match prov.as_str() {
@@ -83,13 +100,7 @@ async fn fetch_api_lyrics(
                 match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title).await {
                     Ok((lines, raw)) if !lines.is_empty() => {
                         state.update_lyrics(lines, meta, None, Some(Provider::Lrclib));
-                        if let Some((db, path)) = db.zip(db_path)
-                            && let Some(raw_lrc) = raw
-                        {
-                            let mut guard = db.lock().await;
-                            guard.insert(&meta.artist, &meta.title, &raw_lrc);
-                            let _ = guard.save(path);
-                        }
+                        save_raw_to_db(db, db_path, &meta.artist, &meta.title, raw).await;
                         return;
                     }
                     Ok((_lines, _)) => { /* empty, try next provider */ }
@@ -126,13 +137,7 @@ async fn fetch_api_lyrics(
                             Some(Provider::MusixmatchSubtitles)
                         };
                         state.update_lyrics(lines, meta, None, provider_tag);
-                        if let Some((db, path)) = db.zip(db_path)
-                            && let Some(raw_lrc) = raw
-                        {
-                            let mut guard = db.lock().await;
-                            guard.insert(&meta.artist, &meta.title, &raw_lrc);
-                            let _ = guard.save(path);
-                        }
+                        save_raw_to_db(db, db_path, &meta.artist, &meta.title, raw).await;
                         return;
                     }
                     Ok((_lines, _)) => { /* empty, try next provider */ }
@@ -157,6 +162,7 @@ async fn fetch_api_lyrics(
             }
         }
     }
+
     // No provider returned lyrics
     state.update_lyrics(Vec::new(), meta, None, None);
 }

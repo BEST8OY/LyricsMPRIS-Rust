@@ -1,7 +1,6 @@
 use crate::lyricsdb::LyricsDB;
 use crate::pool;
 use crate::state::Update;
-use crate::text_utils::wrap_text;
 use crate::ui::styles::LyricStyles;
 use crossterm::{
     event::{Event, KeyCode},
@@ -14,58 +13,9 @@ use std::time::{Duration, Instant};
 use std::pin::Pin;
 use tokio::time::Sleep;
 use tokio::sync::{Mutex, mpsc};
-use tui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::{Alignment, Rect},
-    text::{Span, Spans},
-    widgets::Paragraph,
-};
+use tui::{Terminal, backend::CrosstermBackend};
 
-use crate::ui::modern_helpers::gather_visible_lines;
-
-// Helper: compute the next per-word sleep for richsync karaoke.
-// Scans the current line and subsequent lines for the next word start/end > position
-// and returns a pinned Sleep scheduled at that boundary.
-fn compute_next_word_sleep_from_update(
-    upd: &Update,
-) -> Option<Pin<Box<Sleep>>> {
-    if !upd.playing || !matches!(upd.provider, Some(crate::state::Provider::MusixmatchRichsync)) {
-        return None;
-    }
-    let pos = upd.position;
-    let mut next_dur: Option<f64> = None;
-    // scan current and subsequent lines for next word start or end > pos
-    for i in upd.index..upd.lines.len() {
-        if let Some(line) = upd.lines.get(i) {
-            if let Some(words) = &line.words {
-                for w in words.iter() {
-                    if w.start > pos {
-                        let d = w.start - pos;
-                        next_dur = Some(next_dur.map_or(d, |nd| nd.min(d)));
-                    }
-                    if w.end > pos {
-                        let d = w.end - pos;
-                        next_dur = Some(next_dur.map_or(d, |nd| nd.min(d)));
-                    }
-                }
-            }
-        }
-        // If we already found a very near boundary, stop early
-        if let Some(d) = next_dur {
-            if d <= 0.0 {
-                break;
-            }
-        }
-    }
-    if let Some(dur) = next_dur {
-        let dur = dur.max(0.0);
-        let when = tokio::time::Instant::now() + Duration::from_secs_f64(dur);
-        Some(Box::pin(tokio::time::sleep_until(when)))
-    } else {
-        None
-    }
-}
+use crate::ui::modern_helpers::{estimate_update_and_next_sleep, draw_ui_with_cache};
 
 /// UI state for the modern TUI mode
 pub struct ModernUIState {
@@ -145,21 +95,12 @@ pub async fn display_lyrics_modern(
                 }
                 process_update(update, &mut state, &mut terminal, &styles)?;
 
-                // After processing a new update, (re)compute next per-word wakeup
-                next_word_sleep = None;
-                if let Some(ref last_upd) = state.last_update {
-                    let mut tmp = last_upd.clone();
-                    if tmp.playing {
-                        if let Some(since) = state.last_update_instant {
-                            tmp.position += since.elapsed().as_secs_f64();
-                        }
-                    }
-                    // draw immediately to reflect the update
-                    let _ = draw_ui_with_cache(&mut terminal, &Some(tmp.clone()), &state.cached_lines, &styles, state.karaoke_enabled);
-                    if state.karaoke_enabled {
-                        next_word_sleep = compute_next_word_sleep_from_update(&tmp);
-                    }
+                // After processing a new update, draw and (re)compute next per-word wakeup
+                let (maybe_tmp, next) = estimate_update_and_next_sleep(&state.last_update, state.last_update_instant, state.karaoke_enabled);
+                if let Some(tmp) = maybe_tmp {
+                    let _ = draw_ui_with_cache(&mut terminal, &Some(tmp), &state.cached_lines, &styles, state.karaoke_enabled);
                 }
+                next_word_sleep = next;
             }
 
             maybe_event = tokio::task::spawn_blocking(|| crossterm::event::poll(std::time::Duration::from_millis(100))) => {
@@ -168,19 +109,11 @@ pub async fn display_lyrics_modern(
                     process_event(event, &mut state, &mut terminal, &styles)?;
 
                     // user-driven state changes (toggle karaoke, etc) may change scheduling
-                    next_word_sleep = None;
-                    if let Some(ref last_upd) = state.last_update {
-                        let mut tmp = last_upd.clone();
-                        if tmp.playing {
-                            if let Some(since) = state.last_update_instant {
-                                tmp.position += since.elapsed().as_secs_f64();
-                            }
-                        }
-                        let _ = draw_ui_with_cache(&mut terminal, &Some(tmp.clone()), &state.cached_lines, &styles, state.karaoke_enabled);
-                        if state.karaoke_enabled {
-                            next_word_sleep = compute_next_word_sleep_from_update(&tmp);
-                        }
+                    let (maybe_tmp, next) = estimate_update_and_next_sleep(&state.last_update, state.last_update_instant, state.karaoke_enabled);
+                    if let Some(tmp) = maybe_tmp {
+                        let _ = draw_ui_with_cache(&mut terminal, &Some(tmp), &state.cached_lines, &styles, state.karaoke_enabled);
                     }
+                    next_word_sleep = next;
                 }
             }
 
@@ -193,21 +126,11 @@ pub async fn display_lyrics_modern(
                 }
             } => {
                 // timer fired: redraw using estimated position and reschedule next boundary
-                if let Some(ref last_upd) = state.last_update {
-                    let mut tmp = last_upd.clone();
-                    if tmp.playing {
-                        if let Some(since) = state.last_update_instant {
-                            tmp.position += since.elapsed().as_secs_f64();
-                        }
-                    }
-                    let _ = draw_ui_with_cache(&mut terminal, &Some(tmp.clone()), &state.cached_lines, &styles, state.karaoke_enabled);
-
-                    // schedule next using improved scanner across subsequent lines
-                    next_word_sleep = None;
-                    if state.karaoke_enabled {
-                        next_word_sleep = compute_next_word_sleep_from_update(&tmp);
-                    }
+                let (maybe_tmp, next) = estimate_update_and_next_sleep(&state.last_update, state.last_update_instant, state.karaoke_enabled);
+                if let Some(tmp) = maybe_tmp {
+                    let _ = draw_ui_with_cache(&mut terminal, &Some(tmp), &state.cached_lines, &styles, state.karaoke_enabled);
                 }
+                next_word_sleep = next;
             }
         }
     }
@@ -222,6 +145,8 @@ fn update_cache_and_state(state: &mut ModernUIState, update: &Update) {
     state.last_update = Some(update.clone());
     state.last_update_instant = Some(Instant::now());
 }
+
+// Scheduling helpers moved to `modern_helpers.rs` (estimate_update_and_next_sleep).
 
 /// Encapsulates all logic for updating ModernUIState from an Update.
 fn update_state(state: &mut ModernUIState, update: Option<Update>) {
@@ -253,31 +178,7 @@ fn update_state(state: &mut ModernUIState, update: Option<Update>) {
     }
 }
 
-/// Prepares the visible spans for rendering, given the state and styles.
-fn prepare_visible_spans<'a>(
-    last_update: &Option<Update>,
-    cached_lines: &Option<Vec<String>>,
-    w: usize,
-    h: usize,
-    styles: &'a LyricStyles,
-    karaoke_enabled: bool,
-) -> Vec<Spans<'a>> {
-    if let Some(update) = last_update {
-        if let Some(ref err) = update.err {
-            // If there's an error, wrap it and prepare to render it.
-            return wrap_text(err, w)
-                .into_iter()
-                .map(|line| Spans::from(Span::styled(line, styles.current)))
-                .collect();
-            } else if let Some(cached) = cached_lines
-            && !cached.is_empty()
-            && update.index < cached.len()
-        {
-            return gather_visible_lines(update, cached, w, h, styles, update.position, karaoke_enabled).into_vec();
-        }
-    }
-    Vec::new()
-}
+// prepare_visible_spans moved to `ui_helpers::draw_ui_with_cache`.
 
 /// Handle incoming update from the lyrics source (now simplified)
 fn process_update<B: tui::backend::Backend>(
@@ -331,43 +232,3 @@ fn to_boxed_err<E: std::error::Error + Send + Sync + 'static>(
 }
 
 // Helpers for wrapping and visible-line selection live in `modern_helpers`.
-
-/// Renders the UI, now using the TUI Paragraph widget for centering.
-fn draw_ui_with_cache<B: tui::backend::Backend>(
-    terminal: &mut Terminal<B>,
-    last_update: &Option<Update>,
-    cached_lines: &Option<Vec<String>>,
-    styles: &LyricStyles,
-    karaoke_enabled: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    terminal
-        .draw(|f| {
-            let size = f.size();
-            let w = size.width as usize;
-            let h = size.height as usize;
-            let visible_spans = prepare_visible_spans(last_update, cached_lines, w, h, styles, karaoke_enabled);
-
-            if visible_spans.is_empty() {
-                // Render an empty paragraph to clear the area and avoid zero-height rendering.
-                let paragraph =
-                    Paragraph::new(vec![Spans::from(Span::raw(""))]).alignment(Alignment::Center);
-                f.render_widget(paragraph, size);
-            } else {
-                // Calculate vertical padding to center the entire block of text.
-                let top_padding = h.saturating_sub(visible_spans.len()) / 2;
-                let render_area = Rect {
-                    x: size.x,
-                    y: size.y + top_padding as u16,
-                    width: size.width,
-                    // Ensure height doesn't exceed the terminal boundary
-                    height: (visible_spans.len() as u16).min(size.height),
-                };
-
-                // Create a Paragraph and let it handle the horizontal centering.
-                let paragraph = Paragraph::new(visible_spans).alignment(Alignment::Center);
-                f.render_widget(paragraph, render_area);
-            }
-        })
-        .map_err(to_boxed_err)?;
-    Ok(())
-}

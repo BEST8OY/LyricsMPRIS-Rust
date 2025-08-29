@@ -2,6 +2,135 @@ use crate::text_utils::wrap_text;
 use crate::state::Update;
 use crate::ui::styles::LyricStyles;
 use tui::text::Spans;
+use std::pin::Pin;
+use tokio::time::Sleep;
+use std::time::Duration;
+use std::time::Instant;
+use tui::Terminal;
+use tui::widgets::Paragraph;
+use tui::layout::{Alignment, Rect};
+use tui::backend::Backend;
+use std::error::Error;
+
+/// Draw the UI using cached lines and the modern helpers.
+pub fn draw_ui_with_cache<B: Backend>(
+    terminal: &mut Terminal<B>,
+    last_update: &Option<Update>,
+    cached_lines: &Option<Vec<String>>,
+    styles: &LyricStyles,
+    karaoke_enabled: bool,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    terminal
+        .draw(|f| {
+            let size = f.size();
+            let w = size.width as usize;
+            let h = size.height as usize;
+            let visible_spans = {
+                if let Some(update) = last_update {
+                    if let Some(ref err) = update.err {
+                        wrap_text(err, w)
+                            .into_iter()
+                            .map(|line| Spans::from(tui::text::Span::styled(line, styles.current)))
+                            .collect()
+                    } else if let Some(cached) = cached_lines
+                        && !cached.is_empty()
+                        && update.index < cached.len()
+                    {
+                        gather_visible_lines(update, cached, w, h, styles, update.position, karaoke_enabled).into_vec()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                }
+            };
+
+            if visible_spans.is_empty() {
+                let paragraph = Paragraph::new(vec![Spans::from(tui::text::Span::raw(""))]).alignment(Alignment::Center);
+                f.render_widget(paragraph, size);
+            } else {
+                let top_padding = h.saturating_sub(visible_spans.len()) / 2;
+                let render_area = Rect {
+                    x: size.x,
+                    y: size.y + top_padding as u16,
+                    width: size.width,
+                    height: (visible_spans.len() as u16).min(size.height),
+                };
+                let paragraph = Paragraph::new(visible_spans).alignment(Alignment::Center);
+                f.render_widget(paragraph, render_area);
+            }
+        })
+        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+    Ok(())
+}
+
+/// Compute the next per-word sleep for richsync karaoke from an Update.
+/// Scans the current line and subsequent lines for the next word start/end > position
+/// and returns a pinned Sleep scheduled at that boundary.
+pub fn compute_next_word_sleep_from_update(
+    upd: &Update,
+) -> Option<Pin<Box<Sleep>>> {
+    if !upd.playing || !matches!(upd.provider, Some(crate::state::Provider::MusixmatchRichsync)) {
+        return None;
+    }
+    let pos = upd.position;
+    let mut next_dur: Option<f64> = None;
+    // scan current and subsequent lines for next word start or end > pos
+    for i in upd.index..upd.lines.len() {
+        if let Some(line) = upd.lines.get(i) {
+            if let Some(words) = &line.words {
+                for w in words.iter() {
+                    if w.start > pos {
+                        let d = w.start - pos;
+                        next_dur = Some(next_dur.map_or(d, |nd| nd.min(d)));
+                    }
+                    if w.end > pos {
+                        let d = w.end - pos;
+                        next_dur = Some(next_dur.map_or(d, |nd| nd.min(d)));
+                    }
+                }
+            }
+        }
+        // If we already found a very near boundary, stop early
+        if let Some(d) = next_dur {
+            if d <= 0.0 {
+                break;
+            }
+        }
+    }
+    if let Some(dur) = next_dur {
+        let dur = dur.max(0.0);
+        let when = tokio::time::Instant::now() + Duration::from_secs_f64(dur);
+        Some(Box::pin(tokio::time::sleep_until(when)))
+    } else {
+        None
+    }
+}
+
+/// Estimate the current Update position from `last_update` and `last_update_instant`,
+/// and return a tuple of (estimated_update_option, next_word_sleep_option).
+pub fn estimate_update_and_next_sleep(
+    last_update: &Option<Update>,
+    last_update_instant: Option<Instant>,
+    karaoke_enabled: bool,
+) -> (Option<Update>, Option<Pin<Box<Sleep>>>) {
+    if let Some(upd) = last_update {
+        let mut tmp = upd.clone();
+        if tmp.playing {
+            if let Some(since) = last_update_instant {
+                tmp.position += since.elapsed().as_secs_f64();
+            }
+        }
+        let next = if karaoke_enabled {
+            compute_next_word_sleep_from_update(&tmp)
+        } else {
+            None
+        };
+        (Some(tmp), next)
+    } else {
+        (None, None)
+    }
+}
 
 /// A collection of styled text lines (Spans) ready for rendering.
 pub struct VisibleLines<'a> {
