@@ -24,6 +24,49 @@ use tui::{
 
 use crate::ui::modern_helpers::gather_visible_lines;
 
+// Helper: compute the next per-word sleep for richsync karaoke.
+// Scans the current line and subsequent lines for the next word start/end > position
+// and returns a pinned Sleep scheduled at that boundary.
+fn compute_next_word_sleep_from_update(
+    upd: &Update,
+) -> Option<Pin<Box<Sleep>>> {
+    if !upd.playing || !matches!(upd.provider, Some(crate::state::Provider::MusixmatchRichsync)) {
+        return None;
+    }
+    let pos = upd.position;
+    let mut next_dur: Option<f64> = None;
+    // scan current and subsequent lines for next word start or end > pos
+    for i in upd.index..upd.lines.len() {
+        if let Some(line) = upd.lines.get(i) {
+            if let Some(words) = &line.words {
+                for w in words.iter() {
+                    if w.start > pos {
+                        let d = w.start - pos;
+                        next_dur = Some(next_dur.map_or(d, |nd| nd.min(d)));
+                    }
+                    if w.end > pos {
+                        let d = w.end - pos;
+                        next_dur = Some(next_dur.map_or(d, |nd| nd.min(d)));
+                    }
+                }
+            }
+        }
+        // If we already found a very near boundary, stop early
+        if let Some(d) = next_dur {
+            if d <= 0.0 {
+                break;
+            }
+        }
+    }
+    if let Some(dur) = next_dur {
+        let dur = dur.max(0.0);
+        let when = tokio::time::Instant::now() + Duration::from_secs_f64(dur);
+        Some(Box::pin(tokio::time::sleep_until(when)))
+    } else {
+        None
+    }
+}
+
 /// UI state for the modern TUI mode
 pub struct ModernUIState {
     pub last_update: Option<Update>,
@@ -113,16 +156,8 @@ pub async fn display_lyrics_modern(
                     }
                     // draw immediately to reflect the update
                     let _ = draw_ui_with_cache(&mut terminal, &Some(tmp.clone()), &state.cached_lines, &styles, state.karaoke_enabled);
-                    if tmp.playing && state.karaoke_enabled && matches!(tmp.provider, Some(crate::state::Provider::MusixmatchRichsync)) {
-                        if let Some(line) = tmp.lines.get(tmp.index) {
-                            if let Some(words) = &line.words {
-                                if let Some(next_end) = words.iter().map(|w| w.end).find(|&e| e > tmp.position) {
-                                    let dur = (next_end - tmp.position).max(0.0);
-                                    let when = tokio::time::Instant::now() + Duration::from_secs_f64(dur);
-                                    next_word_sleep = Some(Box::pin(tokio::time::sleep_until(when)));
-                                }
-                            }
-                        }
+                    if state.karaoke_enabled {
+                        next_word_sleep = compute_next_word_sleep_from_update(&tmp);
                     }
                 }
             }
@@ -142,16 +177,8 @@ pub async fn display_lyrics_modern(
                             }
                         }
                         let _ = draw_ui_with_cache(&mut terminal, &Some(tmp.clone()), &state.cached_lines, &styles, state.karaoke_enabled);
-                        if tmp.playing && state.karaoke_enabled && matches!(tmp.provider, Some(crate::state::Provider::MusixmatchRichsync)) {
-                            if let Some(line) = tmp.lines.get(tmp.index) {
-                                if let Some(words) = &line.words {
-                                    if let Some(next_end) = words.iter().map(|w| w.end).find(|&e| e > tmp.position) {
-                                        let dur = (next_end - tmp.position).max(0.0);
-                                        let when = tokio::time::Instant::now() + Duration::from_secs_f64(dur);
-                                        next_word_sleep = Some(Box::pin(tokio::time::sleep_until(when)));
-                                    }
-                                }
-                            }
+                        if state.karaoke_enabled {
+                            next_word_sleep = compute_next_word_sleep_from_update(&tmp);
                         }
                     }
                 }
@@ -175,18 +202,10 @@ pub async fn display_lyrics_modern(
                     }
                     let _ = draw_ui_with_cache(&mut terminal, &Some(tmp.clone()), &state.cached_lines, &styles, state.karaoke_enabled);
 
-                    // schedule next
+                    // schedule next using improved scanner across subsequent lines
                     next_word_sleep = None;
-                    if tmp.playing && state.karaoke_enabled && matches!(tmp.provider, Some(crate::state::Provider::MusixmatchRichsync)) {
-                        if let Some(line) = tmp.lines.get(tmp.index) {
-                            if let Some(words) = &line.words {
-                                if let Some(next_end) = words.iter().map(|w| w.end).find(|&e| e > tmp.position) {
-                                    let dur = (next_end - tmp.position).max(0.0);
-                                    let when = tokio::time::Instant::now() + Duration::from_secs_f64(dur);
-                                    next_word_sleep = Some(Box::pin(tokio::time::sleep_until(when)));
-                                }
-                            }
-                        }
+                    if state.karaoke_enabled {
+                        next_word_sleep = compute_next_word_sleep_from_update(&tmp);
                     }
                 }
             }

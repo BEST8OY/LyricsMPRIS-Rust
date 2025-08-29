@@ -22,9 +22,14 @@ pub enum Event {
 pub async fn send_update(state: &StateBundle, update_tx: &mpsc::Sender<Update>, force: bool) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_SENT_VERSION: AtomicU64 = AtomicU64::new(0);
+    // Combine the state's version and the playing flag into a single u64 key so
+    // we still send updates when only playback state changes (e.g. play/pause or
+    // playback start on repeat) even if the lyric `version` hasn't changed.
     let version = state.version;
-    let last_version = LAST_SENT_VERSION.load(Ordering::Relaxed);
-    if !force && version == last_version {
+    let playing_bit: u64 = if state.player_state.playing { 1 } else { 0 };
+    let key = (version << 1) | playing_bit;
+    let last_key = LAST_SENT_VERSION.load(Ordering::Relaxed);
+    if !force && key == last_key {
         return;
     }
     let update = Update {
@@ -41,7 +46,7 @@ pub async fn send_update(state: &StateBundle, update_tx: &mpsc::Sender<Update>, 
     };
     if force || !update.lines.is_empty() || update.err.is_some() {
         let _ = update_tx.send(update).await;
-        LAST_SENT_VERSION.store(version, Ordering::Relaxed);
+    LAST_SENT_VERSION.store(key, Ordering::Relaxed);
     }
 }
 
@@ -256,7 +261,7 @@ async fn handle_mpris_event(
 
     // Only send an update when playback starts (avoid transient stopped state on repeat)
     // or when the lyric index changed for the same track while playing.
-    if (prev_playing != playing && playing) || (updated && !is_new_track && playing) {
+    if (prev_playing != playing) || (updated && !is_new_track) {
         send_update(state, update_tx, false).await;
     }
 }
