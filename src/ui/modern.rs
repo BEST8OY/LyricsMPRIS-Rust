@@ -42,12 +42,9 @@ impl ModernUIState {
     }
 }
 
-/// Compute a line index from an Arc<Vec<LyricLine>> for a given position.
-/// Mirrors the binary-search logic used in `LyricState::get_index` but keeps
-/// it local to the UI so the UI can advance lines between backend updates.
-// helper removed: UI is now event-driven and uses backend Updates for index
-
-// VisibleLines and gather_visible_lines live in `modern_helpers` to keep this file small.
+// Compute a line index from an Arc<Vec<LyricLine>> for a given position.
+// Mirrors the binary-search logic used in `LyricState::get_index` but kept
+// small here; VisibleLines and gather_visible_lines live in `modern_helpers`.
 
 /// Display lyrics in modern TUI mode (centered, highlighted, real-time)
 pub async fn display_lyrics_modern(

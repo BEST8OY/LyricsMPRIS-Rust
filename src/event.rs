@@ -84,12 +84,10 @@ async fn fetch_api_lyrics(
         title: &str,
         raw: Option<String>,
     ) {
-        if let Some((db, path)) = db.zip(db_path) {
-            if let Some(raw_lrc) = raw {
-                let mut guard = db.lock().await;
-                guard.insert(artist, title, &raw_lrc);
-                let _ = guard.save(path);
-            }
+        if let Some((db, path)) = db.zip(db_path) && let Some(raw_lrc) = raw {
+            let mut guard = db.lock().await;
+            guard.insert(artist, title, &raw_lrc);
+            let _ = guard.save(path);
         }
     }
 

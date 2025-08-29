@@ -77,25 +77,21 @@ pub fn compute_next_word_sleep_from_update(
     let mut next_dur: Option<f64> = None;
     // scan current and subsequent lines for next word start or end > pos
     for i in upd.index..upd.lines.len() {
-        if let Some(line) = upd.lines.get(i) {
-            if let Some(words) = &line.words {
-                for w in words.iter() {
-                    if w.start > pos {
-                        let d = w.start - pos;
-                        next_dur = Some(next_dur.map_or(d, |nd| nd.min(d)));
-                    }
-                    if w.end > pos {
-                        let d = w.end - pos;
-                        next_dur = Some(next_dur.map_or(d, |nd| nd.min(d)));
-                    }
+        if let Some(line) = upd.lines.get(i) && let Some(words) = &line.words {
+            for w in words.iter() {
+                if w.start > pos {
+                    let d = w.start - pos;
+                    next_dur = Some(next_dur.map_or(d, |nd| nd.min(d)));
+                }
+                if w.end > pos {
+                    let d = w.end - pos;
+                    next_dur = Some(next_dur.map_or(d, |nd| nd.min(d)));
                 }
             }
         }
         // If we already found a very near boundary, stop early
-        if let Some(d) = next_dur {
-            if d <= 0.0 {
-                break;
-            }
+        if let Some(d) = next_dur && d <= 0.0 {
+            break;
         }
     }
     if let Some(dur) = next_dur {
@@ -116,17 +112,14 @@ pub fn estimate_update_and_next_sleep(
 ) -> (Option<Update>, Option<Pin<Box<Sleep>>>) {
     if let Some(upd) = last_update {
         let mut tmp = upd.clone();
-        if tmp.playing {
-            if let Some(since) = last_update_instant {
+        if tmp.playing
+            && let Some(since) = last_update_instant {
                 tmp.position += since.elapsed().as_secs_f64();
             }
-        }
         // Estimate the current line index locally from the estimated position so the UI
         // can advance lines (and not wait for backend updates) when richsync moves fast.
         // Mirrors the binary-search behavior in `state::LyricState::get_index`.
-        if tmp.lines.len() <= 1 {
-            tmp.index = 0;
-        } else if tmp.position.is_nan() || tmp.lines.iter().any(|line| line.time.is_nan()) {
+        if tmp.lines.len() <= 1 || tmp.position.is_nan() || tmp.lines.iter().any(|line| line.time.is_nan()) {
             tmp.index = 0;
         } else {
             tmp.index = match tmp
@@ -266,9 +259,9 @@ pub fn gather_visible_lines<'a>(
 
     let mut current = Vec::new();
 
-    if let Some(ly) = update.lines.get(update.index) {
-        if karaoke_enabled && matches!(update.provider, Some(crate::state::Provider::MusixmatchRichsync)) {
-            if let Some(words) = &ly.words {
+    if let Some(ly) = update.lines.get(update.index)
+        && karaoke_enabled && matches!(update.provider, Some(crate::state::Provider::MusixmatchRichsync))
+            && let Some(words) = &ly.words {
                 let word_lines = split_words_into_lines(words, w);
                 for wl in word_lines.iter() {
                     let mut spans = Vec::new();
@@ -290,7 +283,7 @@ pub fn gather_visible_lines<'a>(
                             continue;
                         }
 
-                        let dur = (wt.end - wt.start).max(std::f64::EPSILON);
+                        let dur = (wt.end - wt.start).max(f64::EPSILON);
                         let frac = ((position - wt.start) / dur).clamp(0.0, 1.0);
                         let total = wt.graphemes.len();
                         let highlight_graphemes = ((frac * total as f64).floor() as usize).min(total);
@@ -324,8 +317,6 @@ pub fn gather_visible_lines<'a>(
                     current.push(Spans::from(spans));
                 }
             }
-        }
-    }
 
     if current.is_empty() {
         for line in current_block.iter() {

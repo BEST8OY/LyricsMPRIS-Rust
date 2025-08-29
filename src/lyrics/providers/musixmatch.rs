@@ -90,20 +90,18 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(artist: &str, title: &str) -
             .pointer("/message/header/status_code")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        if status == 200 {
-            if let Some(body) = rich.pointer("/message/body") {
+        if status == 200
+            && let Some(body) = rich.pointer("/message/body") {
                 // Try to access richsync_body
                 let richsync_body_opt = body
                     .get("richsync")
                     .and_then(|r| r.get("richsync_body"))
                     .and_then(|v| v.as_str());
-                if let Some(richsync_body) = richsync_body_opt {
-                    if let Some((parsed, raw)) = crate::lyrics::parse::parse_richsync_body(richsync_body) {
+                if let Some(richsync_body) = richsync_body_opt
+                    && let Some((parsed, raw)) = crate::lyrics::parse::parse_richsync_body(richsync_body) {
                         return Ok((parsed, Some(raw)));
                     }
-                }
             }
-        }
     }
 
     if let Some(subs) = macro_calls.get("track.subtitles.get") {

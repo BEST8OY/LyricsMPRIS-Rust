@@ -47,8 +47,8 @@ pub fn parse_synced_lyrics(synced: &str) -> Vec<LyricLine> {
 /// Try to parse a musixmatch "richsync_body" JSON string into lyric lines with optional per-word timings.
 /// Returns Some((lines, raw_lrc_with_marker)) on success, or None if parsing/shape doesn't match.
 pub fn parse_richsync_body(richsync_body: &str) -> Option<(Vec<LyricLine>, String)> {
-    if let Ok(lines_val) = serde_json::from_str::<Value>(richsync_body) {
-        if let Some(arr) = lines_val.as_array() {
+    if let Ok(lines_val) = serde_json::from_str::<Value>(richsync_body)
+        && let Some(arr) = lines_val.as_array() {
             let mut parsed = Vec::new();
             let mut out = String::new();
             for line in arr.iter() {
@@ -146,6 +146,5 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<(Vec<LyricLine>, Strin
             let out_with_marker = format!(";;richsync=1\n{}", out);
             return Some((parsed, out_with_marker));
         }
-    }
     None
 }
