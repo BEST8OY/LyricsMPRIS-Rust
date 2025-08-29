@@ -11,6 +11,8 @@ use crossterm::{
 use std::io::{self};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::pin::Pin;
+use tokio::time::Sleep;
 use tokio::sync::{Mutex, mpsc};
 use tui::{
     Terminal,
@@ -47,6 +49,11 @@ impl ModernUIState {
     }
 }
 
+/// Compute a line index from an Arc<Vec<LyricLine>> for a given position.
+/// Mirrors the binary-search logic used in `LyricState::get_index` but keeps
+/// it local to the UI so the UI can advance lines between backend updates.
+// helper removed: UI is now event-driven and uses backend Updates for index
+
 // VisibleLines and gather_visible_lines live in `modern_helpers` to keep this file small.
 
 /// Display lyrics in modern TUI mode (centered, highlighted, real-time)
@@ -77,42 +84,110 @@ pub async fn display_lyrics_modern(
     let styles = LyricStyles::default();
     let mut state = ModernUIState::new();
     state.karaoke_enabled = karaoke_enabled;
+    // per-word sleep used to schedule redraws only at interesting times (word boundaries)
+    let mut next_word_sleep: Option<Pin<Box<Sleep>>> = None;
     // use state.last_track_id for track-change detection; avoid redundant local copy
-    // UI tick for smooth in-line progress updates (e.g. karaoke highlighting)
-    let mut ui_tick = tokio::time::interval(Duration::from_millis(100));
     while !state.should_exit {
         tokio::select! {
+            biased;
+
             update = rx.recv() => {
                 // Robust track change detection for TUI mode
                 if let Some(ref upd) = update {
                     let track_id = crate::ui::track_id(upd);
                     if state.last_track_id.as_ref() != Some(&track_id) {
-                        // Optionally, reset scroll or state here if needed
                         state.last_track_id = None;
-                        // set new track id so update_state/draw see it immediately
                         state.last_track_id = Some(track_id);
                     }
                 }
                 process_update(update, &mut state, &mut terminal, &styles)?;
-            }
-        // Periodic UI tick: update the displayed position based on elapsed time
-            _ = ui_tick.tick() => {
-                // If we have a last update, use its position + elapsed (when playing)
+
+                // After processing a new update, (re)compute next per-word wakeup
+                next_word_sleep = None;
                 if let Some(ref last_upd) = state.last_update {
-                    let mut displayed = last_upd.clone();
-                    if displayed.playing {
+                    let mut tmp = last_upd.clone();
+                    if tmp.playing {
                         if let Some(since) = state.last_update_instant {
-                            displayed.position = displayed.position + since.elapsed().as_secs_f64();
+                            tmp.position += since.elapsed().as_secs_f64();
                         }
                     }
-            // Redraw using the estimated position
-            draw_ui_with_cache(&mut terminal, &Some(displayed), &state.cached_lines, &styles, state.karaoke_enabled)?;
+                    // draw immediately to reflect the update
+                    let _ = draw_ui_with_cache(&mut terminal, &Some(tmp.clone()), &state.cached_lines, &styles, state.karaoke_enabled);
+                    if tmp.playing && state.karaoke_enabled && matches!(tmp.provider, Some(crate::state::Provider::MusixmatchRichsync)) {
+                        if let Some(line) = tmp.lines.get(tmp.index) {
+                            if let Some(words) = &line.words {
+                                if let Some(next_end) = words.iter().map(|w| w.end).find(|&e| e > tmp.position) {
+                                    let dur = (next_end - tmp.position).max(0.0);
+                                    let when = tokio::time::Instant::now() + Duration::from_secs_f64(dur);
+                                    next_word_sleep = Some(Box::pin(tokio::time::sleep_until(when)));
+                                }
+                            }
+                        }
+                    }
                 }
             }
+
             maybe_event = tokio::task::spawn_blocking(|| crossterm::event::poll(std::time::Duration::from_millis(100))) => {
                 if let Ok(Ok(true)) = maybe_event {
                     let event = crossterm::event::read().map_err(to_boxed_err)?;
                     process_event(event, &mut state, &mut terminal, &styles)?;
+
+                    // user-driven state changes (toggle karaoke, etc) may change scheduling
+                    next_word_sleep = None;
+                    if let Some(ref last_upd) = state.last_update {
+                        let mut tmp = last_upd.clone();
+                        if tmp.playing {
+                            if let Some(since) = state.last_update_instant {
+                                tmp.position += since.elapsed().as_secs_f64();
+                            }
+                        }
+                        let _ = draw_ui_with_cache(&mut terminal, &Some(tmp.clone()), &state.cached_lines, &styles, state.karaoke_enabled);
+                        if tmp.playing && state.karaoke_enabled && matches!(tmp.provider, Some(crate::state::Provider::MusixmatchRichsync)) {
+                            if let Some(line) = tmp.lines.get(tmp.index) {
+                                if let Some(words) = &line.words {
+                                    if let Some(next_end) = words.iter().map(|w| w.end).find(|&e| e > tmp.position) {
+                                        let dur = (next_end - tmp.position).max(0.0);
+                                        let when = tokio::time::Instant::now() + Duration::from_secs_f64(dur);
+                                        next_word_sleep = Some(Box::pin(tokio::time::sleep_until(when)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // per-word timer branch: only present when scheduled for richsync karaoke
+            _ = async {
+                if let Some(s) = &mut next_word_sleep {
+                    s.as_mut().await;
+                } else {
+                    futures_util::future::pending::<()>().await;
+                }
+            } => {
+                // timer fired: redraw using estimated position and reschedule next boundary
+                if let Some(ref last_upd) = state.last_update {
+                    let mut tmp = last_upd.clone();
+                    if tmp.playing {
+                        if let Some(since) = state.last_update_instant {
+                            tmp.position += since.elapsed().as_secs_f64();
+                        }
+                    }
+                    let _ = draw_ui_with_cache(&mut terminal, &Some(tmp.clone()), &state.cached_lines, &styles, state.karaoke_enabled);
+
+                    // schedule next
+                    next_word_sleep = None;
+                    if tmp.playing && state.karaoke_enabled && matches!(tmp.provider, Some(crate::state::Provider::MusixmatchRichsync)) {
+                        if let Some(line) = tmp.lines.get(tmp.index) {
+                            if let Some(words) = &line.words {
+                                if let Some(next_end) = words.iter().map(|w| w.end).find(|&e| e > tmp.position) {
+                                    let dur = (next_end - tmp.position).max(0.0);
+                                    let when = tokio::time::Instant::now() + Duration::from_secs_f64(dur);
+                                    next_word_sleep = Some(Box::pin(tokio::time::sleep_until(when)));
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

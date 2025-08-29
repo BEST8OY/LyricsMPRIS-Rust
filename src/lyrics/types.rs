@@ -27,6 +27,10 @@ pub struct WordTiming {
     pub start: f64,
     pub end: f64,
     pub text: String,
+    /// Grapheme cluster slices of `text` (precomputed to avoid per-tick allocations).
+    pub graphemes: Vec<String>,
+    /// Byte offsets corresponding to the start of each grapheme in `text`.
+    pub grapheme_byte_offsets: Vec<usize>,
 }
 
 #[derive(Error, Debug)]

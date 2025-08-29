@@ -144,25 +144,27 @@ pub fn gather_visible_lines<'a>(
 
                         let dur = (wt.end - wt.start).max(std::f64::EPSILON);
                         let frac = ((position - wt.start) / dur).clamp(0.0, 1.0);
-                        let chars: Vec<char> = wt.text.chars().collect();
-                        let total = chars.len();
-                        let highlight_chars = ((frac * total as f64).floor() as usize).min(total);
+                        let total = wt.graphemes.len();
+                        let highlight_graphemes = ((frac * total as f64).floor() as usize).min(total);
 
-                        if highlight_chars == 0 {
+                        if highlight_graphemes == 0 {
                             if i + 1 < wl.len() {
                                 spans.push(tui::text::Span::styled(format!("{} ", wt.text), styles.after));
                             } else {
                                 spans.push(tui::text::Span::styled(wt.text.clone(), styles.after));
                             }
-                        } else if highlight_chars >= total {
+                        } else if highlight_graphemes >= total {
                             if i + 1 < wl.len() {
                                 spans.push(tui::text::Span::styled(format!("{} ", wt.text), styles.current));
                             } else {
                                 spans.push(tui::text::Span::styled(wt.text.clone(), styles.current));
                             }
                         } else {
-                            let highlighted: String = chars[..highlight_chars].iter().collect();
-                            let remaining: String = chars[highlight_chars..].iter().collect();
+                            // Build highlighted and remaining substrings using byte offsets into wt.text
+                            let start_byte = wt.grapheme_byte_offsets[0];
+                            let split_byte = wt.grapheme_byte_offsets[highlight_graphemes];
+                            let highlighted = wt.text[start_byte..split_byte].to_string();
+                            let remaining = wt.text[split_byte..].to_string();
                             spans.push(tui::text::Span::styled(highlighted, styles.current));
                             if i + 1 < wl.len() {
                                 spans.push(tui::text::Span::styled(format!("{} ", remaining), styles.after));

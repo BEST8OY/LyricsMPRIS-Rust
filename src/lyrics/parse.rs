@@ -1,4 +1,5 @@
 use crate::lyrics::types::LyricLine;
+use unicode_segmentation::UnicodeSegmentation;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
@@ -73,7 +74,17 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<(Vec<LyricLine>, Strin
                         let start = w.get("start").and_then(|v| v.as_f64()).unwrap_or(t);
                         let end = w.get("end").and_then(|v| v.as_f64()).unwrap_or(start);
                         let wtext = w.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        wts.push(crate::lyrics::types::WordTiming { start, end, text: wtext });
+                        // Precompute grapheme clusters and byte offsets for efficient slicing
+                        let graphemes: Vec<String> = UnicodeSegmentation::graphemes(wtext.as_str(), true)
+                            .map(|g| g.to_string())
+                            .collect();
+                        let mut offsets = Vec::with_capacity(graphemes.len());
+                        let mut acc = 0usize;
+                        for g in &graphemes {
+                            offsets.push(acc);
+                            acc += g.len();
+                        }
+                        wts.push(crate::lyrics::types::WordTiming { start, end, text: wtext, graphemes, grapheme_byte_offsets: offsets });
                     }
                     if wts.is_empty() { None } else { Some(wts) }
                 } else if let Some(l_arr) = line.get("l").and_then(|v| v.as_array()) {
@@ -88,7 +99,17 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<(Vec<LyricLine>, Strin
                             if !cur.is_empty() {
                                 let start = t + cur_start.unwrap_or(0.0);
                                 let end = t + o;
-                                wts.push(crate::lyrics::types::WordTiming { start, end, text: cur.clone() });
+                                // Precompute graphemes and offsets for this assembled word
+                                let graphemes: Vec<String> = UnicodeSegmentation::graphemes(cur.as_str(), true)
+                                    .map(|g| g.to_string())
+                                    .collect();
+                                let mut offsets = Vec::with_capacity(graphemes.len());
+                                let mut acc = 0usize;
+                                for g in &graphemes {
+                                    offsets.push(acc);
+                                    acc += g.len();
+                                }
+                                wts.push(crate::lyrics::types::WordTiming { start, end, text: cur.clone(), graphemes, grapheme_byte_offsets: offsets });
                                 cur.clear();
                                 cur_start = None;
                                 last_offset = None;
@@ -104,7 +125,16 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<(Vec<LyricLine>, Strin
                     if !cur.is_empty() {
                         let start = t + cur_start.unwrap_or(0.0);
                         let end = t + last_offset.unwrap_or(te - t);
-                        wts.push(crate::lyrics::types::WordTiming { start, end, text: cur.clone() });
+                        let graphemes: Vec<String> = UnicodeSegmentation::graphemes(cur.as_str(), true)
+                            .map(|g| g.to_string())
+                            .collect();
+                        let mut offsets = Vec::with_capacity(graphemes.len());
+                        let mut acc = 0usize;
+                        for g in &graphemes {
+                            offsets.push(acc);
+                            acc += g.len();
+                        }
+                        wts.push(crate::lyrics::types::WordTiming { start, end, text: cur.clone(), graphemes, grapheme_byte_offsets: offsets });
                     }
                     if wts.is_empty() { None } else { Some(wts) }
                 } else {

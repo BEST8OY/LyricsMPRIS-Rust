@@ -254,7 +254,9 @@ async fn handle_mpris_event(
     state.player_state.update_playback_dbus(playing, position);
     let updated = state.update_index(state.player_state.estimate_position());
 
-    if prev_playing != playing || (updated && !is_new_track) {
+    // Only send an update when playback starts (avoid transient stopped state on repeat)
+    // or when the lyric index changed for the same track while playing.
+    if (prev_playing != playing && playing) || (updated && !is_new_track && playing) {
         send_update(state, update_tx, false).await;
     }
 }

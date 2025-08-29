@@ -846,6 +846,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tui",
+ "unicode-segmentation",
  "urlencoding",
 ]
 
