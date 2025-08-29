@@ -93,7 +93,7 @@ pub async fn display_lyrics_modern(
                         state.last_track_id = Some(track_id);
                     }
                 }
-                process_update(update, &mut state, &mut terminal, &styles)?;
+                process_update(update, &mut state)?;
 
                 // After processing a new update, draw and (re)compute next per-word wakeup
                 let (maybe_tmp, next) = estimate_update_and_next_sleep(&state.last_update, state.last_update_instant, state.karaoke_enabled);
@@ -106,7 +106,7 @@ pub async fn display_lyrics_modern(
             maybe_event = tokio::task::spawn_blocking(|| crossterm::event::poll(std::time::Duration::from_millis(100))) => {
                 if let Ok(Ok(true)) = maybe_event {
                     let event = crossterm::event::read().map_err(to_boxed_err)?;
-                    process_event(event, &mut state, &mut terminal, &styles)?;
+                    process_event(event, &mut state)?;
 
                     // user-driven state changes (toggle karaoke, etc) may change scheduling
                     let (maybe_tmp, next) = estimate_update_and_next_sleep(&state.last_update, state.last_update_instant, state.karaoke_enabled);
@@ -181,23 +181,18 @@ fn update_state(state: &mut ModernUIState, update: Option<Update>) {
 // prepare_visible_spans moved to `ui_helpers::draw_ui_with_cache`.
 
 /// Handle incoming update from the lyrics source (now simplified)
-fn process_update<B: tui::backend::Backend>(
+fn process_update(
     update: Option<Update>,
     state: &mut ModernUIState,
-    terminal: &mut Terminal<B>,
-    styles: &LyricStyles,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     update_state(state, update);
-    draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles, state.karaoke_enabled)?;
     Ok(())
 }
 
 /// Handle user input events (keyboard)
-fn process_event<B: tui::backend::Backend>(
+fn process_event(
     event: Event,
     state: &mut ModernUIState,
-    terminal: &mut Terminal<B>,
-    styles: &LyricStyles,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Event::Key(key) = event {
         match key.code {
@@ -217,10 +212,6 @@ fn process_event<B: tui::backend::Backend>(
             }
             _ => {}
         }
-    }
-    // Only redraw if state changed (scroll or exit)
-    if !state.should_exit {
-    draw_ui_with_cache(terminal, &state.last_update, &state.cached_lines, styles, state.karaoke_enabled)?;
     }
     Ok(())
 }

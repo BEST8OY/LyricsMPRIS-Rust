@@ -121,6 +121,25 @@ pub fn estimate_update_and_next_sleep(
                 tmp.position += since.elapsed().as_secs_f64();
             }
         }
+        // Estimate the current line index locally from the estimated position so the UI
+        // can advance lines (and not wait for backend updates) when richsync moves fast.
+        // Mirrors the binary-search behavior in `state::LyricState::get_index`.
+        if tmp.lines.len() <= 1 {
+            tmp.index = 0;
+        } else if tmp.position.is_nan() || tmp.lines.iter().any(|line| line.time.is_nan()) {
+            tmp.index = 0;
+        } else {
+            tmp.index = match tmp
+                .lines
+                .binary_search_by(|line| match line.time.partial_cmp(&tmp.position) {
+                    Some(ord) => ord,
+                    _ => std::cmp::Ordering::Less,
+                }) {
+                Ok(idx) => idx,
+                Err(0) => 0,
+                Err(idx) => idx - 1,
+            };
+        }
         let next = if karaoke_enabled {
             compute_next_word_sleep_from_update(&tmp)
         } else {
