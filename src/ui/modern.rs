@@ -94,9 +94,11 @@ pub async fn display_lyrics_modern(
 
                 // After processing a new update, draw and (re)compute next per-word wakeup
                 let (maybe_tmp, next) = estimate_update_and_next_sleep(&state.last_update, state.last_update_instant, state.karaoke_enabled);
-                if let Some(tmp) = maybe_tmp {
-                    let _ = draw_ui_with_cache(&mut terminal, &Some(tmp), &state.cached_lines, &styles, state.karaoke_enabled);
-                }
+                // Draw using the estimated update when available, otherwise fall back to the
+                // stored `state.last_update`. This ensures UI is redrawn to clear content
+                // (e.g. when cached_lines were cleared) even if no estimate exists.
+                let draw_arg = if let Some(tmp) = maybe_tmp.clone() { Some(tmp) } else { state.last_update.clone() };
+                let _ = draw_ui_with_cache(&mut terminal, &draw_arg, &state.cached_lines, &styles, state.karaoke_enabled);
                 next_word_sleep = next;
             }
 
@@ -107,9 +109,8 @@ pub async fn display_lyrics_modern(
 
                     // user-driven state changes (toggle karaoke, etc) may change scheduling
                     let (maybe_tmp, next) = estimate_update_and_next_sleep(&state.last_update, state.last_update_instant, state.karaoke_enabled);
-                    if let Some(tmp) = maybe_tmp {
-                        let _ = draw_ui_with_cache(&mut terminal, &Some(tmp), &state.cached_lines, &styles, state.karaoke_enabled);
-                    }
+                    let draw_arg = if let Some(tmp) = maybe_tmp.clone() { Some(tmp) } else { state.last_update.clone() };
+                    let _ = draw_ui_with_cache(&mut terminal, &draw_arg, &state.cached_lines, &styles, state.karaoke_enabled);
                     next_word_sleep = next;
                 }
             }
@@ -124,9 +125,8 @@ pub async fn display_lyrics_modern(
             } => {
                 // timer fired: redraw using estimated position and reschedule next boundary
                 let (maybe_tmp, next) = estimate_update_and_next_sleep(&state.last_update, state.last_update_instant, state.karaoke_enabled);
-                if let Some(tmp) = maybe_tmp {
-                    let _ = draw_ui_with_cache(&mut terminal, &Some(tmp), &state.cached_lines, &styles, state.karaoke_enabled);
-                }
+                let draw_arg = if let Some(tmp) = maybe_tmp.clone() { Some(tmp) } else { state.last_update.clone() };
+                let _ = draw_ui_with_cache(&mut terminal, &draw_arg, &state.cached_lines, &styles, state.karaoke_enabled);
                 next_word_sleep = next;
             }
         }
