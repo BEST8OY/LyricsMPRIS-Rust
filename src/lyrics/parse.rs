@@ -72,7 +72,11 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<(Vec<LyricLine>, Strin
                     let mut wts = Vec::new();
                     for w in words_arr {
                         let start = w.get("start").and_then(|v| v.as_f64()).unwrap_or(t);
-                        let end = w.get("end").and_then(|v| v.as_f64()).unwrap_or(start);
+                        let mut end = w.get("end").and_then(|v| v.as_f64()).unwrap_or(start);
+                        // Ensure end is after start; if not, fall back to the line end `te`.
+                        if end <= start {
+                            end = te;
+                        }
                         let wtext = w.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
                         // Precompute grapheme clusters and byte offsets for efficient slicing
                         let graphemes: Vec<String> = UnicodeSegmentation::graphemes(wtext.as_str(), true)
@@ -98,7 +102,11 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<(Vec<LyricLine>, Strin
                         if ch.trim().is_empty() {
                             if !cur.is_empty() {
                                 let start = t + cur_start.unwrap_or(0.0);
-                                let end = t + o;
+                                let mut end = t + o;
+                                // Guard: if end is not after start, fall back to the line end `te`.
+                                if end <= start {
+                                    end = te;
+                                }
                                 // Precompute graphemes and offsets for this assembled word
                                 let graphemes: Vec<String> = UnicodeSegmentation::graphemes(cur.as_str(), true)
                                     .map(|g| g.to_string())
@@ -124,7 +132,10 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<(Vec<LyricLine>, Strin
                     }
                     if !cur.is_empty() {
                         let start = t + cur_start.unwrap_or(0.0);
-                        let end = t + last_offset.unwrap_or(te - t);
+                        let mut end = t + last_offset.unwrap_or(te - t);
+                        if end <= start {
+                            end = te;
+                        }
                         let graphemes: Vec<String> = UnicodeSegmentation::graphemes(cur.as_str(), true)
                             .map(|g| g.to_string())
                             .collect();
