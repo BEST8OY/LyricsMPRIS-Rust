@@ -9,14 +9,24 @@ struct LrcLibResp {
     syncedLyrics: Option<String>,
 }
 
-/// Fetch lyrics from lrclib for a given artist and title.
-pub async fn fetch_lyrics_from_lrclib(artist: &str, title: &str) -> ProviderResult {
+/// Fetch lyrics from lrclib for a given artist and title. Optionally include track duration
+/// (seconds) to improve matching accuracy.
+pub async fn fetch_lyrics_from_lrclib(
+    artist: &str,
+    title: &str,
+    duration: Option<f64>,
+) -> ProviderResult {
     let client = http_client();
-    let url = format!(
-        "https://lrclib.net/api/get?artist_name={}&track_name={}",
-        urlencoding::encode(artist),
-        urlencoding::encode(title)
-    );
+    // Build query parameters and URL; encode values to be safe.
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!("artist_name={}", urlencoding::encode(artist)));
+    parts.push(format!("track_name={}", urlencoding::encode(title)));
+    if let Some(d) = duration {
+        // lrclib expects duration in seconds (integer). Round to nearest second.
+        let secs = d.round() as i64;
+        parts.push(format!("duration={}", secs));
+    }
+    let url = format!("https://lrclib.net/api/get?{}", parts.join("&"));
     let resp = client
         .get(&url)
         .header("User-Agent", "LyricsMPRIS/1.0")

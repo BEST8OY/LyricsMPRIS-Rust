@@ -5,7 +5,11 @@ use crate::lyrics::types::{LyricLine, LyricsError, ProviderResult, http_client};
 
 /// Fetch lyrics using Musixmatch desktop "usertoken" (apic-desktop.musixmatch.com).
 #[allow(dead_code)]
-pub async fn fetch_lyrics_from_musixmatch_usertoken(artist: &str, title: &str) -> ProviderResult {
+pub async fn fetch_lyrics_from_musixmatch_usertoken(
+    artist: &str,
+    title: &str,
+    duration: Option<f64>,
+) -> ProviderResult {
     let token = match env::var("MUSIXMATCH_USERTOKEN").ok() {
         Some(t) if !t.is_empty() => t,
         _ => return Ok((Vec::new(), None)),
@@ -15,20 +19,20 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(artist: &str, title: &str) -
 
     let base_url = "https://apic-desktop.musixmatch.com/ws/1.1/macro.subtitles.get?format=json&namespace=lyrics_richsynched&subtitle_format=mxm&app_id=web-desktop-app-v1.0&";
 
-    let params = [
-        ("q_artist", artist),
-        ("q_track", title),
-        ("usertoken", &token),
-        // Request richsync optional call so `track.richsync.get` (and `richsync_body`) may be included
-        ("optional_calls", "track.richsync"),
-    ];
+    // Build query params and include q_duration when available to improve matching accuracy.
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!("q_artist={}", urlencoding::encode(artist)));
+    parts.push(format!("q_track={}", urlencoding::encode(title)));
+    parts.push(format!("usertoken={}", urlencoding::encode(&token)));
+    // Request richsync optional call so `track.richsync.get` (and `richsync_body`) may be included
+    parts.push(format!("optional_calls={}", urlencoding::encode("track.richsync")));
+    if let Some(d) = duration {
+        // Musixmatch expects duration as an integer number of seconds (q_duration).
+        let secs = d.round() as i64;
+        parts.push(format!("q_duration={}", secs));
+    }
 
-    let final_url = base_url.to_string()
-        + &params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
-            .collect::<Vec<_>>()
-            .join("&");
+    let final_url = base_url.to_string() + &parts.join("&");
 
     let resp = client
         .get(&final_url)
