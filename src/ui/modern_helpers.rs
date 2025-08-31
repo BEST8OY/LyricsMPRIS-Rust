@@ -79,13 +79,30 @@ pub fn compute_next_word_sleep_from_update(
     for i in upd.index..upd.lines.len() {
         if let Some(line) = upd.lines.get(i) && let Some(words) = &line.words {
             for w in words.iter() {
+                // Word start
                 if w.start > pos {
                     let d = w.start - pos;
                     next_dur = Some(next_dur.map_or(d, |nd| nd.min(d)));
                 }
+                // Word end
                 if w.end > pos {
                     let d = w.end - pos;
                     next_dur = Some(next_dur.map_or(d, |nd| nd.min(d)));
+                }
+                // Also schedule intermediate grapheme boundaries so we can progressively
+                // highlight parts of the word instead of jumping only at word end.
+                // Approximate grapheme timings by evenly dividing the word duration
+                // across graphemes (parse may not provide per-grapheme times).
+                let total = w.graphemes.len();
+                if total > 1 {
+                    let dur = (w.end - w.start).max(f64::EPSILON);
+                    for k in 1..total { // boundary after k graphemes
+                        let boundary = w.start + (k as f64 / total as f64) * dur;
+                        if boundary > pos {
+                            let d = boundary - pos;
+                            next_dur = Some(next_dur.map_or(d, |nd| nd.min(d)));
+                        }
+                    }
                 }
             }
         }

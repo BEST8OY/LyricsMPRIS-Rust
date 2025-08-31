@@ -255,6 +255,9 @@ async fn handle_mpris_event(
         state.clear_lyrics();
         *latest_meta = Some((meta.clone(), position, service.clone()));
         state.player_state.reset_position_cache(position);
+    // Notify UI immediately that the track changed and lyrics were cleared so the
+    // previous song's lyrics aren't shown while we fetch new ones.
+    send_update(state, update_tx, true).await;
     }
 
     let prev_playing = state.player_state.playing;
