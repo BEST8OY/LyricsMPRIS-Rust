@@ -6,12 +6,12 @@ use crate::mpris::TrackMetadata;
 use crate::mpris::events::MprisEventHandler;
 use crate::state::{StateBundle, Update};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch, oneshot};
 
 pub async fn listen(
-    update_tx: mpsc::Sender<Update>,
+    update_tx: watch::Sender<Option<Update>>,
     poll_interval: Duration,
-    mut shutdown_rx: mpsc::Receiver<()>,
+    mut shutdown_rx: oneshot::Receiver<()>,
     mpris_config: crate::Config,
 ) {
     // Determine provider order from config (default is lrclib then musixmatch)
@@ -93,7 +93,7 @@ pub async fn listen(
 
     loop {
         tokio::select! {
-            _ = shutdown_rx.recv() => {
+            _ = &mut shutdown_rx => {
                 process_event(Event::Shutdown, &mut state, &update_tx, &mut latest_meta).await;
                 break;
             },

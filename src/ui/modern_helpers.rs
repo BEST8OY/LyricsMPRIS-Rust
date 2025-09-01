@@ -2,8 +2,6 @@ use crate::text_utils::wrap_text;
 use crate::state::Update;
 use crate::ui::styles::LyricStyles;
 use tui::text::Spans;
-use std::pin::Pin;
-use tokio::time::Sleep;
 use std::time::Duration;
 use std::time::Instant;
 use tui::Terminal;
@@ -15,8 +13,9 @@ use std::error::Error;
 /// Draw the UI using cached lines and the modern helpers.
 pub fn draw_ui_with_cache<B: Backend>(
     terminal: &mut Terminal<B>,
-    last_update: &Option<Update>,
-    cached_lines: &Option<Vec<String>>,
+    last_update: Option<&Update>,
+    cached_lines: Option<&[String]>,
+    cached_wrapped: &mut Option<(usize, Vec<Vec<String>>)>,
     styles: &LyricStyles,
     karaoke_enabled: bool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -25,6 +24,27 @@ pub fn draw_ui_with_cache<B: Backend>(
             let size = f.size();
             let w = size.width as usize;
             let h = size.height as usize;
+            // Prepare wrapped blocks, using cache when possible and matching width
+            let wrapped_blocks: Vec<Vec<String>> = match cached_wrapped.as_ref() {
+                Some((cached_w, blocks)) if *cached_w == w => blocks.clone(),
+                _ => {
+                    if let Some(cached) = cached_lines {
+                        cached.iter().map(|l| wrap_text(l, w)).collect()
+                    } else {
+                        Vec::new()
+                    }
+                }
+            };
+
+            // Update cached_wrapped if we recomputed
+            if cached_wrapped.as_ref().map(|(cw, _)| *cw != w).unwrap_or(true) {
+                if !wrapped_blocks.is_empty() {
+                    *cached_wrapped = Some((w, wrapped_blocks.clone()));
+                } else {
+                    *cached_wrapped = None;
+                }
+            }
+
             let visible_spans = {
                 if let Some(update) = last_update {
                     if let Some(ref err) = update.err {
@@ -32,11 +52,8 @@ pub fn draw_ui_with_cache<B: Backend>(
                             .into_iter()
                             .map(|line| Spans::from(tui::text::Span::styled(line, styles.current)))
                             .collect()
-                    } else if let Some(cached) = cached_lines
-                        && !cached.is_empty()
-                        && update.index < cached.len()
-                    {
-                        gather_visible_lines(update, cached, w, h, styles, update.position, karaoke_enabled).into_vec()
+                    } else if !wrapped_blocks.is_empty() && update.index < wrapped_blocks.len() {
+                        gather_visible_lines(update, &wrapped_blocks, w, h, styles, update.position, karaoke_enabled).into_vec()
                     } else {
                         Vec::new()
                     }
@@ -64,12 +81,12 @@ pub fn draw_ui_with_cache<B: Backend>(
     Ok(())
 }
 
-/// Compute the next per-word sleep for richsync karaoke from an Update.
-/// Scans the current line and subsequent lines for the next word start/end > position
-/// and returns a pinned Sleep scheduled at that boundary.
+/// Compute the duration until the next interesting karaoke boundary (word start/end or
+/// intermediate grapheme boundary) for a richsync Update. Returns None when not
+/// applicable (not playing or not richsync provider).
 pub fn compute_next_word_sleep_from_update(
     upd: &Update,
-) -> Option<Pin<Box<Sleep>>> {
+) -> Option<Duration> {
     if !upd.playing || !matches!(upd.provider, Some(crate::state::Provider::MusixmatchRichsync)) {
         return None;
     }
@@ -113,20 +130,19 @@ pub fn compute_next_word_sleep_from_update(
     }
     if let Some(dur) = next_dur {
         let dur = dur.max(0.0);
-        let when = tokio::time::Instant::now() + Duration::from_secs_f64(dur);
-        Some(Box::pin(tokio::time::sleep_until(when)))
+        Some(Duration::from_secs_f64(dur))
     } else {
         None
     }
 }
 
-/// Estimate the current Update position from `last_update` and `last_update_instant`,
-/// and return a tuple of (estimated_update_option, next_word_sleep_option).
+/// Estimate the current Update from the last known Update and the instant it was
+/// received. Returns (estimated_update, optional_duration_to_next_boundary).
 pub fn estimate_update_and_next_sleep(
     last_update: &Option<Update>,
     last_update_instant: Option<Instant>,
     karaoke_enabled: bool,
-) -> (Option<Update>, Option<Pin<Box<Sleep>>>) {
+) -> (Option<Update>, Option<Duration>) {
     if let Some(upd) = last_update {
         let mut tmp = upd.clone();
         if tmp.playing
@@ -263,14 +279,13 @@ pub fn split_words_into_lines<'b>(
 /// Build VisibleLines from update/cached lines. Keeps logic minimal and focused for tests.
 pub fn gather_visible_lines<'a>(
     update: &Update,
-    cached: &[String],
+    wrapped_blocks: &[Vec<String>],
     w: usize,
     h: usize,
     styles: &'a LyricStyles,
     position: f64,
     karaoke_enabled: bool,
 ) -> VisibleLines<'a> {
-    let wrapped_blocks: Vec<Vec<String>> = cached.iter().map(|l| wrap_text(l, w)).collect();
     let current_block = &wrapped_blocks[update.index];
     let current_height = current_block.len();
 

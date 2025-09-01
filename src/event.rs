@@ -2,7 +2,7 @@
 
 use crate::mpris::TrackMetadata;
 use crate::state::{StateBundle, Update, Provider};
-use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 #[derive(Debug)]
 pub enum MprisEvent {
@@ -16,8 +16,10 @@ pub enum Event {
     Shutdown,
 }
 
-/// Send an update if state has changed or force is true.
-pub async fn send_update(state: &StateBundle, update_tx: &mpsc::Sender<Update>, force: bool) {
+/// Send an update if state has changed or force is true. Publishes the latest
+/// Update into a watch channel (Option<Update>); receivers will get the newest
+/// value via `changed()`.
+pub async fn send_update(state: &StateBundle, update_tx: &watch::Sender<Option<Update>>, force: bool) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static LAST_SENT_VERSION: AtomicU64 = AtomicU64::new(0);
     // Combine the state's version and the playing flag into a single u64 key so
@@ -43,8 +45,8 @@ pub async fn send_update(state: &StateBundle, update_tx: &mpsc::Sender<Update>, 
     provider: state.provider.clone(),
     };
     if force || !update.lines.is_empty() || update.err.is_some() {
-        let _ = update_tx.send(update).await;
-    LAST_SENT_VERSION.store(key, Ordering::Relaxed);
+        let _ = update_tx.send(Some(update));
+        LAST_SENT_VERSION.store(key, Ordering::Relaxed);
     }
 }
 
@@ -170,7 +172,7 @@ pub async fn fetch_and_update_lyrics(
 pub async fn process_event(
     event: Event,
     state: &mut StateBundle,
-    update_tx: &mpsc::Sender<Update>,
+    update_tx: &watch::Sender<Option<Update>>,
     latest_meta: &mut Option<(TrackMetadata, f64, String)>,
 ) {
     match event {
@@ -187,7 +189,7 @@ pub async fn process_event(
 async fn handle_mpris_event(
     event: MprisEvent,
     state: &mut StateBundle,
-    update_tx: &mpsc::Sender<Update>,
+    update_tx: &watch::Sender<Option<Update>>,
     latest_meta: &mut Option<(TrackMetadata, f64, String)>,
 ) {
     let (meta, position, service, track_changed) = match event {
@@ -245,7 +247,7 @@ async fn handle_latest_meta_update(
     _db_path: Option<&str>,
     debug_log: bool,
     providers: &[String],
-    update_tx: &mpsc::Sender<Update>,
+    update_tx: &watch::Sender<Option<Update>>,
 ) -> bool {
     if let Some((meta, _old_position, service)) = latest_meta.take() {
         // Fetch lyrics for the new track
@@ -254,7 +256,7 @@ async fn handle_latest_meta_update(
                 .await;
         state.update_index(position);
         state.player_state.reset_position_cache(position);
-        send_update(state, update_tx, true).await;
+    send_update(state, update_tx, true).await;
         true
     } else {
         false
@@ -275,7 +277,7 @@ pub async fn handle_poll(
     state: &mut StateBundle,
     _db: Option<&()>,
     _db_path: Option<&str>,
-    update_tx: &mpsc::Sender<Update>,
+    update_tx: &watch::Sender<Option<Update>>,
     debug_log: bool,
     latest_meta: &mut Option<(TrackMetadata, f64, String)>,
     providers: &[String],
