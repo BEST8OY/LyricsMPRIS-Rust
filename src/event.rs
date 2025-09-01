@@ -93,6 +93,7 @@ async fn fetch_api_lyrics(
                     &meta.title,
                     &meta.album,
                     meta.length,
+                    meta.spotify_id.as_deref(),
                 )
                 .await
                 {

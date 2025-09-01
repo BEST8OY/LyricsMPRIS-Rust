@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use std::pin::Pin;
 use tokio::time::Sleep;
 use tokio::sync::mpsc;
+use std::thread;
 use tui::{Terminal, backend::CrosstermBackend};
 
 use crate::ui::modern_helpers::{estimate_update_and_next_sleep, draw_ui_with_cache};
@@ -65,6 +66,38 @@ pub async fn display_lyrics_modern(
     state.karaoke_enabled = karaoke_enabled;
     // per-word sleep used to schedule redraws only at interesting times (word boundaries)
     let mut next_word_sleep: Option<Pin<Box<Sleep>>> = None;
+    // Single background thread to poll for crossterm events and forward them
+    // to the async runtime via `event_rx`. This avoids repeatedly calling
+    // `tokio::task::spawn_blocking` which grows the blocking threadpool when
+    // the UI wakes frequently (e.g. karaoke mode).
+    let (event_tx, mut event_rx) = mpsc::channel(32);
+    // Spawn a real OS thread that polls and reads events synchronously.
+    // Use try_send so the thread can exit when the receiver is closed.
+    thread::spawn(move || {
+        loop {
+            // Poll with a short timeout to remain responsive.
+            match crossterm::event::poll(std::time::Duration::from_millis(100)) {
+                Ok(true) => match crossterm::event::read() {
+                    Ok(ev) => {
+                        // If the async receiver is closed, stop the thread.
+                        if event_tx.try_send(ev).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => {
+                        // ignore and continue polling
+                    }
+                },
+                Ok(false) => {
+                    // timeout, continue
+                }
+                Err(_) => {
+                    // on error, sleep a bit to avoid busy loop
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            }
+        }
+    });
     // use state.last_track_id for track-change detection; avoid redundant local copy
     while !state.should_exit {
         tokio::select! {
@@ -91,9 +124,8 @@ pub async fn display_lyrics_modern(
                 next_word_sleep = next;
             }
 
-            maybe_event = tokio::task::spawn_blocking(|| crossterm::event::poll(std::time::Duration::from_millis(100))) => {
-                if let Ok(Ok(true)) = maybe_event {
-                    let event = crossterm::event::read().map_err(to_boxed_err)?;
+            maybe_event = event_rx.recv() => {
+                if let Some(event) = maybe_event {
                     process_event(event, &mut state)?;
 
                     // user-driven state changes (toggle karaoke, etc) may change scheduling
@@ -101,6 +133,9 @@ pub async fn display_lyrics_modern(
                     let draw_arg = if let Some(tmp) = maybe_tmp.clone() { Some(tmp) } else { state.last_update.clone() };
                     let _ = draw_ui_with_cache(&mut terminal, &draw_arg, &state.cached_lines, &styles, state.karaoke_enabled);
                     next_word_sleep = next;
+                } else {
+                    // channel closed -> exit
+                    state.should_exit = true;
                 }
             }
 

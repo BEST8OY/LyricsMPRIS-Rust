@@ -10,6 +10,7 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
     title: &str,
     album: &str,
     duration: Option<f64>,
+    spotify_id: Option<&str>,
 ) -> ProviderResult {
     // Requirements: a usertoken must be present.
     let token = match env::var("MUSIXMATCH_USERTOKEN").ok() {
@@ -101,6 +102,15 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
     if let Some(d) = duration {
         let secs = d.round() as i64;
         parts.push(format!("q_duration={}", secs));
+    }
+    // If we have a Spotify track id extracted from MPRIS metadata, include it
+    // as `track_spotify_id` but only when the original mpris:trackid had the
+    // expected spotify path. The caller passes `spotify_id` only when that
+    // was detected.
+    if let Some(sid) = spotify_id {
+        if !sid.is_empty() {
+            parts.push(format!("track_spotify_id={}", urlencoding::encode(sid)));
+        }
     }
 
     let final_url = base_url.to_string() + &parts.join("&");

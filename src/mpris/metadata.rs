@@ -10,6 +10,10 @@ pub struct TrackMetadata {
     pub artist: String,
     pub album: String,
     pub length: Option<f64>,
+    /// If available, the Spotify track id extracted from `mpris:trackid`, e.g.
+    /// from "/com/spotify/track/40MTAe7rupM7DNRrw72Q8i" we'll store
+    /// "40MTAe7rupM7DNRrw72Q8i" here.
+    pub spotify_id: Option<String>,
 }
 
 /// Helper to extract a string that might be a single value or the first in an array.
@@ -50,11 +54,25 @@ pub fn extract_metadata(map: &dbus::arg::PropMap) -> TrackMetadata {
         .get("mpris:length")
         .and_then(|v| v.0.as_i64())
         .map(|l| l as f64 / 1_000_000.0);
+    // Try to extract a spotify track id from the mpris:trackid property if present.
+    let spotify_id = map
+        .get("mpris:trackid")
+        .and_then(|v| v.0.as_str())
+        .and_then(|s| {
+            // Expecting object path-like value such as "/com/spotify/track/<id>".
+            // Only accept when it contains the spotify track path segment.
+            if s.contains("/com/spotify/track/") {
+                s.rsplit('/').next().map(str::to_string)
+            } else {
+                None
+            }
+        });
     TrackMetadata {
         title,
         artist,
         album,
         length,
+        spotify_id,
     }
 }
 
