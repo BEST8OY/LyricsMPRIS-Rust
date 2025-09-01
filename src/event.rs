@@ -95,7 +95,7 @@ async fn fetch_api_lyrics(
     for prov in providers {
         match prov.as_str() {
             "lrclib" => {
-                match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title, meta.length).await {
+                match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title, &meta.album, meta.length).await {
                     Ok((lines, raw)) if !lines.is_empty() => {
                         state.update_lyrics(lines, meta, None, Some(Provider::Lrclib));
                         save_raw_to_db(db, db_path, &meta.artist, &meta.title, raw).await;
@@ -122,6 +122,7 @@ async fn fetch_api_lyrics(
                 match crate::lyrics::fetch_lyrics_from_musixmatch_usertoken(
                     &meta.artist,
                     &meta.title,
+                    &meta.album,
                     meta.length,
                 )
                 .await

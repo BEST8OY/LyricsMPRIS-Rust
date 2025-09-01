@@ -14,6 +14,7 @@ struct LrcLibResp {
 pub async fn fetch_lyrics_from_lrclib(
     artist: &str,
     title: &str,
+    album: &str,
     duration: Option<f64>,
 ) -> ProviderResult {
     let client = http_client();
@@ -21,6 +22,10 @@ pub async fn fetch_lyrics_from_lrclib(
     let mut parts: Vec<String> = Vec::new();
     parts.push(format!("artist_name={}", urlencoding::encode(artist)));
     parts.push(format!("track_name={}", urlencoding::encode(title)));
+    // Include album_name when provided to improve matching.
+    if !album.is_empty() {
+        parts.push(format!("album_name={}", urlencoding::encode(album)));
+    }
     if let Some(d) = duration {
         // lrclib expects duration in seconds (integer). Round to nearest second.
         let secs = d.round() as i64;
