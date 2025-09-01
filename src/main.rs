@@ -1,6 +1,5 @@
 mod event;
 mod lyrics;
-mod lyricsdb;
 mod mpris;
 mod pool;
 mod state;
@@ -11,9 +10,7 @@ use crate::mpris::metadata::get_metadata;
 use crate::mpris::playback::get_position;
 use clap::Parser;
 use std::error::Error;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 /// Application configuration from CLI
 #[derive(Parser, Debug, Clone)]
@@ -81,20 +78,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut cfg = cfg;
     providers_from_env_if_empty(&mut cfg);
     let poll_interval = Duration::from_millis(1000);
-    let db_path = cfg.database.clone();
-
-    // Load database if path provided
-    let db = if let Some(ref path) = db_path {
-        match lyricsdb::LyricsDB::load(path) {
-            Ok(db) => Some(Arc::new(Mutex::new(db))),
-            Err(e) => {
-                eprintln!("Failed to load database: {}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
 
     // Always start the UI, even if no song is playing yet
     // Try to get current metadata/position, but ignore errors and let UI handle waiting
@@ -123,8 +106,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             meta,
             pos,
             poll_interval,
-            db.clone(),
-            db_path.clone(),
             cfg.clone(),
         )
         .await
@@ -133,8 +114,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             meta,
             pos,
             poll_interval,
-            db.clone(),
-            db_path.clone(),
             cfg.clone(),
             !cfg.no_karaoke,
         )

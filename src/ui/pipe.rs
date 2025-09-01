@@ -1,28 +1,17 @@
-use crate::lyricsdb::LyricsDB;
 use crate::pool;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 /// Display lyrics in pipe mode (stdout only, for scripting)
 pub async fn display_lyrics_pipe(
     _meta: crate::mpris::TrackMetadata,
     _pos: f64,
     poll_interval: Duration,
-    db: Option<Arc<Mutex<LyricsDB>>>,
-    db_path: Option<String>,
     mpris_config: crate::Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, mut rx) = mpsc::channel(32);
     let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
-    tokio::spawn(pool::listen(
-        tx,
-        poll_interval,
-        db.clone(),
-        db_path.clone(),
-        shutdown_rx,
-        mpris_config.clone(),
-    ));
+    tokio::spawn(pool::listen(tx, poll_interval, shutdown_rx, mpris_config.clone()));
 
     // State for track transitions and lyric printing
     let mut last_track_id: Option<(String, String, String)> = None;

@@ -1,19 +1,16 @@
 // Minimal central event loop for polling and event-based updates
 
-use crate::event::{Event, MprisEvent, handle_poll, process_event, send_update};
-use crate::lyricsdb::LyricsDB;
+use crate::event::{Event, MprisEvent, process_event, send_update};
+use std::time::Duration;
 use crate::mpris::TrackMetadata;
 use crate::mpris::events::MprisEventHandler;
 use crate::state::{StateBundle, Update};
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
-use tokio::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 pub async fn listen(
     update_tx: mpsc::Sender<Update>,
     poll_interval: Duration,
-    mut db: Option<Arc<Mutex<LyricsDB>>>,
-    db_path: Option<String>,
     mut shutdown_rx: mpsc::Receiver<()>,
     mpris_config: crate::Config,
 ) {
@@ -62,8 +59,8 @@ pub async fn listen(
     let position = crate::event::fetch_and_update_lyrics(
         &meta,
         &mut state,
-        db.as_ref(),
-        db_path.as_deref(),
+        None,
+        None,
         mpris_config_arc.debug_log,
         &providers,
         service.as_deref().unwrap_or(""),
@@ -71,8 +68,6 @@ pub async fn listen(
     .await;
     state.player_state.position = position;
 
-    let mut paused_since: Option<Instant> = None;
-    let pause_release_threshold = Duration::from_secs(60);
     let mut was_playing = true;
 
     // Spawn MPRIS watcher
@@ -108,31 +103,21 @@ pub async fn listen(
                     process_event(event, &mut state, &update_tx, &mut latest_meta).await;
                     was_playing = state.player_state.playing;
                     if prev_playing != was_playing {
-                        match was_playing {
-                            false => paused_since = Some(Instant::now()),
-                            true => {
-                                paused_since = None;
-                                if db.is_none() && let Some(ref path) = db_path && let Ok(new_db) = LyricsDB::load(path) {
-                                    db = Some(Arc::new(Mutex::new(new_db)));
-                                }
-                            }
-                        }
+                        // playback state changed; update local flag
                     }
                 }
             }
             _ = tokio::time::sleep(poll_interval) => {
                 if state.player_state.playing {
-                    handle_poll(
+                    crate::event::handle_poll(
                         &mut state,
-                        db.as_ref(),
-                        db_path.as_deref(),
+                        None,
+                        None,
                         &update_tx,
                         mpris_config_arc.debug_log,
                         &mut latest_meta,
                         &providers,
                     ).await;
-                } else if let Some(paused_at) = paused_since && paused_at.elapsed() > pause_release_threshold {
-                    db = None;
                 }
             }
         }

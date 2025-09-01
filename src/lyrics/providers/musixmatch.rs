@@ -25,15 +25,7 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
     }
 
     fn bool_or_num_at(v: &Value, ptr: &str) -> Option<bool> {
-        v.pointer(ptr).and_then(|x| {
-            if let Some(b) = x.as_bool() {
-                Some(b)
-            } else if let Some(i) = x.as_i64() {
-                Some(i == 1)
-            } else {
-                None
-            }
-        })
+    v.pointer(ptr).and_then(|x| x.as_i64().map(|i| i == 1).or_else(|| x.as_bool()))
     }
 
     fn lrc_from_array(arr: &[Value], time_key: &str) -> (Vec<LyricLine>, String) {
@@ -85,12 +77,13 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
             return Ok(None);
         }
 
-        if let Some(body) = rich_json.pointer("/message/body") {
-            if let Some(richsync_body) = body.get("richsync").and_then(|r| r.get("richsync_body")).and_then(|v| v.as_str()) {
-                if let Some((parsed, raw)) = crate::lyrics::parse::parse_richsync_body(richsync_body) {
-                    return Ok(Some((parsed, Some(raw))));
-                }
-            }
+        if let Some(body) = rich_json.pointer("/message/body")
+            && let Some(richsync_body) = body
+                .get("richsync")
+                .and_then(|r| r.get("richsync_body"))
+                .and_then(|v| v.as_str())
+            && let Some((parsed, raw)) = crate::lyrics::parse::parse_richsync_body(richsync_body) {
+            return Ok(Some((parsed, Some(raw))));
         }
 
         Ok(None)
@@ -159,54 +152,45 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
 
     // If matcher reports richsync, try the dedicated richsync call for better results.
     let has_richsync = bool_or_num_at(&macro_calls, "/matcher.track.get/message/body/track/has_richsync").unwrap_or(false);
-    if has_richsync {
-        if let Some(track_body) = macro_calls.pointer("/matcher.track.get/message/body") {
-            let track_len = track_body
-                .pointer("/track/track_length")
-                .and_then(|v| v.as_i64())
-                .or_else(|| track_body.pointer("/track_length").and_then(|v| v.as_i64()));
-            let commontrack_id = track_body
-                .pointer("/track/commontrack_id")
-                .and_then(|v| v.as_i64())
-                .or_else(|| track_body.pointer("/commontrack_id").and_then(|v| v.as_i64()));
+    if has_richsync
+        && let Some(track_body) = macro_calls.pointer("/matcher.track.get/message/body") {
+        let track_len = track_body
+            .pointer("/track/track_length")
+            .and_then(|v| v.as_i64())
+            .or_else(|| track_body.pointer("/track_length").and_then(|v| v.as_i64()));
+        let commontrack_id = track_body
+            .pointer("/track/commontrack_id")
+            .and_then(|v| v.as_i64())
+            .or_else(|| track_body.pointer("/commontrack_id").and_then(|v| v.as_i64()));
 
-            if let Some(ctid) = commontrack_id {
-                if let Some(result) = try_richsync_call(&client, &token, ctid, track_len).await? {
-                    return Ok(result);
-                }
-            }
+        if let Some(ctid) = commontrack_id
+            && let Some(result) = try_richsync_call(client, &token, ctid, track_len).await? {
+            return Ok(result);
         }
     }
 
     // If macro_calls contains a richsync payload inline, prefer that.
-    if let Some(rich) = macro_calls.get("track.richsync.get") {
-        if status_code_at(rich, "/message/header/status_code") == 200 {
-            if let Some(body) = rich.pointer("/message/body") {
-                if let Some(richsync_body) = body.get("richsync").and_then(|r| r.get("richsync_body")).and_then(|v| v.as_str()) {
-                    if let Some((parsed, raw)) = crate::lyrics::parse::parse_richsync_body(richsync_body) {
-                        return Ok((parsed, Some(raw)));
-                    }
-                }
-            }
-        }
+    if let Some(rich) = macro_calls.get("track.richsync.get")
+        && status_code_at(rich, "/message/header/status_code") == 200
+        && let Some(body) = rich.pointer("/message/body")
+        && let Some(richsync_body) = body
+            .get("richsync")
+            .and_then(|r| r.get("richsync_body"))
+            .and_then(|v| v.as_str())
+        && let Some((parsed, raw)) = crate::lyrics::parse::parse_richsync_body(richsync_body) {
+        return Ok((parsed, Some(raw)));
     }
 
     // Fallback: check for subtitle_list and convert to LRC-like lines
-    if let Some(subs) = macro_calls.get("track.subtitles.get") {
-        if status_code_at(subs, "/message/header/status_code") == 200 {
-            if let Some(list) = subs.pointer("/message/body/subtitle_list").and_then(|v| v.as_array()) {
-                if let Some(first) = list.first() {
-                    if let Some(sub_body) = first.pointer("/subtitle/subtitle_body").and_then(|v| v.as_str()) {
-                        if let Ok(lines_val) = serde_json::from_str::<Value>(sub_body) {
-                            if let Some(arr) = lines_val.as_array() {
-                                let (parsed, raw) = lrc_from_array(&arr.to_vec(), "/time/total");
-                                return Ok((parsed, Some(raw)));
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    if let Some(subs) = macro_calls.get("track.subtitles.get")
+        && status_code_at(subs, "/message/header/status_code") == 200
+        && let Some(list) = subs.pointer("/message/body/subtitle_list").and_then(|v| v.as_array())
+        && let Some(first) = list.first()
+        && let Some(sub_body) = first.pointer("/subtitle/subtitle_body").and_then(|v| v.as_str())
+        && let Ok(lines_val) = serde_json::from_str::<Value>(sub_body)
+        && let Some(arr) = lines_val.as_array() {
+        let (parsed, raw) = lrc_from_array(&arr.to_vec(), "/time/total");
+        return Ok((parsed, Some(raw)));
     }
 
     Ok((Vec::new(), None))

@@ -1,10 +1,8 @@
 //! Event handling for LyricsMPRIS central loop. Clean, robust, and clear logic.
 
-use crate::lyricsdb::LyricsDB;
 use crate::mpris::TrackMetadata;
 use crate::state::{StateBundle, Update, Provider};
-use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 
 #[derive(Debug)]
 pub enum MprisEvent {
@@ -51,54 +49,25 @@ pub async fn send_update(state: &StateBundle, update_tx: &mpsc::Sender<Update>, 
 }
 
 /// Try to load lyrics from DB. Returns true if found.
-async fn try_db_lyrics(
-    meta: &TrackMetadata,
-    state: &mut StateBundle,
-    db: &Arc<Mutex<LyricsDB>>,
-) -> bool {
-    let guard = db.lock().await;
-    if let Some(synced) = guard.get(&meta.artist, &meta.title) {
-        state.update_lyrics(crate::lyrics::parse_synced_lyrics(&synced), meta, None, Some(Provider::Db));
-        true
-    } else {
-        state.update_lyrics(Vec::new(), meta, None, None);
-        false
-    }
-}
-
 /// Fetch lyrics from API and update state. Save to DB if possible.
 /// `providers` is the ordered list of providers to try (e.g. ["lrclib", "musixmatch"]).
 async fn fetch_api_lyrics(
     meta: &TrackMetadata,
     state: &mut StateBundle,
-    db: Option<&Arc<Mutex<LyricsDB>>>,
-    db_path: Option<&str>,
+    _db: Option<&()>,
+    _db_path: Option<&str>,
     debug_log: bool,
     providers: &[String],
 ) {
-    // Helper to persist raw LRC to DB when both db and path are provided.
-    async fn save_raw_to_db(
-        db: Option<&Arc<Mutex<LyricsDB>>>,
-        db_path: Option<&str>,
-        artist: &str,
-        title: &str,
-        raw: Option<String>,
-    ) {
-        if let Some((db, path)) = db.zip(db_path) && let Some(raw_lrc) = raw {
-            let mut guard = db.lock().await;
-            guard.insert(artist, title, &raw_lrc);
-            let _ = guard.save(path);
-        }
-    }
+    // Local DB support removed: no-op
 
     // Try providers in order. If one returns non-empty lyrics, use it and save to DB if available.
     for prov in providers {
         match prov.as_str() {
             "lrclib" => {
                 match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title, &meta.album, meta.length).await {
-                    Ok((lines, raw)) if !lines.is_empty() => {
+                    Ok((lines, _raw)) if !lines.is_empty() => {
                         state.update_lyrics(lines, meta, None, Some(Provider::Lrclib));
-                        save_raw_to_db(db, db_path, &meta.artist, &meta.title, raw).await;
                         return;
                     }
                     Ok((_lines, _)) => { /* empty, try next provider */ }
@@ -127,17 +96,16 @@ async fn fetch_api_lyrics(
                 )
                 .await
                 {
-                    Ok((lines, raw)) if !lines.is_empty() => {
+                    Ok((lines, _raw)) if !lines.is_empty() => {
                         // If provider supplied per-word timings (richsync), or the raw LRC is marked, mark provider accordingly.
                         let provider_tag = if lines.iter().any(|l| l.words.is_some())
-                            || raw.as_ref().map(|r| r.starts_with(";;richsync=1")).unwrap_or(false)
+                            || _raw.as_ref().map(|r| r.starts_with(";;richsync=1")).unwrap_or(false)
                         {
                             Some(Provider::MusixmatchRichsync)
                         } else {
                             Some(Provider::MusixmatchSubtitles)
                         };
                         state.update_lyrics(lines, meta, None, provider_tag);
-                        save_raw_to_db(db, db_path, &meta.artist, &meta.title, raw).await;
                         return;
                     }
                     Ok((_lines, _)) => { /* empty, try next provider */ }
@@ -171,20 +139,14 @@ async fn fetch_api_lyrics(
 pub async fn fetch_and_update_lyrics(
     meta: &TrackMetadata,
     state: &mut StateBundle,
-    db: Option<&Arc<Mutex<LyricsDB>>>,
-    db_path: Option<&str>,
+    _db: Option<&()>,
+    _db_path: Option<&str>,
     debug_log: bool,
     providers: &[String],
     player_service: &str,
 ) -> f64 {
-    let found = if let Some(db) = db {
-        try_db_lyrics(meta, state, db).await
-    } else {
-        false
-    };
-    if !found {
-        fetch_api_lyrics(meta, state, db, db_path, debug_log, providers).await;
-    }
+    // Always fetch from API (local DB support removed)
+    fetch_api_lyrics(meta, state, None, None, debug_log, providers).await;
     // After fetching, get the most up-to-date position
     let position = match crate::mpris::playback::get_position(player_service).await {
         Ok(pos) => {
@@ -279,8 +241,8 @@ async fn handle_mpris_event(
 async fn handle_latest_meta_update(
     state: &mut StateBundle,
     latest_meta: &mut Option<(TrackMetadata, f64, String)>,
-    db: Option<&Arc<Mutex<LyricsDB>>>,
-    db_path: Option<&str>,
+    _db: Option<&()>,
+    _db_path: Option<&str>,
     debug_log: bool,
     providers: &[String],
     update_tx: &mpsc::Sender<Update>,
@@ -288,7 +250,7 @@ async fn handle_latest_meta_update(
     if let Some((meta, _old_position, service)) = latest_meta.take() {
         // Fetch lyrics for the new track
         let position =
-            fetch_and_update_lyrics(&meta, state, db, db_path, debug_log, providers, &service)
+            fetch_and_update_lyrics(&meta, state, None, None, debug_log, providers, &service)
                 .await;
         state.update_index(position);
         state.player_state.reset_position_cache(position);
@@ -311,8 +273,8 @@ async fn handle_position_sync(state: &mut StateBundle) -> Option<bool> {
 /// Poll handler: update lyrics, sync position, send updates as needed.
 pub async fn handle_poll(
     state: &mut StateBundle,
-    db: Option<&Arc<Mutex<LyricsDB>>>,
-    db_path: Option<&str>,
+    _db: Option<&()>,
+    _db_path: Option<&str>,
     update_tx: &mpsc::Sender<Update>,
     debug_log: bool,
     latest_meta: &mut Option<(TrackMetadata, f64, String)>,
@@ -323,8 +285,8 @@ pub async fn handle_poll(
     if handle_latest_meta_update(
         state,
         latest_meta,
-        db,
-        db_path,
+        None,
+        None,
         debug_log,
         providers,
         update_tx,

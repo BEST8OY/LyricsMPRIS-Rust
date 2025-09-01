@@ -11,7 +11,7 @@ pub enum Provider {
     Lrclib,
     MusixmatchRichsync,
     MusixmatchSubtitles,
-    Db,
+    // Db removed when local DB support was disabled
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
