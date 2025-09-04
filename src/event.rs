@@ -33,14 +33,14 @@ pub async fn send_update(state: &StateBundle, update_tx: &mpsc::Sender<Update>, 
     let update = Update {
         lines: state.lyric_state.lines.clone(),
         index: state.lyric_state.index,
-    position: state.player_state.position,
+        position: state.player_state.estimate_position(),
         err: state.player_state.err.as_ref().map(|e| e.to_string()),
         version,
         playing: state.player_state.playing,
         artist: state.player_state.artist.clone(),
         title: state.player_state.title.clone(),
         album: state.player_state.album.clone(),
-    provider: state.provider.clone(),
+        provider: state.provider.clone(),
     };
     if force || !update.lines.is_empty() || update.err.is_some() {
         let _ = update_tx.send(update).await;
