@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::env;
 
-use crate::lyrics::types::{http_client, LyricLine, LyricsError, ProviderResult};
+use crate::lyrics::types::{http_client, LyricLine, ProviderResult};
 
 /// Fetch lyrics using Musixmatch desktop "usertoken" (apic-desktop.musixmatch.com).
 #[allow(dead_code)]
@@ -10,7 +10,6 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
     title: &str,
     album: &str,
     duration: Option<f64>,
-    spotify_id: Option<&str>,
 ) -> ProviderResult {
     // Requirements: a usertoken must be present.
     let token = match env::var("MUSIXMATCH_USERTOKEN").ok() {
@@ -19,6 +18,8 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
     };
 
     let client = http_client();
+
+    // ...existing code...
 
     // Helper closures/functions to reduce repeated code and improve readability.
     fn status_code_at(v: &Value, ptr: &str) -> i64 {
@@ -45,163 +46,142 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
         (parsed, out)
     }
 
-    async fn try_richsync_call(
-        client: &reqwest::Client,
-        token: &str,
-        commontrack_id: i64,
-        track_len: Option<i64>,
-    ) -> Result<Option<(Vec<LyricLine>, Option<String>)>, LyricsError> {
-        let rich_base = "https://apic-desktop.musixmatch.com/ws/1.1/track.richsync.get?format=json&subtitle_format=mxm&app_id=web-desktop-app-v1.0&";
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(len) = track_len {
-            parts.push(format!("f_subtitle_length={}", len));
-            parts.push(format!("q_duration={}", len));
-        }
-        parts.push(format!("commontrack_id={}", commontrack_id));
-        parts.push(format!("usertoken={}", urlencoding::encode(token)));
-        let rich_url = rich_base.to_string() + &parts.join("&");
 
-        let resp = client
-            .get(&rich_url)
+    // Primary flow: use track.search to obtain candidate tracks, pick the
+    // most similar candidate with `find_best_song_match`, then prefer
+    // richsync via a single macro.subtitles.get call for the selected commontrack_id.
+    {
+        let matcher_base = "https://apic-desktop.musixmatch.com/ws/1.1/track.search?format=json&app_id=web-desktop-app-v1.0&";
+        let mut mparts: Vec<String> = Vec::new();
+        // prefer explicit artist/track fields when available
+        mparts.push(format!("q_artist={}", urlencoding::encode(artist)));
+        mparts.push(format!("q_track={}", urlencoding::encode(title)));
+        if !album.is_empty() {
+            mparts.push(format!("q_album={}", urlencoding::encode(album)));
+        }
+        if let Some(d) = duration {
+            let secs = d.round() as i64;
+            mparts.push(format!("q_duration={}", secs));
+        }
+        mparts.push(format!("usertoken={}", urlencoding::encode(&token)));
+        // request more candidates for better similarity matching and prefer tracks with lyrics
+        mparts.push("page_size=10".to_string());
+        mparts.push("f_has_lyrics=1".to_string());
+
+        let matcher_url = matcher_base.to_string() + &mparts.join("&");
+        let mresp = client
+            .get(&matcher_url)
             .header("Cookie", format!("x-mxm-token-guid={}", token))
             .send()
             .await?;
 
-        let status = resp.status();
-        let text = resp.text().await?;
-        if !status.is_success() {
-            return Ok(None);
+        if !mresp.status().is_success() {
+            return Ok((Vec::new(), None));
         }
 
-        let rich_json: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        if status_code_at(&rich_json, "/message/header/status_code") != 200 {
-            return Ok(None);
+        let mjson: Value = mresp.json().await?;
+        let list = mjson.pointer("/message/body/track_list").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        if list.is_empty() {
+            return Ok((Vec::new(), None));
         }
 
-        if let Some(body) = rich_json.pointer("/message/body")
-            && let Some(richsync_body) = body
-                .get("richsync")
-                .and_then(|r| r.get("richsync_body"))
-                .and_then(|v| v.as_str())
-            && let Some((parsed, raw)) = crate::lyrics::parse::parse_richsync_body(richsync_body) {
-            return Ok(Some((parsed, Some(raw))));
+        // Build candidate array (each item is the inner `track` object)
+        let mut candidates: Vec<Value> = Vec::with_capacity(list.len());
+        for item in &list {
+            if let Some(track) = item.get("track") {
+                candidates.push(track.clone());
+            }
         }
 
-        Ok(None)
-    }
-
-    // Build the initial macro.subtitles.get URL
-    let base_url = "https://apic-desktop.musixmatch.com/ws/1.1/macro.subtitles.get?format=json&namespace=lyrics_richsynched&subtitle_format=mxm&app_id=web-desktop-app-v1.0&";
-    let mut parts: Vec<String> = Vec::new();
-    parts.push(format!("q_artist={}", urlencoding::encode(artist)));
-    parts.push(format!("q_track={}", urlencoding::encode(title)));
-    if !album.is_empty() {
-        parts.push(format!("q_album={}", urlencoding::encode(album)));
-    }
-    parts.push(format!("usertoken={}", urlencoding::encode(&token)));
-    if let Some(d) = duration {
-        let secs = d.round() as i64;
-        parts.push(format!("q_duration={}", secs));
-    }
-    // If we have a Spotify track id extracted from MPRIS metadata, include it
-    // as `track_spotify_id` but only when the original mpris:trackid had the
-    // expected spotify path. The caller passes `spotify_id` only when that
-    // was detected.
-    if let Some(sid) = spotify_id {
-        if !sid.is_empty() {
-            parts.push(format!("track_spotify_id={}", urlencoding::encode(sid)));
+        if candidates.is_empty() {
+            return Ok((Vec::new(), None));
         }
-    }
 
-    let final_url = base_url.to_string() + &parts.join("&");
-    let resp = client
-        .get(&final_url)
-        .header("Cookie", format!("x-mxm-token-guid={}", token))
-        .send()
-        .await?;
+    // candidates collected
 
-    if !resp.status().is_success() {
-        return Err(LyricsError::Api(format!(
-            "musixmatch desktop macro.subtitles.get: {}",
-            resp.status()
-        )));
-    }
+        // Use project's similarity helper to pick best match
+        if let Some((idx, _score)) = crate::lyrics::similarity::find_best_song_match(
+            &candidates,
+            title,
+            artist,
+            if album.is_empty() { None } else { Some(album) },
+            duration,
+        ) {
+            if let Some(best) = candidates.get(idx) {
+                // best candidate obtained
+                // If candidate is instrumental, return a single instrumental line
+                if best.get("instrumental").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let line = LyricLine { time: 0.0, text: "♪ Instrumental ♪".to_string(), words: None };
+                    return Ok((vec![line], None));
+                }
 
-    let json: Value = resp.json().await?;
-    let macro_calls = json.pointer("/message/body/macro_calls").cloned().unwrap_or(Value::Null);
-    if macro_calls.is_null() {
-        return Ok((Vec::new(), None));
-    }
+                let commontrack_id = best
+                    .get("commontrack_id")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| best.get("track_id").and_then(|v| v.as_i64()));
+                let track_len = best
+                    .get("track_length")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| best.get("length").and_then(|v| v.as_i64()));
 
-    if status_code_at(&macro_calls, "/matcher.track.get/message/header/status_code") != 200 {
-        let mode = macro_calls
-            .pointer("/matcher.track.get/message/header/mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        return Err(LyricsError::Api(format!("Requested error: {}", mode)));
-    }
+                if let Some(ctid) = commontrack_id {
+                    // Prefer a single macro.subtitles.get call requesting richsync
+                    // and subtitles in one payload (lower latency, single roundtrip).
+                    let macro_base = "https://apic-desktop.musixmatch.com/ws/1.1/macro.subtitles.get?format=json&namespace=lyrics_richsynched&subtitle_format=mxm&optional_calls=track.richsync&app_id=web-desktop-app-v1.0&";
+                    let mut mparts2: Vec<String> = Vec::new();
+                    mparts2.push(format!("commontrack_id={}", ctid));
+                    mparts2.push(format!("usertoken={}", urlencoding::encode(&token)));
+                    if let Some(len) = track_len {
+                        mparts2.push(format!("q_duration={}", len));
+                    }
+                    let macro_url = macro_base.to_string() + &mparts2.join("&");
 
-    if macro_calls
-        .pointer("/track.lyrics.get/message/body/lyrics/restricted")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        return Err(LyricsError::Api(
-            "Unfortunately we're not authorized to show these lyrics.".to_string(),
-        ));
-    }
+                    let macro_resp = client
+                        .get(&macro_url)
+                        .header("Cookie", format!("x-mxm-token-guid={}", token))
+                        .send()
+                        .await?;
 
-    if macro_calls
-        .pointer("/matcher.track.get/message/body/track/instrumental")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        let line = LyricLine { time: 0.0, text: "♪ Instrumental ♪".to_string(), words: None };
-        return Ok((vec![line], None));
-    }
+            if macro_resp.status().is_success() {
+                        if let Ok(macro_json) = macro_resp.json::<Value>().await {
+                            // Prefer inline richsync payload
+                            let macro_calls = macro_json.pointer("/message/body/macro_calls").cloned().unwrap_or(Value::Null);
+                // macro_calls parsed
+                            if !macro_calls.is_null() {
+                                if let Some(rich) = macro_calls.get("track.richsync.get")
+                                    && status_code_at(rich, "/message/header/status_code") == 200
+                                    && let Some(body) = rich.pointer("/message/body")
+                                    && let Some(richsync_body) = body
+                                        .get("richsync")
+                                        .and_then(|r| r.get("richsync_body"))
+                                        .and_then(|v| v.as_str())
+                                    && let Some((parsed, raw)) = crate::lyrics::parse::parse_richsync_body(richsync_body) {
+                                    return Ok((parsed, Some(raw)));
+                                }
 
-    // If matcher reports richsync, try the dedicated richsync call for better results.
-    let has_richsync = bool_or_num_at(&macro_calls, "/matcher.track.get/message/body/track/has_richsync").unwrap_or(false);
-    if has_richsync
-        && let Some(track_body) = macro_calls.pointer("/matcher.track.get/message/body") {
-        let track_len = track_body
-            .pointer("/track/track_length")
-            .and_then(|v| v.as_i64())
-            .or_else(|| track_body.pointer("/track_length").and_then(|v| v.as_i64()));
-        let commontrack_id = track_body
-            .pointer("/track/commontrack_id")
-            .and_then(|v| v.as_i64())
-            .or_else(|| track_body.pointer("/commontrack_id").and_then(|v| v.as_i64()));
+                                // Fallback to subtitle_list inside macro_calls
+                                if let Some(subs) = macro_calls.get("track.subtitles.get")
+                                    && status_code_at(subs, "/message/header/status_code") == 200
+                                    && let Some(list) = subs.pointer("/message/body/subtitle_list").and_then(|v| v.as_array())
+                                    && let Some(first) = list.first()
+                                    && let Some(sub_body) = first.pointer("/subtitle/subtitle_body").and_then(|v| v.as_str())
+                                    && let Ok(lines_val) = serde_json::from_str::<Value>(sub_body)
+                                    && let Some(arr) = lines_val.as_array() {
+                                    let (parsed, raw) = lrc_from_array(&arr.to_vec(), "/time/total");
+                                    return Ok((parsed, Some(raw)));
+                                }
+                            }
+                        }
+                    }
 
-        if let Some(ctid) = commontrack_id
-            && let Some(result) = try_richsync_call(client, &token, ctid, track_len).await? {
-            return Ok(result);
+                    // If macro request doesn't provide lyrics, return empty —
+                    // dedicated fallbacks removed to avoid extra roundtrips.
+                }
+            }
         }
     }
 
-    // If macro_calls contains a richsync payload inline, prefer that.
-    if let Some(rich) = macro_calls.get("track.richsync.get")
-        && status_code_at(rich, "/message/header/status_code") == 200
-        && let Some(body) = rich.pointer("/message/body")
-        && let Some(richsync_body) = body
-            .get("richsync")
-            .and_then(|r| r.get("richsync_body"))
-            .and_then(|v| v.as_str())
-        && let Some((parsed, raw)) = crate::lyrics::parse::parse_richsync_body(richsync_body) {
-        return Ok((parsed, Some(raw)));
-    }
 
-    // Fallback: check for subtitle_list and convert to LRC-like lines
-    if let Some(subs) = macro_calls.get("track.subtitles.get")
-        && status_code_at(subs, "/message/header/status_code") == 200
-        && let Some(list) = subs.pointer("/message/body/subtitle_list").and_then(|v| v.as_array())
-        && let Some(first) = list.first()
-        && let Some(sub_body) = first.pointer("/subtitle/subtitle_body").and_then(|v| v.as_str())
-        && let Ok(lines_val) = serde_json::from_str::<Value>(sub_body)
-        && let Some(arr) = lines_val.as_array() {
-        let (parsed, raw) = lrc_from_array(&arr.to_vec(), "/time/total");
-        return Ok((parsed, Some(raw)));
-    }
 
     Ok((Vec::new(), None))
 }

@@ -11,9 +11,10 @@ pub enum Provider {
     Lrclib,
     MusixmatchRichsync,
     MusixmatchSubtitles,
-    // Db removed when local DB support was disabled
+    
 }
 
+/// Update sent to the UI: a snapshot of lyrics, player position and metadata.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Update {
     pub lines: Arc<Vec<LyricLine>>,
@@ -60,12 +61,24 @@ impl PlayerState {
         self.position = position;
     }
     pub fn estimate_position(&self) -> f64 {
-        if self.playing
-            && let Some(instant) = self.last_update
-        {
+        // If playing and we have a timestamp for the last observed position,
+        // estimate the current position by adding elapsed wall time.
+        if self.playing && let Some(instant) = self.last_update {
             let elapsed = instant.elapsed().as_secs_f64();
-            return self.last_position + elapsed;
+            let mut estimated = self.last_position + elapsed;
+            // If the track length is known, clamp the estimate to [0, length].
+            if let Some(len) = self.length && estimated.is_finite() {
+                if estimated > len {
+                    estimated = len;
+                }
+                if estimated < 0.0 {
+                    estimated = 0.0;
+                }
+            }
+            return estimated;
         }
+
+        // Fall back to the last known position.
         self.last_position
     }
     pub fn has_changed(&self, meta: &TrackMetadata) -> bool {
@@ -138,6 +151,8 @@ impl StateBundle {
         self.lyric_state.update_lines(Vec::new());
         self.lyric_state.index = 0;
         self.version += 1;
+    // Clear provider when lyrics are removed so callers don't see a stale value.
+    self.provider = None;
     }
     pub fn update_lyrics(
     &mut self,

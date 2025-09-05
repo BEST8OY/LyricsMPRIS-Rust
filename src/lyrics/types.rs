@@ -11,7 +11,7 @@ static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
         .expect("failed to build HTTP client")
 });
 
-/// Provider result: parsed lines plus optional raw LRC string for DB storage
+/// Provider result: parsed lines plus optional raw LRC string
 pub type ProviderResult = Result<(Vec<LyricLine>, Option<String>), LyricsError>;
 
 #[derive(Debug, Clone, Default, PartialEq)]

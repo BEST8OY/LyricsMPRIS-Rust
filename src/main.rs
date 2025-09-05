@@ -19,9 +19,7 @@ pub struct Config {
     /// Pipe current lyric line to stdout (default is modern UI)
     #[arg(long)]
     pipe: bool,
-    /// Path to local lyrics database (optional)
-    #[arg(long)]
-    database: Option<String>,
+    
     /// Blocklist for MPRIS player service names (comma-separated, case-insensitive)
     #[arg(
         long = "block",
@@ -47,7 +45,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             pipe: false,
-            database: None,
             block: vec![],
             debug_log: false,
             providers: vec!["lrclib".to_string(), "musixmatch".to_string()],

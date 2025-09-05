@@ -7,7 +7,7 @@
  - Modern terminal UI with centered lyric display and optional per-word (karaoke) highlighting.
  - Pipe mode for piping current lyric line to stdout (script-friendly).
  - Multiple lyric providers (built-in `lrclib`, `musixmatch`), configurable order.
- - Local lyrics database support and simple blocklist for player services.
+ - Simple blocklist for player services.
 
 
  Lightweight TUI and pipe-mode lyrics viewer that listens to MPRIS players and displays synchronized lyrics.
@@ -56,7 +56,6 @@
 
  - `--no-karaoke` — Disable per-word karaoke highlighting. Karaoke is enabled by default; pass `--no-karaoke` to turn it off.
  - `--pipe` — Run in pipe mode (prints current lyric line to stdout) instead of the modern TUI.
- - `--database <PATH>` — Path to a local lyrics database file.
  - `--block SERVICE1,SERVICE2` — Comma-separated, case-insensitive list of MPRIS service names to ignore.
  - `--debug-log` — Enable backend error logging to stderr.
  - `--providers lrclib,musixmatch` — Comma-separated provider list in preferred order. If omitted, the `LYRIC_PROVIDERS` environment variable is used as a fallback.
