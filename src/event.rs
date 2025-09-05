@@ -106,6 +106,7 @@ async fn fetch_api_lyrics(
                     &meta.title,
                     &meta.album,
                     meta.length,
+                    meta.spotify_id.as_deref(),
                 ).await {
                     Ok((lines, _raw)) if !lines.is_empty() => {
                         let provider_tag = if lines.iter().any(|l| l.words.is_some())

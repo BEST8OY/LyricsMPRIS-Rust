@@ -10,6 +10,7 @@ pub struct TrackMetadata {
     pub artist: String,
     pub album: String,
     pub length: Option<f64>,
+    pub spotify_id: Option<String>,
 }
 
 /// Helper to extract a string that might be a single value or the first in an array.
@@ -56,7 +57,26 @@ pub fn extract_metadata(map: &dbus::arg::PropMap) -> TrackMetadata {
             None
         }
     });
-    TrackMetadata { title, artist, album, length }
+    // Extract mpris:trackid which is often an object path like
+    // "/com/spotify/track/<id>" for Spotify players. We normalize to just
+    // the Spotify track id if present.
+    let spotify_id = map.get("mpris:trackid").and_then(|v| v.0.as_str()).and_then(|s| {
+        if let Some(idx) = s.rfind('/') {
+            let candidate = &s[idx + 1..];
+            if !candidate.is_empty() {
+                return Some(candidate.to_string());
+            }
+        }
+        // support spotify URI form as fallback
+        if let Some(idx) = s.find("spotify:track:") {
+            let candidate = &s[idx + "spotify:track:".len()..];
+            if !candidate.is_empty() {
+                return Some(candidate.to_string());
+            }
+        }
+        None
+    });
+    TrackMetadata { title, artist, album, length, spotify_id }
 }
 
 /// Query metadata for a specific MPRIS player service.
