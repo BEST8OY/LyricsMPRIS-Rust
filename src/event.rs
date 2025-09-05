@@ -45,6 +45,10 @@ pub async fn send_update(state: &StateBundle, update_tx: &mpsc::Sender<Update>, 
         lines: state.lyric_state.lines.clone(),
         index: state.lyric_state.index,
         position: state.player_state.position,
+        position_timestamp: Some({
+            let now = std::time::SystemTime::now();
+            now.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0)
+        }),
         err: state.player_state.err.as_ref().map(|e| e.to_string()),
         version,
         playing: state.player_state.playing,
