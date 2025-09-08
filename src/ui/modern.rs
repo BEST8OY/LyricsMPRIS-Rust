@@ -164,17 +164,7 @@ pub async fn display_lyrics_modern(
 fn update_cache_and_state(state: &mut ModernUIState, update: &Update) {
     state.cached_lines = Some(update.lines.iter().map(|l| l.text.clone()).collect());
     state.last_update = Some(update.clone());
-    // Prefer the backend-supplied timestamp for when `position` was sampled so
-    // local estimation starts from the same time. Fallback to now if absent.
-    if let Some(ts) = update.position_timestamp {
-        let now_sys = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
-        let diff = now_sys - ts;
-        // If diff negative (clock skew), clamp to zero.
-        let diff = if diff.is_sign_negative() { 0.0 } else { diff };
-        state.last_update_instant = Some(Instant::now() - std::time::Duration::from_secs_f64(diff));
-    } else {
-        state.last_update_instant = Some(Instant::now());
-    }
+    state.last_update_instant = Some(Instant::now());
 }
 
 // Scheduling helpers moved to `modern_helpers.rs` (estimate_update_and_next_sleep).
@@ -201,15 +191,7 @@ fn update_state(state: &mut ModernUIState, update: Option<Update>) {
             update_cache_and_state(state, &update);
         } else if let Some(ref mut last_upd) = state.last_update {
             last_upd.index = update.index;
-            // If the incoming update carried a position timestamp use it, otherwise stamp with now.
-            if let Some(ts) = update.position_timestamp {
-                let now_sys = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64()).unwrap_or(0.0);
-                let diff = now_sys - ts;
-                let diff = if diff.is_sign_negative() { 0.0 } else { diff };
-                state.last_update_instant = Some(Instant::now() - std::time::Duration::from_secs_f64(diff));
-            } else {
-                state.last_update_instant = Some(Instant::now());
-            }
+            state.last_update_instant = Some(Instant::now());
         }
         state.last_track_id = Some(track_id);
     } else {

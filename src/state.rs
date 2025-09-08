@@ -20,9 +20,6 @@ pub struct Update {
     pub lines: Arc<Vec<LyricLine>>,
     pub index: usize,
     pub position: f64,
-    /// Unix timestamp (secs as f64) when `position` was sampled. If None, UI
-    /// will fall back to using local receive time.
-    pub position_timestamp: Option<f64>,
     pub err: Option<String>,
     pub version: u64,
     pub playing: bool,

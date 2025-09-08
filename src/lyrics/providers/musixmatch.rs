@@ -213,9 +213,6 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
                     if let Some((parsed, raw)) = try_macro_for_lyrics(client, &token, &params).await? {
                         return Ok((parsed, Some(raw)));
                     }
-
-                    // If macro request doesn't provide lyrics, return empty —
-                    // dedicated fallbacks removed to avoid extra roundtrips.
                 }
             }
         }
