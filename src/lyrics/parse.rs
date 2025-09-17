@@ -93,50 +93,25 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<(Vec<LyricLine>, Strin
                     if wts.is_empty() { None } else { Some(wts) }
                 } else if let Some(l_arr) = line.get("l").and_then(|v| v.as_array()) {
                     let mut wts = Vec::new();
-                    let mut cur = String::new();
-                    let mut cur_start: Option<f64> = None;
-                    let mut last_offset: Option<f64> = None;
-                    for elem in l_arr {
-                        let ch = elem.get("c").and_then(|v| v.as_str()).unwrap_or("");
-                        let o = elem.get("o").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        if ch.trim().is_empty() {
-                            if !cur.is_empty() {
-                                let start = t + cur_start.unwrap_or(0.0);
-                                let mut end = t + o;
-                                // Guard: if end is not after start, fall back to the line end `te`.
-                                if end <= start {
-                                    end = te;
-                                }
-                                // Precompute graphemes and offsets for this assembled word
-                                let graphemes: Vec<String> = UnicodeSegmentation::graphemes(cur.as_str(), true)
-                                    .map(|g| g.to_string())
-                                    .collect();
-                                let mut offsets = Vec::with_capacity(graphemes.len());
-                                let mut acc = 0usize;
-                                for g in &graphemes {
-                                    offsets.push(acc);
-                                    acc += g.len();
-                                }
-                                wts.push(crate::lyrics::types::WordTiming { start, end, text: cur.clone(), graphemes, grapheme_byte_offsets: offsets });
-                                cur.clear();
-                                cur_start = None;
-                                last_offset = None;
-                            }
-                        } else {
-                            if cur.is_empty() {
-                                cur_start = Some(o);
-                            }
-                            cur.push_str(ch);
-                            last_offset = Some(o);
+                    for (i, elem) in l_arr.iter().enumerate() {
+                        let word_text = elem.get("c").and_then(|v| v.as_str()).unwrap_or("");
+                        if word_text.trim().is_empty() {
+                            continue; // Skip spaces
                         }
-                    }
-                    if !cur.is_empty() {
-                        let start = t + cur_start.unwrap_or(0.0);
-                        let mut end = t + last_offset.unwrap_or(te - t);
-                        if end <= start {
-                            end = te;
-                        }
-                        let graphemes: Vec<String> = UnicodeSegmentation::graphemes(cur.as_str(), true)
+
+                        let start_offset = elem.get("o").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let start = t + start_offset;
+
+                        // The end time is the start time of the next element, or the line's end time.
+                        let end = l_arr.get(i + 1)
+                            .and_then(|next_elem| next_elem.get("o").and_then(|v| v.as_f64()))
+                            .map(|end_offset| t + end_offset)
+                            .unwrap_or(te);
+
+                        // Ensure end is after start; if not, fall back to the line end `te`.
+                        let final_end = if end <= start { te } else { end };
+
+                        let graphemes: Vec<String> = UnicodeSegmentation::graphemes(word_text, true)
                             .map(|g| g.to_string())
                             .collect();
                         let mut offsets = Vec::with_capacity(graphemes.len());
@@ -145,7 +120,14 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<(Vec<LyricLine>, Strin
                             offsets.push(acc);
                             acc += g.len();
                         }
-                        wts.push(crate::lyrics::types::WordTiming { start, end, text: cur.clone(), graphemes, grapheme_byte_offsets: offsets });
+
+                        wts.push(crate::lyrics::types::WordTiming {
+                            start,
+                            end: final_end,
+                            text: word_text.to_string(),
+                            graphemes,
+                            grapheme_byte_offsets: offsets,
+                        });
                     }
                     if wts.is_empty() { None } else { Some(wts) }
                 } else {
