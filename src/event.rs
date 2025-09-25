@@ -150,11 +150,29 @@ pub async fn fetch_and_update_lyrics(
     state: &mut StateBundle,
     debug_log: bool,
     providers: &[String],
+    service: Option<&str>,
 ) -> f64 {
     // Fetch lyrics from configured providers first (may take network time).
     fetch_api_lyrics(meta, state, debug_log, providers).await;
 
-    let position = state.player_state.estimate_position();
+    // Try to get an up-to-date position from the MPRIS playback API when we
+    // have a service string. This ensures the internal timer anchor is set to
+    // the real playback position after lyrics are loaded into the UI. If the
+    // D-Bus call fails or no service is available, fall back to the state's
+    // estimated position.
+    let position = if let Some(svc) = service {
+        match crate::mpris::playback::get_position(svc).await {
+            Ok(p) => p,
+            Err(e) => {
+                if debug_log {
+                    eprintln!("[LyricsMPRIS] D-Bus error getting position after lyrics fetch: {}", e);
+                }
+                state.player_state.estimate_position()
+            }
+        }
+    } else {
+        state.player_state.estimate_position()
+    };
 
     state.update_index(position);
     state.player_state.set_position(position);
@@ -205,20 +223,44 @@ async fn handle_mpris_event(
         // Clear immediately and enqueue the full metadata for fetching lyrics
         state.clear_lyrics();
         *latest_meta = Some((meta, position, service));
-        let playing = playback_status == "Playing";
-        state.player_state.update_playback_dbus(playing, position);
+
+        // Some players don't report PlaybackStatus on metadata change. If we
+        // couldn't obtain a playback status (empty string) avoid forcing a
+        // pause by leaving the previous playing state intact and only update
+        // the reported position. When a real playback status update arrives
+        // we'll update the playing flag.
+        if playback_status.is_empty() {
+            state.player_state.set_position(position);
+        } else {
+            let playing = playback_status == "Playing";
+            state.player_state.update_playback_dbus(playing, position);
+        }
+
         // immediate UI clear
         send_update(state, update_tx, true).await;
         return;
     }
 
     let prev_playing = state.player_state.playing;
-    let playing = playback_status == "Playing";
-    state.player_state.update_playback_dbus(playing, position);
+
+    // If we couldn't fetch a playback status, don't modify the playing
+    // flag (avoid forcing a pause). Only update the position so the UI
+    // remains anchored correctly.
+    let playing_opt: Option<bool> = if playback_status.is_empty() {
+        None
+    } else {
+        Some(playback_status == "Playing")
+    };
+
+    if let Some(playing) = playing_opt {
+        state.player_state.update_playback_dbus(playing, position);
+    } else {
+        state.player_state.set_position(position);
+    }
 
     let changed_index = state.update_index(state.player_state.estimate_position());
 
-    if prev_playing != playing || (changed_index && !is_new_track) {
+    if prev_playing != state.player_state.playing || (changed_index && !is_new_track) {
         send_update(state, update_tx, false).await;
     }
 }
@@ -230,8 +272,11 @@ async fn handle_latest_meta_update(
     providers: &[String],
     update_tx: &mpsc::Sender<Update>,
 ) -> bool {
-    if let Some((meta, ..)) = latest_meta.take() {
-        let _position = fetch_and_update_lyrics(&meta, state, debug_log, providers).await;
+    if let Some((meta, _pos, service)) = latest_meta.take() {
+        // We stored (meta, pos, service) earlier; use the captured `service`
+        // string to query a fresh position from MPRIS after lyrics are
+        // fetched so the internal timer is anchored correctly.
+        let _position = fetch_and_update_lyrics(&meta, state, debug_log, providers, Some(&service)).await;
         send_update(state, update_tx, true).await;
         return true;
     }

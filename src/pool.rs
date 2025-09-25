@@ -74,6 +74,7 @@ pub async fn listen(
         &mut state,
         mpris_config_arc.debug_log,
         &providers,
+        service.as_deref(),
     )
     .await;
     state.player_state.set_position(position);

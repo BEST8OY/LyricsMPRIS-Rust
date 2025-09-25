@@ -43,7 +43,6 @@ fn normalize_string(s: &str) -> String {
 }
 
 fn get_ngrams(s: &str, size: usize) -> HashSet<String> {
-    let s = s;
     let chars: Vec<char> = s.chars().collect();
     let mut out = HashSet::new();
     if chars.len() < size || size == 0 {
@@ -144,7 +143,6 @@ fn normalize_artist_name(artist: &str) -> String {
                 .map(|p| p.trim().replace("the", "").replace("  ", " ").trim().to_string())
                 .collect::<Vec<String>>()
         })
-        .into_iter()
         .filter(|p| !p.is_empty())
         .collect();
     let mut sorted = parts.clone();
@@ -234,15 +232,13 @@ pub fn calculate_song_similarity(candidate: &Value, query_title: &str, query_art
         .or_else(|| attrs.get("album_name").and_then(|v| v.as_str()))
         .or_else(|| attrs.get("album_vanity_id").and_then(|v| v.as_str()));
 
-    let cand_duration = if let Some(d) = attrs.get("durationInMillis").and_then(|v| v.as_f64()) {
-        Some(d / 1000.0)
-    } else if let Some(d) = attrs.get("durationMs").and_then(|v| v.as_f64()) {
-        Some(d / 1000.0)
-    } else if let Some(d) = attrs.get("duration").and_then(|v| v.as_f64()) {
-        Some(if d > 1000.0 { d / 1000.0 } else { d })
-    } else if let Some(d) = attrs.get("track_length").and_then(|v| v.as_f64()) {
-        Some(d)
-    } else { None };
+    let cand_duration = attrs
+        .get("durationInMillis")
+        .and_then(|v| v.as_f64())
+        .map(|d| d / 1000.0)
+        .or_else(|| attrs.get("durationMs").and_then(|v| v.as_f64()).map(|d| d / 1000.0))
+        .or_else(|| attrs.get("duration").and_then(|v| v.as_f64()).map(|d| if d > 1000.0 { d / 1000.0 } else { d }))
+        .or_else(|| attrs.get("track_length").and_then(|v| v.as_f64()));
 
     let title_score = calculate_title_similarity(cand_title, query_title);
     let artist_score = calculate_artist_similarity(cand_artist, query_artist);

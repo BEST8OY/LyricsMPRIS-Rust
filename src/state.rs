@@ -79,15 +79,9 @@ impl PlayerState {
         // logic in one place and ensures we always use the monotonic clock.
         let mut estimated = self.timer.estimate(self.playing);
         // Clamp to track length if available.
-        if let Some(len) = self.length {
-            if estimated.is_finite() {
-                if estimated > len {
-                    estimated = len;
-                }
-                if estimated < 0.0 {
-                    estimated = 0.0;
-                }
-            }
+        if let Some(len) = self.length && estimated.is_finite() {
+            if estimated > len { estimated = len; }
+            if estimated < 0.0 { estimated = 0.0; }
         }
         estimated
     }
@@ -135,10 +129,8 @@ impl LyricState {
 
         // If position is before the first timestamp, return None so the UI
         // doesn't pre-highlight the first line.
-        if let Some(first) = self.lines.get(0) {
-            if position < first.time {
-                return None;
-            }
+        if let Some(first) = self.lines.first() && position < first.time {
+            return None;
         }
 
         // binary_search_by returns Ok(idx) when exact match found, or Err(insert)

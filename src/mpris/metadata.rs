@@ -49,13 +49,8 @@ pub fn extract_metadata(map: &dbus::arg::PropMap) -> TrackMetadata {
         .unwrap_or_default();
     let length = map.get("mpris:length").and_then(|v| {
         // DBus may provide the length as a signed or unsigned integer depending on the player.
-        if let Some(i) = v.0.as_i64() {
-            Some(i as f64 / 1_000_000.0)
-        } else if let Some(u) = v.0.as_u64() {
-            Some(u as f64 / 1_000_000.0)
-        } else {
-            None
-        }
+        v.0.as_i64().map(|i| i as f64 / 1_000_000.0)
+            .or_else(|| v.0.as_u64().map(|u| u as f64 / 1_000_000.0))
     });
     // Extract mpris:trackid which is often an object path like
     // "/com/spotify/track/<id>" for Spotify players. We normalize to just

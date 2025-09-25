@@ -218,7 +218,5 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
         }
     }
 
-
-
     Ok((Vec::new(), None))
 }
