@@ -16,6 +16,7 @@ use std::error::Error;
 pub fn draw_ui_with_cache<B: Backend>(
     terminal: &mut Terminal<B>,
     last_update: &Option<Update>,
+    wrapped_cache: &mut Option<(usize, Vec<Vec<String>>)>,
     cached_lines: &Option<Vec<String>>,
     styles: &LyricStyles,
     karaoke_enabled: bool,
@@ -36,7 +37,17 @@ pub fn draw_ui_with_cache<B: Backend>(
                         && !cached.is_empty()
                         && update.index < cached.len()
                     {
-                        gather_visible_lines(update, cached, w, h, styles, update.position, karaoke_enabled).into_vec()
+                        // Use cached wrapped blocks if available and matching width.
+                        let wrapped_blocks_ref: &Vec<Vec<String>> = match wrapped_cache {
+                            Some((cached_w, blocks)) if *cached_w == w && blocks.len() == cached.len() => blocks,
+                            _ => {
+                                let new_blocks: Vec<Vec<String>> = cached.iter().map(|l| wrap_text(l, w)).collect();
+                                *wrapped_cache = Some((w, new_blocks));
+                                // safe to unwrap now
+                                &wrapped_cache.as_ref().unwrap().1
+                            }
+                        };
+                        gather_visible_lines(update, wrapped_blocks_ref, w, h, styles, update.position, karaoke_enabled).into_vec()
                     } else {
                         Vec::new()
                     }
@@ -263,14 +274,13 @@ pub fn split_words_into_lines<'b>(
 /// Build VisibleLines from update/cached lines. Keeps logic minimal and focused for tests.
 pub fn gather_visible_lines<'a>(
     update: &Update,
-    cached: &[String],
+    wrapped_blocks: &[Vec<String>],
     w: usize,
     h: usize,
     styles: &'a LyricStyles,
     position: f64,
     karaoke_enabled: bool,
 ) -> VisibleLines<'a> {
-    let wrapped_blocks: Vec<Vec<String>> = cached.iter().map(|l| wrap_text(l, w)).collect();
     let current_block = &wrapped_blocks[update.index];
     let current_height = current_block.len();
 
@@ -353,18 +363,8 @@ pub fn gather_visible_lines<'a>(
     let lines_needed_before = context_lines / 2;
     let lines_needed_after = context_lines - lines_needed_before;
 
-    let before = collect_before_spans(
-        update.index,
-        &wrapped_blocks,
-        lines_needed_before,
-        styles.before,
-    );
-    let after = collect_after_spans(
-        update.index,
-        &wrapped_blocks,
-        lines_needed_after,
-        styles.after,
-    );
+    let before = collect_before_spans(update.index, wrapped_blocks, lines_needed_before, styles.before);
+    let after = collect_after_spans(update.index, wrapped_blocks, lines_needed_after, styles.after);
 
     VisibleLines {
         before,

@@ -3,6 +3,7 @@ mod lyrics;
 mod mpris;
 mod pool;
 mod state;
+mod timer;
 mod text_utils;
 mod ui;
 
@@ -74,7 +75,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cfg = Config::parse();
     let mut cfg = cfg;
     providers_from_env_if_empty(&mut cfg);
-    let poll_interval = Duration::from_millis(1000);
+    let poll_interval = Duration::from_millis(500);
 
     // Always start the UI, even if no song is playing yet
     // Try to get current metadata/position, but ignore errors and let UI handle waiting

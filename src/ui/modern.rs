@@ -14,12 +14,14 @@ use tokio::sync::mpsc;
 use std::thread;
 use tui::{Terminal, backend::CrosstermBackend};
 
-use crate::ui::modern_helpers::{estimate_update_and_next_sleep, draw_ui_with_cache};
+use crate::ui::modern_helpers::estimate_update_and_next_sleep;
 
 /// UI state for the modern TUI mode
 pub struct ModernUIState {
     pub last_update: Option<Update>,
     pub cached_lines: Option<Vec<String>>,
+    /// Cached wrapped blocks for the current terminal width: (width, wrapped_blocks)
+    pub wrapped_cache: Option<(usize, Vec<Vec<String>>)>,
     pub last_track_id: Option<(String, String, String)>,
     pub should_exit: bool,
     /// Instant when the last Update was received; used to estimate current position
@@ -33,6 +35,7 @@ impl ModernUIState {
         Self {
             last_update: None,
             cached_lines: None,
+            wrapped_cache: None,
             last_track_id: None,
             should_exit: false,
             last_update_instant: None,
@@ -120,7 +123,7 @@ pub async fn display_lyrics_modern(
                 // stored `state.last_update`. This ensures UI is redrawn to clear content
                 // (e.g. when cached_lines were cleared) even if no estimate exists.
                 let draw_arg = if let Some(tmp) = maybe_tmp.clone() { Some(tmp) } else { state.last_update.clone() };
-                let _ = draw_ui_with_cache(&mut terminal, &draw_arg, &state.cached_lines, &styles, state.karaoke_enabled);
+                let _ = crate::ui::modern_helpers::draw_ui_with_cache(&mut terminal, &draw_arg, &mut state.wrapped_cache, &state.cached_lines, &styles, state.karaoke_enabled);
                 next_word_sleep = next;
             }
 
@@ -131,7 +134,7 @@ pub async fn display_lyrics_modern(
                     // user-driven state changes (toggle karaoke, etc) may change scheduling
                     let (maybe_tmp, next) = estimate_update_and_next_sleep(&state.last_update, state.last_update_instant, state.karaoke_enabled);
                     let draw_arg = if let Some(tmp) = maybe_tmp.clone() { Some(tmp) } else { state.last_update.clone() };
-                    let _ = draw_ui_with_cache(&mut terminal, &draw_arg, &state.cached_lines, &styles, state.karaoke_enabled);
+                    let _ = crate::ui::modern_helpers::draw_ui_with_cache(&mut terminal, &draw_arg, &mut state.wrapped_cache, &state.cached_lines, &styles, state.karaoke_enabled);
                     next_word_sleep = next;
                 } else {
                     // channel closed -> exit
@@ -150,7 +153,7 @@ pub async fn display_lyrics_modern(
                 // timer fired: redraw using estimated position and reschedule next boundary
                 let (maybe_tmp, next) = estimate_update_and_next_sleep(&state.last_update, state.last_update_instant, state.karaoke_enabled);
                 let draw_arg = if let Some(tmp) = maybe_tmp.clone() { Some(tmp) } else { state.last_update.clone() };
-                let _ = draw_ui_with_cache(&mut terminal, &draw_arg, &state.cached_lines, &styles, state.karaoke_enabled);
+                let _ = crate::ui::modern_helpers::draw_ui_with_cache(&mut terminal, &draw_arg, &mut state.wrapped_cache, &state.cached_lines, &styles, state.karaoke_enabled);
                 next_word_sleep = next;
             }
         }

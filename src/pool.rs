@@ -9,7 +9,7 @@ use crate::event::{self, Event, MprisEvent, process_event, send_update};
 use std::time::Duration;
 use crate::mpris::TrackMetadata;
 use crate::mpris::events::MprisEventHandler;
-use crate::state::{StateBundle, Update};
+use crate::state::Update;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -23,10 +23,11 @@ pub async fn listen(
     let providers: Vec<String> = if mpris_config.providers.is_empty() {
         vec!["lrclib".to_string(), "musixmatch".to_string()]
     } else {
-        mpris_config.providers.clone()
+        // Take ownership of the configured list to avoid an extra clone later.
+        std::mem::take(&mut mpris_config.providers)
     };
 
-    let mut state = StateBundle::new();
+    let mut state = crate::state::StateBundle::new();
     let (event_tx, mut event_rx) = mpsc::channel(8);
     let mut latest_meta: Option<(TrackMetadata, f64, String)> = None;
 
@@ -53,6 +54,7 @@ pub async fn listen(
 
     // Initial metadata fetch only when a service is present. This avoids calling
     // metadata APIs with empty service strings.
+    // Fetch initial metadata only when we have a service.
     let meta = if let Some(ref svc) = service {
         match crate::mpris::metadata::get_metadata(svc).await {
             Ok(m) => m,
@@ -74,27 +76,30 @@ pub async fn listen(
         &providers,
     )
     .await;
-    state.player_state.position = position;
+    state.player_state.set_position(position);
 
     // Track previous playing state for bookkeeping; initialize from state.
     let mut was_playing = state.player_state.playing;
 
-    // Spawn MPRIS watcher. If creation fails, log and continue (we'll still poll).
+    // Spawn MPRIS watcher. If creation fails we log and continue; polling still
+    // runs so the app works even without event notifications.
     {
-        let event_tx_update = event_tx.clone();
-        let event_tx_seek = event_tx.clone();
+        let tx_update = event_tx.clone();
+        let tx_seek = event_tx.clone();
         let block_list = mpris_config_arc.block.clone();
         let debug = mpris_config_arc.debug_log;
+
         tokio::spawn(async move {
             match MprisEventHandler::new(
                 move |meta, pos, service| {
-                    let _ = event_tx_update.try_send(Event::Mpris(MprisEvent::PlayerUpdate(meta, pos, service)));
+                    let _ = tx_update.try_send(Event::Mpris(MprisEvent::PlayerUpdate(meta, pos, service)));
                 },
                 move |meta, pos, service| {
-                    let _ = event_tx_seek.try_send(Event::Mpris(MprisEvent::Seeked(meta, pos, service)));
+                    let _ = tx_seek.try_send(Event::Mpris(MprisEvent::Seeked(meta, pos, service)));
                 },
                 block_list,
-            ).await {
+            ).await
+            {
                 Ok(mut handler) => {
                     let _ = handler.handle_events().await;
                 }
@@ -110,10 +115,13 @@ pub async fn listen(
     // Main loop: handle shutdown, incoming events, and timed polls.
     loop {
         tokio::select! {
+            // Shutdown requested: flush a final update and exit.
             _ = shutdown_rx.recv() => {
                 process_event(Event::Shutdown, &mut state, &update_tx, &mut latest_meta).await;
                 break;
             }
+
+            // Incoming MPRIS event from the watcher.
             maybe_event = event_rx.recv() => {
                 if let Some(event) = maybe_event {
                     let prev_playing = was_playing;
@@ -124,9 +132,9 @@ pub async fn listen(
                     }
                 }
             }
+
+            // Periodic poll: keep position/lyrics in sync even without events.
             _ = tokio::time::sleep(poll_interval) => {
-                // Always run poll handler; it internally decides if anything
-                // needs to be done (fetch lyrics, sync position, send updates).
                 event::handle_poll(
                     &mut state,
                     &update_tx,
