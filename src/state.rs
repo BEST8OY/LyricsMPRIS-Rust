@@ -1,22 +1,25 @@
-// Minimal state data structures for lyrics and player
+// State module: compact, safe, and well-documented structures that represent
+// the current lyrics and player state used by the UI and other components.
 
 use crate::lyrics::LyricLine;
 use crate::mpris::TrackMetadata;
-use std::sync::Arc;
+use crate::timer::{sanitize_position, PlaybackTimer};
 use std::cmp::Ordering;
-use crate::timer::{PlaybackTimer, sanitize_position};
+use std::sync::Arc;
 
-/// Which provider supplied the current lyrics.
-#[derive(Debug, Clone, PartialEq)]
+/// Provider that supplied the currently loaded lyrics.
+/// Kept small and stable so other modules can match on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Provider {
     Lrclib,
     MusixmatchRichsync,
     MusixmatchSubtitles,
-    
 }
 
-/// Update sent to the UI: a snapshot of lyrics, player position and metadata.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// Snapshot passed to the UI layer. This is an immutable view of the
+/// important pieces of state: the lines, the currently highlighted index,
+/// the estimated playback position and some metadata.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Update {
     pub lines: Arc<Vec<LyricLine>>,
     pub index: Option<usize>,
@@ -27,30 +30,29 @@ pub struct Update {
     pub artist: String,
     pub title: String,
     pub album: String,
-    /// Provider that supplied the current lyrics.
     pub provider: Option<Provider>,
 }
 
+/// Current state of the audio player. The struct keeps a high-precision
+/// internal `PlaybackTimer` to estimate the current position when playing.
 #[derive(Debug, PartialEq, Default)]
 pub struct PlayerState {
     pub title: String,
     pub artist: String,
     pub album: String,
     pub playing: bool,
-    /// Last emitted/stored position in seconds. Consumers still read/write this
-    /// field directly in a few places so we keep it for backward compatibility.
+    /// Last stored anchor position (seconds). Some call sites still read this
+    /// directly so we keep it for compatibility.
     pub position: f64,
     pub err: Option<String>,
-    /// Internal high-precision timer to track position while playing. This
-    /// uses `Instant` (monotonic clock) and isolates timing concerns so the
-    /// rest of the codebase can use simple seconds (`f64`). The timer is
-    /// intentionally lightweight and deterministic.
+    /// Internal monotonic timer used to estimate position while playing.
     timer: PlaybackTimer,
-    /// Known track length in seconds (used to clamp estimates).
+    /// Known track length in seconds, used to clamp estimated positions.
     pub length: Option<f64>,
 }
 
 impl PlayerState {
+    /// Apply new track metadata and reset position/timer to start.
     pub fn update_from_metadata(&mut self, meta: &TrackMetadata) {
         self.title = meta.title.clone();
         self.artist = meta.artist.clone();
@@ -58,55 +60,76 @@ impl PlayerState {
         self.length = meta.length;
         self.position = 0.0;
         self.err = None;
-        // Reset the internal timer to the start of the track.
         self.timer.reset(0.0);
     }
+
+    /// Update playback state coming from DBus (or another external source).
+    /// This sets the anchor position and adjusts the playing flag/timer
+    /// consistently.
     pub fn update_playback_dbus(&mut self, playing: bool, position: f64) {
-        // Normalize incoming position and update timer anchor.
         let pos = sanitize_position(position);
         self.timer.set_position(pos);
         self.position = pos;
-        // Use the convenience helpers so the playing flag and timer state
-        // remain consistent and centralized.
         if playing {
             self.start_playing();
         } else {
             self.pause();
         }
     }
+
+    /// Estimate the current playback position in seconds using the internal
+    /// timer. The returned value is clamped to [0, length] when length is
+    /// known and finite.
     pub fn estimate_position(&self) -> f64 {
-        // Use the internal timer to produce an estimate. This keeps timing
-        // logic in one place and ensures we always use the monotonic clock.
         let mut estimated = self.timer.estimate(self.playing);
-        // Clamp to track length if available.
-        if let Some(len) = self.length && estimated.is_finite() {
-            if estimated > len { estimated = len; }
-            if estimated < 0.0 { estimated = 0.0; }
+        if estimated.is_nan() {
+            // Keep a deterministic, finite fallback.
+            estimated = self.position;
+        }
+        if let Some(len) = self.length {
+            if estimated.is_finite() {
+                if estimated > len {
+                    estimated = len;
+                }
+                if estimated < 0.0 {
+                    estimated = 0.0;
+                }
+            }
         }
         estimated
     }
+
+    /// Returns true when the provided `meta` differs from the stored
+    /// title/artist/album. Used to detect track changes.
     pub fn has_changed(&self, meta: &TrackMetadata) -> bool {
         self.title != meta.title || self.artist != meta.artist || self.album != meta.album
     }
-    /// Set a new anchor position without changing playback state.
+
+    /// Set a new anchor position without changing whether the player is
+    /// considered playing. The timer anchor and the stored `position` are
+    /// updated together.
     pub fn set_position(&mut self, position: f64) {
         let pos = sanitize_position(position);
         self.timer.set_position(pos);
         self.position = pos;
     }
-    /// Start playback (does not modify anchor position).
+
+    /// Mark the player as playing. This flips the internal timer into the
+    /// running state.
     pub fn start_playing(&mut self) {
         self.playing = true;
         self.timer.mark_playing();
     }
 
-    /// Pause playback (does not modify anchor position).
+    /// Mark the player as paused. Timer is paused but the anchor position
+    /// remains unchanged.
     pub fn pause(&mut self) {
         self.playing = false;
         self.timer.mark_paused();
     }
 }
 
+/// Holds the list of lyric lines and the currently highlighted index.
 #[derive(Debug, Default)]
 pub struct LyricState {
     pub lines: Arc<Vec<LyricLine>>,
@@ -114,28 +137,29 @@ pub struct LyricState {
 }
 
 impl LyricState {
-    /// Compute the current lyric index for a given playback `position`.
-    /// Returns `None` when no line should be considered active yet (e.g.
-    /// position is before the first timestamp or there are no valid lines).
+    /// Compute the index for `position`. Returns `None` when no line should
+    /// be active (no lines, position before first timestamp, or NaNs).
     pub fn get_index(&self, position: f64) -> Option<usize> {
-        // No lines -> no index
         if self.lines.is_empty() {
             return None;
         }
-
-        if position.is_nan() || self.lines.iter().any(|line| line.time.is_nan()) {
+        if position.is_nan() {
+            return None;
+        }
+        // If any line has NaN time treat the whole set as invalid.
+        if self.lines.iter().any(|l| l.time.is_nan()) {
             return None;
         }
 
-        // If position is before the first timestamp, return None so the UI
-        // doesn't pre-highlight the first line.
-        if let Some(first) = self.lines.first() && position < first.time {
-            return None;
+        // If position is before the first timestamp, don't highlight anything.
+        if let Some(first) = self.lines.first() {
+            if position < first.time {
+                return None;
+            }
         }
 
-        // binary_search_by returns Ok(idx) when exact match found, or Err(insert)
-        // where the correct index is insert - 1 (unless insert == 0, which we
-        // already handled by the early-return above).
+        // binary_search_by returns Ok(idx) when exact match, or Err(insert).
+        // When Err(insert) we want the previous line index (insert - 1).
         match self.lines.binary_search_by(|line| {
             line.time
                 .partial_cmp(&position)
@@ -143,14 +167,15 @@ impl LyricState {
         }) {
             Ok(idx) => Some(idx),
             Err(0) => None,
-            Err(idx) => Some(idx - 1),
+            Err(insert) => Some(insert - 1),
         }
     }
+
+    /// Replace the current lines with a sanitized, sorted list. Removes lines
+    /// with NaN times and clamps negative times to 0.0. The current index is
+    /// cleared because the position may no longer correspond to the same
+    /// line set.
     pub fn update_lines(&mut self, lines: Vec<LyricLine>) {
-        // Sanitize incoming lines to ensure they are safe for binary search
-        // and UI rendering. This enforces a non-decreasing time order, removes
-        // NaN times and clamps negative times to 0.0. Keeping this logic in
-        // the central state ensures all providers don't need to duplicate it.
         let mut sanitized: Vec<LyricLine> = lines
             .into_iter()
             .filter_map(|mut l| {
@@ -164,63 +189,66 @@ impl LyricState {
             })
             .collect();
 
-        // Sort by time to satisfy binary_search expectations. Use partial_cmp
-        // and treat incomparable values as equal (they've already been filtered).
-        sanitized.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
+        sanitized.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(Ordering::Equal));
 
-        // Clear the current index: we don't assume the first line should be
-        // active until playback position reaches its timestamp.
-        self.index = None;
         self.lines = Arc::new(sanitized);
+        self.index = None;
     }
+
+    /// Update the stored index; returns true when it actually changed.
     pub fn update_index(&mut self, new_index: Option<usize>) -> bool {
-        // Update the stored index (Option semantics). Returns true when changed.
-        let changed = new_index != self.index;
-        if changed {
+        if self.index != new_index {
             self.index = new_index;
+            true
+        } else {
+            false
         }
-        changed
     }
 }
 
+/// Bundle holding both lyric and player state plus a monotonically
+/// incrementing `version` used to indicate changes to observers.
 #[derive(Debug, Default)]
 pub struct StateBundle {
     pub lyric_state: LyricState,
     pub player_state: PlayerState,
     pub version: u64,
-    /// Provider that supplied current lyrics
     pub provider: Option<Provider>,
 }
 
 impl StateBundle {
-    /// Create a new default `StateBundle`.
+    /// Convenience constructor.
     pub fn new() -> Self {
         Default::default()
     }
 
-    /// Remove current lyrics and bump the state version. Also clears the
-    /// associated provider to avoid stale values being exposed.
+    /// Clear loaded lyrics and bump `version`. Also clears the provider so
+    /// callers don't observe stale provider info.
     pub fn clear_lyrics(&mut self) {
         self.lyric_state.update_lines(Vec::new());
-        // `update_lines` resets index to 0 already.
         self.version = self.version.wrapping_add(1);
         self.provider = None;
     }
+
+    /// Load new lyrics and associated metadata. This sets the player's
+    /// metadata (resetting timer/position), stores an optional error, sets
+    /// the provider, and advances the version.
     pub fn update_lyrics(
-    &mut self,
-    lines: Vec<LyricLine>,
-    meta: &TrackMetadata,
-    err: Option<String>,
-    provider: Option<Provider>,
+        &mut self,
+        lines: Vec<LyricLine>,
+        meta: &TrackMetadata,
+        err: Option<String>,
+        provider: Option<Provider>,
     ) {
         self.lyric_state.update_lines(lines);
         self.player_state.err = err;
         self.player_state.update_from_metadata(meta);
-        // Bump version to indicate a state change.
-        self.version = self.version.wrapping_add(1);
-        // Store provider so callers can know which provider supplied the current lyrics
         self.provider = provider;
+        self.version = self.version.wrapping_add(1);
     }
+
+    /// Recompute the lyric index for `position`. If the index changes the
+    /// bundle `version` is bumped and `true` is returned.
     pub fn update_index(&mut self, position: f64) -> bool {
         let new_index = self.lyric_state.get_index(position);
         let changed = self.lyric_state.update_index(new_index);
