@@ -19,7 +19,7 @@ pub enum Provider {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Update {
     pub lines: Arc<Vec<LyricLine>>,
-    pub index: usize,
+    pub index: Option<usize>,
     pub position: f64,
     pub err: Option<String>,
     pub version: u64,
@@ -116,36 +116,73 @@ impl PlayerState {
 #[derive(Debug, Default)]
 pub struct LyricState {
     pub lines: Arc<Vec<LyricLine>>,
-    pub index: usize,
+    pub index: Option<usize>,
 }
 
 impl LyricState {
-    pub fn get_index(&self, position: f64) -> usize {
-        // Fast-path for trivial cases.
-        if self.lines.len() <= 1 {
-            return 0;
+    /// Compute the current lyric index for a given playback `position`.
+    /// Returns `None` when no line should be considered active yet (e.g.
+    /// position is before the first timestamp or there are no valid lines).
+    pub fn get_index(&self, position: f64) -> Option<usize> {
+        // No lines -> no index
+        if self.lines.is_empty() {
+            return None;
         }
+
         if position.is_nan() || self.lines.iter().any(|line| line.time.is_nan()) {
-            return 0;
+            return None;
+        }
+
+        // If position is before the first timestamp, return None so the UI
+        // doesn't pre-highlight the first line.
+        if let Some(first) = self.lines.get(0) {
+            if position < first.time {
+                return None;
+            }
         }
 
         // binary_search_by returns Ok(idx) when exact match found, or Err(insert)
-        // where the correct index is insert - 1 (unless insert == 0).
+        // where the correct index is insert - 1 (unless insert == 0, which we
+        // already handled by the early-return above).
         match self.lines.binary_search_by(|line| {
             line.time
                 .partial_cmp(&position)
                 .unwrap_or(Ordering::Less)
         }) {
-            Ok(idx) => idx,
-            Err(0) => 0,
-            Err(idx) => idx - 1,
+            Ok(idx) => Some(idx),
+            Err(0) => None,
+            Err(idx) => Some(idx - 1),
         }
     }
     pub fn update_lines(&mut self, lines: Vec<LyricLine>) {
-        self.index = 0;
-        self.lines = Arc::new(lines);
+        // Sanitize incoming lines to ensure they are safe for binary search
+        // and UI rendering. This enforces a non-decreasing time order, removes
+        // NaN times and clamps negative times to 0.0. Keeping this logic in
+        // the central state ensures all providers don't need to duplicate it.
+        let mut sanitized: Vec<LyricLine> = lines
+            .into_iter()
+            .filter_map(|mut l| {
+                if l.time.is_nan() {
+                    return None;
+                }
+                if l.time < 0.0 {
+                    l.time = 0.0;
+                }
+                Some(l)
+            })
+            .collect();
+
+        // Sort by time to satisfy binary_search expectations. Use partial_cmp
+        // and treat incomparable values as equal (they've already been filtered).
+        sanitized.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Clear the current index: we don't assume the first line should be
+        // active until playback position reaches its timestamp.
+        self.index = None;
+        self.lines = Arc::new(sanitized);
     }
-    pub fn update_index(&mut self, new_index: usize) -> bool {
+    pub fn update_index(&mut self, new_index: Option<usize>) -> bool {
+        // Update the stored index (Option semantics). Returns true when changed.
         let changed = new_index != self.index;
         if changed {
             self.index = new_index;

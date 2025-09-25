@@ -35,7 +35,10 @@ pub fn draw_ui_with_cache<B: Backend>(
                             .collect()
                     } else if let Some(cached) = cached_lines
                         && !cached.is_empty()
-                        && update.index < cached.len()
+                        // Allow rendering cached lines even when `update.index` is None
+                        // (i.e. before the first timestamp). When `index` is None we
+                        // still want to show the lyrics but without highlighting.
+                        && update.index.map(|i| i < cached.len()).unwrap_or(true)
                     {
                         // Use cached wrapped blocks if available and matching width.
                         let wrapped_blocks_ref: &Vec<Vec<String>> = match wrapped_cache {
@@ -47,6 +50,10 @@ pub fn draw_ui_with_cache<B: Backend>(
                                 &wrapped_cache.as_ref().unwrap().1
                             }
                         };
+                        // gather_visible_lines will look at `update.index` itself and
+                        // handle the None case by rendering the block without an
+                        // active highlight. It's safe to call here even when
+                        // `update.index` is None.
                         gather_visible_lines(update, wrapped_blocks_ref, w, h, styles, update.position, karaoke_enabled).into_vec()
                     } else {
                         Vec::new()
@@ -81,13 +88,14 @@ pub fn draw_ui_with_cache<B: Backend>(
 pub fn compute_next_word_sleep_from_update(
     upd: &Update,
 ) -> Option<Pin<Box<Sleep>>> {
-    if !upd.playing || !matches!(upd.provider, Some(crate::state::Provider::MusixmatchRichsync)) {
+    // No per-word scheduling when not playing, not richsync, or index is None
+    if !upd.playing || !matches!(upd.provider, Some(crate::state::Provider::MusixmatchRichsync)) || upd.index.is_none() {
         return None;
     }
     let pos = upd.position;
     let mut next_dur: Option<f64> = None;
     // scan current and subsequent lines for next word start or end > pos
-    for i in upd.index..upd.lines.len() {
+    for i in upd.index.unwrap()..upd.lines.len() {
         if let Some(line) = upd.lines.get(i) && let Some(words) = &line.words {
             for w in words.iter() {
                 // Word start
@@ -147,19 +155,25 @@ pub fn estimate_update_and_next_sleep(
         // Estimate the current line index locally from the estimated position so the UI
         // can advance lines (and not wait for backend updates) when richsync moves fast.
         // Mirrors the binary-search behavior in `state::LyricState::get_index`.
+        // Compute an Option<usize> index; None if position is before first time
         if tmp.lines.len() <= 1 || tmp.position.is_nan() || tmp.lines.iter().any(|line| line.time.is_nan()) {
-            tmp.index = 0;
+            tmp.index = None;
         } else {
-            tmp.index = match tmp
-                .lines
-                .binary_search_by(|line| match line.time.partial_cmp(&tmp.position) {
-                    Some(ord) => ord,
-                    _ => std::cmp::Ordering::Less,
-                }) {
-                Ok(idx) => idx,
-                Err(0) => 0,
-                Err(idx) => idx - 1,
-            };
+            // If position before first timestamp -> None
+            if tmp.position < tmp.lines[0].time {
+                tmp.index = None;
+            } else {
+                tmp.index = match tmp
+                    .lines
+                    .binary_search_by(|line| match line.time.partial_cmp(&tmp.position) {
+                        Some(ord) => ord,
+                        _ => std::cmp::Ordering::Less,
+                    }) {
+                    Ok(idx) => Some(idx),
+                    Err(0) => None,
+                    Err(idx) => Some(idx - 1),
+                };
+            }
         }
         let next = if karaoke_enabled {
             compute_next_word_sleep_from_update(&tmp)
@@ -281,14 +295,19 @@ pub fn gather_visible_lines<'a>(
     position: f64,
     karaoke_enabled: bool,
 ) -> VisibleLines<'a> {
-    let current_block = &wrapped_blocks[update.index];
+    // Use the provided index when available; fall back to 0 for context
+    // computation. If index is None we intentionally render no "current"
+    // lines so the UI doesn't pre-highlight the first lyric before its time.
+    let idx_for_context = update.index.unwrap_or(0);
+    let current_block = &wrapped_blocks[idx_for_context];
     let current_height = current_block.len();
 
     let mut current = Vec::new();
 
-    if let Some(ly) = update.lines.get(update.index)
-        && karaoke_enabled && matches!(update.provider, Some(crate::state::Provider::MusixmatchRichsync))
-            && let Some(words) = &ly.words {
+    if let Some(idx) = update.index {
+        if let Some(ly) = update.lines.get(idx)
+            && karaoke_enabled && matches!(update.provider, Some(crate::state::Provider::MusixmatchRichsync))
+                && let Some(words) = &ly.words {
                 let word_lines = split_words_into_lines(words, w);
                 for wl in word_lines.iter() {
                     let mut spans = Vec::new();
@@ -345,9 +364,17 @@ pub fn gather_visible_lines<'a>(
                 }
             }
 
+        }
+
     if current.is_empty() {
+        // If index was None we want to avoid treating the first block as
+        // actively highlighted; render using `styles.current` only when an
+        // explicit index exists. Otherwise render in `styles.after` so no
+        // highlight appears. We check update.index.is_some() to decide.
+        let use_current_style = update.index.is_some();
         for line in current_block.iter() {
-            current.push(Spans::from(tui::text::Span::styled(line.clone(), styles.current)));
+            let style = if use_current_style { styles.current } else { styles.after };
+            current.push(Spans::from(tui::text::Span::styled(line.clone(), style)));
         }
     }
 
@@ -363,8 +390,8 @@ pub fn gather_visible_lines<'a>(
     let lines_needed_before = context_lines / 2;
     let lines_needed_after = context_lines - lines_needed_before;
 
-    let before = collect_before_spans(update.index, wrapped_blocks, lines_needed_before, styles.before);
-    let after = collect_after_spans(update.index, wrapped_blocks, lines_needed_after, styles.after);
+    let before = collect_before_spans(idx_for_context, wrapped_blocks, lines_needed_before, styles.before);
+    let after = collect_after_spans(idx_for_context, wrapped_blocks, lines_needed_after, styles.after);
 
     VisibleLines {
         before,

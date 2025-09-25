@@ -16,7 +16,7 @@ pub async fn display_lyrics_pipe(
     // State for track transitions and lyric printing
     let mut last_track_id: Option<(String, String, String)> = None;
     let mut last_track_had_lyric = false;
-    let mut last_line_idx = None;
+    let mut last_line_idx: Option<usize> = None;
 
     while let Some(upd) = rx.recv().await {
         let track_id = crate::ui::track_id(&upd);
@@ -32,21 +32,25 @@ pub async fn display_lyrics_pipe(
             last_line_idx = None;
             last_track_had_lyric = false;
             if has_lyrics {
-                if let Some(line) = upd.lines.get(upd.index) {
-                    println!("{}", line.text);
-                    last_track_had_lyric = true;
+                if let Some(idx) = upd.index {
+                    if let Some(line) = upd.lines.get(idx) {
+                        println!("{}", line.text);
+                        last_track_had_lyric = true;
+                    }
+                    last_line_idx = Some(idx);
                 }
-                last_line_idx = Some(upd.index);
             }
             continue;
         }
 
-        if has_lyrics && Some(upd.index) != last_line_idx {
-            if let Some(line) = upd.lines.get(upd.index) {
-                println!("{}", line.text);
-                last_track_had_lyric = true;
+        if has_lyrics && upd.index != last_line_idx {
+            if let Some(idx) = upd.index {
+                if let Some(line) = upd.lines.get(idx) {
+                    println!("{}", line.text);
+                    last_track_had_lyric = true;
+                }
             }
-            last_line_idx = Some(upd.index);
+            last_line_idx = upd.index;
         }
     }
     Ok(())
