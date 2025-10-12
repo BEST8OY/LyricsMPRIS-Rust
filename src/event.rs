@@ -3,160 +3,216 @@ use crate::state::{Provider, StateBundle, Update};
 use tokio::sync::mpsc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Events coming from MPRIS (player updates or seeks).
+// ============================================================================
+// Event Types
+// ============================================================================
+
+/// Events originating from MPRIS player interface
 #[derive(Debug)]
 pub enum MprisEvent {
+    /// Full player state update with metadata, position, and service name
     PlayerUpdate(TrackMetadata, f64, String),
+    /// Seek event when user scrubs through track
     Seeked(TrackMetadata, f64, String),
 }
 
-/// Top-level events the event loop handles.
+/// Top-level events processed by the main event loop
 #[derive(Debug)]
 pub enum Event {
     Mpris(MprisEvent),
     Shutdown,
 }
 
-// Track last sent (version << 1 | playing_bit). Avoid redundant UI updates.
+// ============================================================================
+// Update Tracking
+// ============================================================================
+
+/// Tracks the last sent state to avoid redundant UI updates.
+/// Format: (version << 1) | playing_bit
 static LAST_SENT_VERSION: AtomicU64 = AtomicU64::new(0);
 
-/// Build and send an Update to the UI channel when appropriate.
+/// Computes a unique key for the current state
+fn compute_state_key(version: u64, playing: bool) -> u64 {
+    let playing_bit = if playing { 1 } else { 0 };
+    (version << 1) | playing_bit
+}
+
+/// Checks if the state has changed since the last update
+fn has_state_changed(version: u64, playing: bool) -> bool {
+    let current_key = compute_state_key(version, playing);
+    let last_key = LAST_SENT_VERSION.load(Ordering::Relaxed);
+    current_key != last_key
+}
+
+/// Marks the current state as sent
+fn mark_state_sent(version: u64, playing: bool) {
+    let key = compute_state_key(version, playing);
+    LAST_SENT_VERSION.store(key, Ordering::Relaxed);
+}
+
+// ============================================================================
+// Update Sending
+// ============================================================================
+
+/// Determines if an update should be sent to the UI
+fn should_send_update(state: &StateBundle, force: bool) -> bool {
+    if force {
+        return true;
+    }
+    
+    if !has_state_changed(state.version, state.player_state.playing) {
+        return false;
+    }
+    
+    // Send update if there's meaningful content
+    !state.lyric_state.lines.is_empty() || state.player_state.err.is_some()
+}
+
+/// Builds an Update message from current state.
+/// Uses `StateBundle::create_update` to build Update snapshots (keeps
+/// the logic colocated with the state container).
 ///
-/// This mirrors the previous behavior: avoid allocating when nothing to
-/// send, optionally force, and update the LAST_SENT_VERSION on success.
+/// Sends an update to the UI channel when appropriate.
 pub async fn send_update(state: &StateBundle, update_tx: &mpsc::Sender<Update>, force: bool) {
-    let version = state.version;
-    let playing_bit: u64 = if state.player_state.playing { 1 } else { 0 };
-    let key = (version << 1) | playing_bit;
-
-    // Fast early-out if unchanged and not forced.
-    let last = LAST_SENT_VERSION.load(Ordering::Relaxed);
-    if !force && last == key {
+    if !should_send_update(state, force) {
         return;
     }
 
-    // Decide whether there's anything worth sending.
-    let should_send = force
-        || !state.lyric_state.lines.is_empty()
-        || state.player_state.err.is_some();
-
-    if !should_send {
-        return;
-    }
-
-    // If player is playing, use backend's estimate so UI has up-to-date position
-    let position = if state.player_state.playing {
-        state.player_state.estimate_position()
-    } else {
-        state.player_state.position
-    };
-
-    let update = Update {
-        lines: state.lyric_state.lines.clone(),
-        index: state.lyric_state.index,
-        position,
-        err: state.player_state.err.as_ref().map(|e| e.to_string()),
-        version,
-        playing: state.player_state.playing,
-        artist: state.player_state.artist.clone(),
-        title: state.player_state.title.clone(),
-        album: state.player_state.album.clone(),
-        provider: state.provider.clone(),
-    };
-
+    let update = state.create_update();
+    
     if update_tx.send(update).await.is_ok() {
-        LAST_SENT_VERSION.store(key, Ordering::Relaxed);
+        mark_state_sent(state.version, state.player_state.playing);
     }
 }
 
-// Internal helper: try each provider in order and update the state when
-// lyrics are found. Non-transient errors (non-network) set empty lyrics and
-// stop trying further providers.
+// ============================================================================
+// Lyrics Fetching
+// ============================================================================
+
+/// Result of a lyrics fetch attempt
+enum FetchResult {
+    Success,
+    Transient,
+    NonTransient(crate::lyrics::LyricsError),
+}
+
+/// Attempts to fetch lyrics from a single provider
+async fn try_provider(
+    provider: &str,
+    meta: &TrackMetadata,
+    state: &mut StateBundle,
+) -> FetchResult {
+    match provider {
+        "lrclib" => try_lrclib(meta, state).await,
+        "musixmatch" => try_musixmatch(meta, state).await,
+        _ => FetchResult::Transient, // Unknown providers are skipped
+    }
+}
+
+/// Fetches lyrics from LRCLib
+async fn try_lrclib(meta: &TrackMetadata, state: &mut StateBundle) -> FetchResult {
+    match crate::lyrics::fetch_lyrics_from_lrclib(
+        &meta.artist,
+        &meta.title,
+        &meta.album,
+        meta.length,
+    )
+    .await
+    {
+        Ok((lines, _raw)) if !lines.is_empty() => {
+            state.update_lyrics(lines, meta, None, Some(Provider::Lrclib));
+            FetchResult::Success
+        }
+        Ok(_) => FetchResult::Transient,
+        Err(crate::lyrics::LyricsError::Network(_)) => FetchResult::Transient,
+        Err(e) => FetchResult::NonTransient(e),
+    }
+}
+
+/// Fetches lyrics from Musixmatch
+async fn try_musixmatch(meta: &TrackMetadata, state: &mut StateBundle) -> FetchResult {
+    match crate::lyrics::fetch_lyrics_from_musixmatch_usertoken(
+        &meta.artist,
+        &meta.title,
+        &meta.album,
+        meta.length,
+        meta.spotify_id.as_deref(),
+    )
+    .await
+    {
+        Ok((lines, raw)) if !lines.is_empty() => {
+            let provider = determine_musixmatch_provider(&lines, &raw);
+            state.update_lyrics(lines, meta, None, Some(provider));
+            FetchResult::Success
+        }
+        Ok(_) => FetchResult::Transient,
+        Err(crate::lyrics::LyricsError::Network(_)) => FetchResult::Transient,
+        Err(e) => FetchResult::NonTransient(e),
+    }
+}
+
+/// Determines which Musixmatch format was returned
+fn determine_musixmatch_provider(lines: &[crate::lyrics::LyricLine], raw: &Option<String>) -> Provider {
+    let has_words = lines.iter().any(|l| l.words.is_some());
+    let is_richsync = raw
+        .as_ref()
+        .map(|r| r.starts_with(";;richsync=1"))
+        .unwrap_or(false);
+
+    if has_words || is_richsync {
+        Provider::MusixmatchRichsync
+    } else {
+        Provider::MusixmatchSubtitles
+    }
+}
+
+/// Fetches lyrics from all configured providers
 async fn fetch_api_lyrics(
     meta: &TrackMetadata,
     state: &mut StateBundle,
     debug_log: bool,
     providers: &[String],
 ) {
-    let mut handle_non_transient_error = |err: crate::lyrics::LyricsError| {
-        if debug_log {
-            eprintln!("[LyricsMPRIS] provider error: {}", err);
-        }
-        state.update_lyrics(Vec::new(), meta, Some(err.to_string()), None);
-    };
-
-    for prov in providers.iter() {
-        match prov.as_str() {
-            "lrclib" => {
-                match crate::lyrics::fetch_lyrics_from_lrclib(
-                    &meta.artist,
-                    &meta.title,
-                    &meta.album,
-                    meta.length,
-                )
-                .await
-                {
-                    Ok((lines, _raw)) if !lines.is_empty() => {
-                        state.update_lyrics(lines, meta, None, Some(Provider::Lrclib));
-                        return;
-                    }
-                    Ok(_) => { /* try next provider */ }
-                    Err(e) => match e {
-                        crate::lyrics::LyricsError::Network(_) => { /* transient */ }
-                        _ => {
-                            handle_non_transient_error(e);
-                            return;
-                        }
-                    },
-                }
-            }
-            "musixmatch" => {
-                match crate::lyrics::fetch_lyrics_from_musixmatch_usertoken(
-                    &meta.artist,
-                    &meta.title,
-                    &meta.album,
-                    meta.length,
-                    meta.spotify_id.as_deref(),
-                )
-                .await
-                {
-                    Ok((lines, raw)) if !lines.is_empty() => {
-                        let provider_tag = if lines.iter().any(|l| l.words.is_some())
-                            || raw.as_ref().map(|r| r.starts_with(";;richsync=1")).unwrap_or(false)
-                        {
-                            Some(Provider::MusixmatchRichsync)
-                        } else {
-                            Some(Provider::MusixmatchSubtitles)
-                        };
-                        state.update_lyrics(lines, meta, None, provider_tag);
-                        return;
-                    }
-                    Ok(_) => { /* try next provider */ }
-                    Err(e) => match e {
-                        crate::lyrics::LyricsError::Network(_) => { /* transient */ }
-                        _ => {
-                            handle_non_transient_error(e);
-                            return;
-                        }
-                    },
-                }
-            }
-            other => {
+    for provider in providers {
+        match try_provider(provider, meta, state).await {
+            FetchResult::Success => return,
+            FetchResult::Transient => continue,
+            FetchResult::NonTransient(err) => {
                 if debug_log {
-                    eprintln!("[LyricsMPRIS] unknown provider: {}", other);
+                    eprintln!("[LyricsMPRIS] Provider error ({}): {}", provider, err);
                 }
+                state.update_lyrics(Vec::new(), meta, Some(err.to_string()), None);
+                return;
             }
         }
     }
 
-    // No provider returned anything: record empty lyrics (no error).
+    // No provider succeeded
     state.update_lyrics(Vec::new(), meta, None, None);
 }
 
-/// Fetch lyrics from configured providers and then attempt to get a fresh
-/// position from the player's MPRIS interface (if `service` is Some).
-///
-/// Returns the position that was set/used.
+/// Fetches a fresh position from the player
+async fn fetch_fresh_position(
+    service: Option<&str>,
+    state: &StateBundle,
+    debug_log: bool,
+) -> f64 {
+    let Some(svc) = service else {
+        return state.player_state.estimate_position();
+    };
+
+    match crate::mpris::playback::get_position(svc).await {
+        Ok(pos) => pos,
+        Err(e) => {
+            if debug_log {
+                eprintln!("[LyricsMPRIS] Failed to fetch position: {}", e);
+            }
+            state.player_state.estimate_position()
+        }
+    }
+}
+
+/// Fetches lyrics and updates position atomically
 pub async fn fetch_and_update_lyrics(
     meta: &TrackMetadata,
     state: &mut StateBundle,
@@ -164,31 +220,20 @@ pub async fn fetch_and_update_lyrics(
     providers: &[String],
     service: Option<&str>,
 ) -> f64 {
-    // First fetch from network providers.
     fetch_api_lyrics(meta, state, debug_log, providers).await;
-
-    // Query the playback API for a fresh position (if we know the service name).
-    let position = if let Some(svc) = service {
-        match crate::mpris::playback::get_position(svc).await {
-            Ok(p) => p,
-            Err(e) => {
-                if debug_log {
-                    eprintln!("[LyricsMPRIS] D-Bus error getting position after lyrics fetch: {}", e);
-                }
-                state.player_state.estimate_position()
-            }
-        }
-    } else {
-        state.player_state.estimate_position()
-    };
-
+    
+    let position = fetch_fresh_position(service, state, debug_log).await;
     state.update_index(position);
     state.player_state.set_position(position);
+    
     position
 }
 
-/// Process a single event. Public API to keep compatibility with the
-/// original module.
+// ============================================================================
+// Event Processing
+// ============================================================================
+
+/// Processes a single event from the event loop
 pub async fn process_event(
     event: Event,
     state: &mut StateBundle,
@@ -196,11 +241,16 @@ pub async fn process_event(
     latest_meta: &mut Option<(TrackMetadata, f64, String)>,
 ) {
     match event {
-        Event::Mpris(ev) => handle_mpris_event(ev, state, update_tx, latest_meta).await,
-        Event::Shutdown => send_update(state, update_tx, true).await,
+        Event::Mpris(mpris_event) => {
+            handle_mpris_event(mpris_event, state, update_tx, latest_meta).await;
+        }
+        Event::Shutdown => {
+            send_update(state, update_tx, true).await;
+        }
     }
 }
 
+/// Handles MPRIS events (player updates and seeks)
 async fn handle_mpris_event(
     event: MprisEvent,
     state: &mut StateBundle,
@@ -212,90 +262,130 @@ async fn handle_mpris_event(
         MprisEvent::Seeked(m, p, s) => (m, p, s, false),
     };
 
-    // If service is empty, treat as no player: clear state and report.
+    // Handle empty service (no active player)
     if service.is_empty() {
-        state.clear_lyrics();
-        state.player_state = Default::default();
-        send_update(state, update_tx, true).await;
+        handle_no_player(state, update_tx).await;
         return;
     }
 
-    let playback_status = crate::mpris::get_playback_status(&service).await.unwrap_or_default();
+    let playback_status = get_playback_status(&service).await;
 
-    if playback_status == "Stopped" {
-        state.clear_lyrics();
-        state.player_state = Default::default();
-        send_update(state, update_tx, true).await;
+    // Handle stopped player
+    if playback_status.as_deref() == Some("Stopped") {
+        handle_no_player(state, update_tx).await;
         return;
     }
 
-    let is_new_track = state.player_state.has_changed(&meta);
-
-    if is_player_update && is_new_track {
-        // Immediately clear UI and enqueue metadata for fetching lyrics.
-        state.clear_lyrics();
-        *latest_meta = Some((meta, position, service));
-
-        // Some players omit PlaybackStatus on metadata change. If we don't
-        // have a status, only update position and leave playing flag alone.
-        if playback_status.is_empty() {
-            state.player_state.set_position(position);
-        } else {
-            let playing = playback_status == "Playing";
-            state.player_state.update_playback_dbus(playing, position);
-        }
-
-        send_update(state, update_tx, true).await;
+    // Handle new track
+    if is_player_update && state.player_state.has_changed(&meta) {
+        handle_new_track(meta, position, service, playback_status, state, update_tx, latest_meta).await;
         return;
     }
 
-    let prev_playing = state.player_state.playing;
+    // Handle position/playback state changes
+    handle_state_update(position, playback_status, state, update_tx).await;
+}
 
-    // If playback status couldn't be obtained, don't overwrite playing flag.
-    let playing_opt: Option<bool> = if playback_status.is_empty() {
-        None
-    } else {
-        Some(playback_status == "Playing")
-    };
+/// Clears state when no player is active
+async fn handle_no_player(state: &mut StateBundle, update_tx: &mpsc::Sender<Update>) {
+    state.clear_lyrics();
+    state.player_state = Default::default();
+    send_update(state, update_tx, true).await;
+}
 
-    if let Some(playing) = playing_opt {
+/// Handles detection of a new track
+async fn handle_new_track(
+    meta: TrackMetadata,
+    position: f64,
+    service: String,
+    playback_status: Option<String>,
+    state: &mut StateBundle,
+    update_tx: &mpsc::Sender<Update>,
+    latest_meta: &mut Option<(TrackMetadata, f64, String)>,
+) {
+    state.clear_lyrics();
+    *latest_meta = Some((meta, position, service));
+
+    // Update playback state if available
+    if let Some(status) = playback_status {
+        let playing = status == "Playing";
         state.player_state.update_playback_dbus(playing, position);
     } else {
         state.player_state.set_position(position);
     }
 
-    let changed_index = state.update_index(state.player_state.estimate_position());
+    send_update(state, update_tx, true).await;
+}
 
-    if prev_playing != state.player_state.playing || (changed_index && !is_new_track) {
+/// Handles position and playback state updates
+async fn handle_state_update(
+    position: f64,
+    playback_status: Option<String>,
+    state: &mut StateBundle,
+    update_tx: &mpsc::Sender<Update>,
+) {
+    let prev_playing = state.player_state.playing;
+
+    // Update playback state
+    if let Some(status) = playback_status {
+        let playing = status == "Playing";
+        state.player_state.update_playback_dbus(playing, position);
+    } else {
+        state.player_state.set_position(position);
+    }
+
+    // Update lyric index
+    let position = state.player_state.estimate_position();
+    let changed_index = state.update_index(position);
+
+    // Send update if meaningful change occurred
+    let playing_changed = prev_playing != state.player_state.playing;
+    if playing_changed || changed_index {
         send_update(state, update_tx, false).await;
     }
 }
 
-async fn handle_latest_meta_update(
+/// Fetches playback status from the player
+async fn get_playback_status(service: &str) -> Option<String> {
+    crate::mpris::get_playback_status(service)
+        .await
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+// ============================================================================
+// Polling
+// ============================================================================
+
+/// Handles queued metadata fetches
+async fn handle_pending_metadata(
     state: &mut StateBundle,
     latest_meta: &mut Option<(TrackMetadata, f64, String)>,
     debug_log: bool,
     providers: &[String],
     update_tx: &mpsc::Sender<Update>,
 ) -> bool {
-    if let Some((meta, _pos, service)) = latest_meta.take() {
-        // Use the captured service string to get a fresh position after
-        // fetching lyrics so the internal timer anchor is correct.
-        let _position = fetch_and_update_lyrics(&meta, state, debug_log, providers, Some(&service)).await;
-        send_update(state, update_tx, true).await;
-        return true;
-    }
-    false
+    let Some((meta, _pos, service)) = latest_meta.take() else {
+        return false;
+    };
+
+    fetch_and_update_lyrics(&meta, state, debug_log, providers, Some(&service)).await;
+    send_update(state, update_tx, true).await;
+    true
 }
 
-async fn handle_position_sync(state: &mut StateBundle) -> bool {
+/// Syncs position when playing
+async fn sync_position(state: &mut StateBundle) -> bool {
+    if !state.player_state.playing {
+        return false;
+    }
+
     let position = state.player_state.estimate_position();
     state.player_state.set_position(position);
     state.update_index(position)
 }
 
-/// Called periodically from the poll loop to handle any queued meta fetches
-/// and to sync the timer when playing.
+/// Periodic polling handler for background tasks
 pub async fn handle_poll(
     state: &mut StateBundle,
     update_tx: &mpsc::Sender<Update>,
@@ -303,21 +393,24 @@ pub async fn handle_poll(
     latest_meta: &mut Option<(TrackMetadata, f64, String)>,
     providers: &[String],
 ) {
-    let mut should_send_update = false;
+    let mut needs_update = false;
 
-    if handle_latest_meta_update(state, latest_meta, debug_log, providers, update_tx).await {
-        should_send_update = true;
+    // Process pending metadata
+    if handle_pending_metadata(state, latest_meta, debug_log, providers, update_tx).await {
+        needs_update = true;
     }
 
-    if state.player_state.playing && handle_position_sync(state).await {
-        should_send_update = true;
+    // Sync position when playing
+    if sync_position(state).await {
+        needs_update = true;
     }
 
+    // Always send if there's an error
     if state.player_state.err.is_some() {
-        should_send_update = true;
+        needs_update = true;
     }
 
-    if should_send_update {
+    if needs_update {
         send_update(state, update_tx, false).await;
     }
 }
