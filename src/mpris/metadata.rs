@@ -85,41 +85,40 @@ pub async fn get_metadata(service: &str) -> Result<TrackMetadata, MprisError> {
         return Ok(TrackMetadata::default());
     }
     let conn = get_dbus_conn().await?;
-    let proxy = Proxy::new(&conn, service, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player").await?;
-    // Request the raw property as an OwnedValue. Prefer deserializing into our SerdeMetadata
-    // (via zvariant's DeserializeDict) and fall back to the generic HashMap parser.
-    if let Ok(val) = proxy.get_property::<OwnedValue>("Metadata").await {
-        // Preferred path: convert the OwnedValue into a HashMap and then
-        // build the SerdeMetadata from that HashMap. This uses the same
-        // normalization logic as the canonical parser but funnels it
-        // through the serde-friendly struct as requested.
-        if let Ok(map) = std::convert::TryInto::<std::collections::HashMap<String, OwnedValue>>::try_into(val.clone()) {
-            let title = map.get("xesam:title").and_then(|v| std::convert::TryInto::<String>::try_into(v.clone()).ok());
-            let artist = map.get("xesam:artist").and_then(|v| std::convert::TryInto::<Vec<String>>::try_into(v.clone()).ok());
-            let album = map.get("xesam:album").and_then(|v| std::convert::TryInto::<Vec<String>>::try_into(v.clone()).ok());
-            let mpris_length = map.get("mpris:length").and_then(|v| {
-                if let Ok(i) = std::convert::TryInto::<i64>::try_into(v.clone()) {
-                    return Some(i);
-                }
-                if let Ok(u) = std::convert::TryInto::<u64>::try_into(v.clone()) {
-                    return Some(u as i64);
-                }
-                None
-            });
-            let trackid = map.get("mpris:trackid").and_then(|v| std::convert::TryInto::<String>::try_into(v.clone()).ok());
+    // Use targeted Properties.Get to avoid triggering GetAll
+    let props_proxy = Proxy::new(&conn, service, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties").await?;
+    if let Ok(reply) = props_proxy.call_method("Get", &("org.mpris.MediaPlayer2.Player", "Metadata")).await {
+        if let Ok(val) = reply.body().deserialize::<OwnedValue>() {
+            // Preferred path: convert the OwnedValue into a HashMap and then
+            // build the SerdeMetadata from that HashMap.
+            if let Ok(map) = std::convert::TryInto::<std::collections::HashMap<String, OwnedValue>>::try_into(val.clone()) {
+                let title = map.get("xesam:title").and_then(|v| std::convert::TryInto::<String>::try_into(v.clone()).ok());
+                let artist = map.get("xesam:artist").and_then(|v| std::convert::TryInto::<Vec<String>>::try_into(v.clone()).ok());
+                let album = map.get("xesam:album").and_then(|v| std::convert::TryInto::<Vec<String>>::try_into(v.clone()).ok());
+                let mpris_length = map.get("mpris:length").and_then(|v| {
+                    if let Ok(i) = std::convert::TryInto::<i64>::try_into(v.clone()) {
+                        return Some(i);
+                    }
+                    if let Ok(u) = std::convert::TryInto::<u64>::try_into(v.clone()) {
+                        return Some(u as i64);
+                    }
+                    None
+                });
+                let trackid = map.get("mpris:trackid").and_then(|v| std::convert::TryInto::<String>::try_into(v.clone()).ok());
 
-            let serde_md = SerdeMetadata {
-                title,
-                artist,
-                album,
-                mpris_length,
-                trackid,
-            };
-            return Ok(from_serde(serde_md));
-        }
-        // If we couldn't turn it into a map, fall back to the generic parser
-        if let Ok(map) = std::convert::TryInto::<std::collections::HashMap<String, OwnedValue>>::try_into(val) {
-            return Ok(extract_metadata(&map));
+                let serde_md = SerdeMetadata {
+                    title,
+                    artist,
+                    album,
+                    mpris_length,
+                    trackid,
+                };
+                return Ok(from_serde(serde_md));
+            }
+            // If we couldn't turn it into a map, fall back to the generic parser
+            if let Ok(map) = std::convert::TryInto::<std::collections::HashMap<String, OwnedValue>>::try_into(val) {
+                return Ok(extract_metadata(&map));
+            }
         }
     }
     // Fallback: no metadata or deserialization failed

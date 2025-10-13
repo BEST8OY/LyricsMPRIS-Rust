@@ -11,7 +11,7 @@ use crate::mpris::metadata::get_metadata;
 use crate::mpris::playback::get_position;
 use clap::Parser;
 use std::error::Error;
-use std::time::Duration;
+// polling removed; no Duration needed here
 
 /// Application configuration from CLI
 #[derive(Parser, Debug, Clone)]
@@ -75,7 +75,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let cfg = Config::parse();
     let mut cfg = cfg;
     providers_from_env_if_empty(&mut cfg);
-    let poll_interval = Duration::from_millis(1000);
+    // polling removed: rely solely on MPRIS events
 
     // Always start the UI, even if no song is playing yet
     // Try to get current metadata/position, but ignore errors and let UI handle waiting
@@ -100,18 +100,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     };
 
     let result = if cfg.pipe {
-        crate::ui::pipe::display_lyrics_pipe(
-            meta,
-            pos,
-            poll_interval,
-            cfg.clone(),
-        )
-        .await
+        crate::ui::pipe::display_lyrics_pipe(meta, pos, cfg.clone()).await
     } else {
         crate::ui::modern::display_lyrics_modern(
             meta,
             pos,
-            poll_interval,
             cfg.clone(),
             !cfg.no_karaoke,
         )

@@ -10,7 +10,6 @@ use crate::event::{self, Event, MprisEvent, process_event, send_update};
 use crate::mpris::{TrackMetadata, events::MprisEventHandler};
 use crate::state::{StateBundle, Update};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Configuration for the event loop, wrapping the main app config.
@@ -45,7 +44,6 @@ impl LoopConfig {
 /// Encapsulates the runtime state needed by the event loop.
 struct LoopState {
     state_bundle: StateBundle,
-    latest_metadata: Option<(TrackMetadata, f64, String)>,
     was_playing: bool,
 }
 
@@ -53,7 +51,6 @@ impl LoopState {
     fn new() -> Self {
         Self {
             state_bundle: StateBundle::new(),
-            latest_metadata: None,
             was_playing: false,
         }
     }
@@ -73,24 +70,18 @@ impl LoopState {
 /// * `config` - Application configuration including provider settings
 pub async fn listen(
     update_tx: mpsc::Sender<Update>,
-    poll_interval: Duration,
     shutdown_rx: mpsc::Receiver<()>,
     config: crate::Config,
 ) {
     let loop_config = LoopConfig::new(config);
     let mut loop_state = LoopState::new();
     
-    let event_rx = initialize_loop(
-        &mut loop_state,
-        &update_tx,
-        &loop_config,
-    ).await;
+    let event_rx = initialize_loop(&mut loop_state, &update_tx, &loop_config).await;
 
     run_event_loop(
         loop_state,
         event_rx,
         update_tx,
-        poll_interval,
         shutdown_rx,
         loop_config,
     ).await;
@@ -201,7 +192,7 @@ fn spawn_mpris_watcher(
     let debug = config.debug_log();
 
     tokio::spawn(async move {
-        let handler_result = MprisEventHandler::new(
+        let handler_result = MprisEventHandler::with_closures(
             move |meta, pos, service| {
                 let _ = update_tx.try_send(Event::Mpris(
                     MprisEvent::PlayerUpdate(meta, pos, service)
@@ -236,7 +227,6 @@ async fn run_event_loop(
     mut loop_state: LoopState,
     mut event_rx: mpsc::Receiver<Event>,
     update_tx: mpsc::Sender<Update>,
-    poll_interval: Duration,
     mut shutdown_rx: mpsc::Receiver<()>,
     config: LoopConfig,
 ) {
@@ -244,28 +234,16 @@ async fn run_event_loop(
         tokio::select! {
             // Shutdown signal received
             _ = shutdown_rx.recv() => {
-                handle_shutdown(&mut loop_state, &update_tx).await;
+                handle_shutdown(&mut loop_state, &update_tx, &config).await;
                 break;
             }
 
             // MPRIS event received from watcher
             maybe_event = event_rx.recv() => {
-                handle_mpris_event(
-                    maybe_event,
-                    &mut loop_state,
-                    &update_tx,
-                    &config,
-                ).await;
+                handle_mpris_event(maybe_event, &mut loop_state, &update_tx, &config).await;
             }
 
-            // Periodic poll timer elapsed
-            _ = tokio::time::sleep(poll_interval) => {
-                handle_periodic_poll(
-                    &mut loop_state,
-                    &update_tx,
-                    &config,
-                ).await;
-            }
+            // No periodic polling: rely solely on MPRIS events
         }
     }
 }
@@ -274,12 +252,14 @@ async fn run_event_loop(
 async fn handle_shutdown(
     loop_state: &mut LoopState,
     update_tx: &mpsc::Sender<Update>,
+    config: &LoopConfig,
 ) {
     let _ = process_event(
         Event::Shutdown,
         &mut loop_state.state_bundle,
         update_tx,
-        &mut loop_state.latest_metadata,
+        config.debug_log(),
+        &config.providers,
     ).await;
 }
 
@@ -296,32 +276,19 @@ async fn handle_mpris_event(
                 event,
                 &mut loop_state.state_bundle,
                 update_tx,
-                &mut loop_state.latest_metadata,
+                config.debug_log(),
+                &config.providers,
             ).await;
             
             loop_state.update_playing_status();
         }
         None => {
-            // Event channel closed; polling will maintain state
+            // Event channel closed; nothing else to do
             if config.debug_log() {
-                eprintln!("[EventLoop] MPRIS channel closed, relying on polling");
+                eprintln!("[EventLoop] MPRIS channel closed");
             }
         }
     }
 }
 
-/// Executes a periodic poll to ensure state stays synchronized even
-/// when no events are emitted.
-async fn handle_periodic_poll(
-    loop_state: &mut LoopState,
-    update_tx: &mpsc::Sender<Update>,
-    config: &LoopConfig,
-) {
-    let _ = event::handle_poll(
-        &mut loop_state.state_bundle,
-        update_tx,
-        config.debug_log(),
-        &mut loop_state.latest_metadata,
-        &config.providers,
-    ).await;
-}
+// periodic polling removed — rely on MPRIS events only

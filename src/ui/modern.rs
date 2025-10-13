@@ -7,14 +7,14 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use std::io::{self};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::pin::Pin;
 use tokio::time::Sleep;
 use tokio::sync::mpsc;
 use std::thread;
 use tui::{Terminal, backend::CrosstermBackend};
 
-use crate::ui::modern_helpers::estimate_update_and_next_sleep;
+use crate::ui::estimate_update_and_next_sleep;
 
 /// UI state for the modern TUI mode
 pub struct ModernUIState {
@@ -52,13 +52,12 @@ impl ModernUIState {
 pub async fn display_lyrics_modern(
     _meta: crate::mpris::TrackMetadata,
     _pos: f64,
-    poll_interval: Duration,
     mpris_config: crate::Config,
     karaoke_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, mut rx) = mpsc::channel(32);
     let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
-    tokio::spawn(pool::listen(tx, poll_interval, shutdown_rx, mpris_config.clone()));
+    tokio::spawn(pool::listen(tx, shutdown_rx, mpris_config.clone()));
     enable_raw_mode().map_err(to_boxed_err)?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).map_err(to_boxed_err)?;

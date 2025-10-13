@@ -238,11 +238,12 @@ pub async fn process_event(
     event: Event,
     state: &mut StateBundle,
     update_tx: &mpsc::Sender<Update>,
-    latest_meta: &mut Option<(TrackMetadata, f64, String)>,
+    debug_log: bool,
+    providers: &[String],
 ) {
     match event {
         Event::Mpris(mpris_event) => {
-            handle_mpris_event(mpris_event, state, update_tx, latest_meta).await;
+            handle_mpris_event(mpris_event, state, update_tx, debug_log, providers).await;
         }
         Event::Shutdown => {
             send_update(state, update_tx, true).await;
@@ -255,7 +256,8 @@ async fn handle_mpris_event(
     event: MprisEvent,
     state: &mut StateBundle,
     update_tx: &mpsc::Sender<Update>,
-    latest_meta: &mut Option<(TrackMetadata, f64, String)>,
+    debug_log: bool,
+    providers: &[String],
 ) {
     let (meta, position, service, is_player_update) = match event {
         MprisEvent::PlayerUpdate(m, p, s) => (m, p, s, true),
@@ -268,17 +270,23 @@ async fn handle_mpris_event(
         return;
     }
 
-    let playback_status = get_playback_status(&service).await;
+    // Only query playback status for full PlayerUpdate events. Seeked events are
+    // position-only and shouldn't trigger property fetches.
+    let playback_status = if is_player_update {
+        get_playback_status(&service).await
+    } else {
+        None
+    };
 
-    // Handle stopped player
-    if playback_status.as_deref() == Some("Stopped") {
+    // Handle stopped player (only meaningful for PlayerUpdate)
+    if is_player_update && playback_status.as_deref() == Some("Stopped") {
         handle_no_player(state, update_tx).await;
         return;
     }
 
     // Handle new track
     if is_player_update && state.player_state.has_changed(&meta) {
-        handle_new_track(meta, position, service, playback_status, state, update_tx, latest_meta).await;
+        handle_new_track(meta, position, service, playback_status, state, update_tx, debug_log, providers).await;
         return;
     }
 
@@ -301,10 +309,10 @@ async fn handle_new_track(
     playback_status: Option<String>,
     state: &mut StateBundle,
     update_tx: &mpsc::Sender<Update>,
-    latest_meta: &mut Option<(TrackMetadata, f64, String)>,
+    debug_log: bool,
+    providers: &[String],
 ) {
     state.clear_lyrics();
-    *latest_meta = Some((meta, position, service));
 
     // Update playback state if available
     if let Some(status) = playback_status {
@@ -314,6 +322,13 @@ async fn handle_new_track(
         state.player_state.set_position(position);
     }
 
+    // Notify UI immediately that a new track started (lyrics may follow)
+    send_update(state, update_tx, true).await;
+
+    // Fetch lyrics immediately (synchronously) and update state
+    // This may perform network IO; it's executed inside the event task.
+    let _ = fetch_and_update_lyrics(&meta, state, debug_log, providers, Some(&service)).await;
+    // After fetching, send another forced update to refresh UI
     send_update(state, update_tx, true).await;
 }
 
@@ -353,64 +368,4 @@ async fn get_playback_status(service: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-// ============================================================================
-// Polling
-// ============================================================================
-
-/// Handles queued metadata fetches
-async fn handle_pending_metadata(
-    state: &mut StateBundle,
-    latest_meta: &mut Option<(TrackMetadata, f64, String)>,
-    debug_log: bool,
-    providers: &[String],
-    update_tx: &mpsc::Sender<Update>,
-) -> bool {
-    let Some((meta, _pos, service)) = latest_meta.take() else {
-        return false;
-    };
-
-    fetch_and_update_lyrics(&meta, state, debug_log, providers, Some(&service)).await;
-    send_update(state, update_tx, true).await;
-    true
-}
-
-/// Syncs position when playing
-async fn sync_position(state: &mut StateBundle) -> bool {
-    if !state.player_state.playing {
-        return false;
-    }
-
-    let position = state.player_state.estimate_position();
-    state.player_state.set_position(position);
-    state.update_index(position)
-}
-
-/// Periodic polling handler for background tasks
-pub async fn handle_poll(
-    state: &mut StateBundle,
-    update_tx: &mpsc::Sender<Update>,
-    debug_log: bool,
-    latest_meta: &mut Option<(TrackMetadata, f64, String)>,
-    providers: &[String],
-) {
-    let mut needs_update = false;
-
-    // Process pending metadata
-    if handle_pending_metadata(state, latest_meta, debug_log, providers, update_tx).await {
-        needs_update = true;
-    }
-
-    // Sync position when playing
-    if sync_position(state).await {
-        needs_update = true;
-    }
-
-    // Always send if there's an error
-    if state.player_state.err.is_some() {
-        needs_update = true;
-    }
-
-    if needs_update {
-        send_update(state, update_tx, false).await;
-    }
-}
+// Polling support removed; lyrics are fetched immediately on MPRIS new-track events.
