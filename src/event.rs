@@ -191,26 +191,7 @@ async fn fetch_api_lyrics(
     state.update_lyrics(Vec::new(), meta, None, None);
 }
 
-/// Fetches a fresh position from the player
-async fn fetch_fresh_position(
-    service: Option<&str>,
-    state: &StateBundle,
-    debug_log: bool,
-) -> f64 {
-    let Some(svc) = service else {
-        return state.player_state.estimate_position();
-    };
 
-    match crate::mpris::playback::get_position(svc).await {
-        Ok(pos) => pos,
-        Err(e) => {
-            if debug_log {
-                eprintln!("[LyricsMPRIS] Failed to fetch position: {}", e);
-            }
-            state.player_state.estimate_position()
-        }
-    }
-}
 
 /// Fetches lyrics and updates position atomically
 pub async fn fetch_and_update_lyrics(
@@ -221,12 +202,24 @@ pub async fn fetch_and_update_lyrics(
     service: Option<&str>,
 ) -> f64 {
     fetch_api_lyrics(meta, state, debug_log, providers).await;
-    
-    let position = fetch_fresh_position(service, state, debug_log).await;
-    state.update_index(position);
-    state.player_state.set_position(position);
-    
-    position
+    // After fetching lyrics, instead of querying the player for position,
+    // seek the player to our internal estimate to synchronize timing. This
+    // avoids an extra Properties.Get call and uses our calculated anchor.
+    let estimated = state.player_state.estimate_position();
+
+    if let Some(svc) = service {
+        if let Err(e) = crate::mpris::playback::seek_to_position(svc, estimated).await {
+            if debug_log {
+                eprintln!("[LyricsMPRIS] Failed to seek player: {}", e);
+            }
+        }
+    }
+
+    // Update index and anchor to the estimated position
+    state.update_index(estimated);
+    state.player_state.set_position(estimated);
+
+    estimated
 }
 
 // ============================================================================
