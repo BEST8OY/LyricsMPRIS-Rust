@@ -79,6 +79,29 @@ fn map_to_serde_metadata(map: &std::collections::HashMap<String, OwnedValue>) ->
     SerdeMetadata { title, artist, album, mpris_length, trackid }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_serde_basic() {
+        let serde_md = SerdeMetadata {
+            title: Some("Song Title".to_string()),
+            artist: Some(vec!["Artist1".to_string(), "Artist2".to_string()]),
+            album: Some(vec!["Album Name".to_string()]),
+            mpris_length: Some(210_000_000),
+            trackid: Some("spotify:track:0123456789".to_string()),
+        };
+
+        let md = from_serde(serde_md);
+        assert_eq!(md.title, "Song Title");
+        assert_eq!(md.artist, "Artist1");
+        assert_eq!(md.album, "Album Name");
+        assert_eq!(md.length, Some(210.0));
+        assert_eq!(md.spotify_id.unwrap(), "0123456789");
+    }
+}
+
 /// Query metadata for a specific MPRIS player service.
 pub async fn get_metadata(service: &str) -> Result<TrackMetadata, MprisError> {
     if service.is_empty() {
