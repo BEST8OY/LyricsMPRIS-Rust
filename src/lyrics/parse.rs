@@ -1,143 +1,228 @@
 use crate::lyrics::types::LyricLine;
-use unicode_segmentation::UnicodeSegmentation;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
+use unicode_segmentation::UnicodeSegmentation;
 
+/// Regex pattern for LRC timestamps: [MM:SS.CC]
 static SYNCED_LYRICS_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\[(\d{1,2}):(\d{2})[.](\d{1,2})\]").unwrap());
 
-/// Parse time-synced lyrics into LyricLine structs.
+/// Parse standard LRC format time-synced lyrics into LyricLine structs.
+/// 
+/// Example input:
+/// ```text
+/// [00:29.26]Have you got colour in your cheeks?
+/// [00:34.27]Do you ever get that fear
+/// ```
 pub fn parse_synced_lyrics(synced: &str) -> Vec<LyricLine> {
-    let re = &SYNCED_LYRICS_RE;
-    let mut lines = Vec::new();
-    for line in synced.lines() {
-        let matches: Vec<_> = re.captures_iter(line).collect();
-        if matches.is_empty() {
-            continue;
-        }
-        let text = re.replace_all(line, "").trim().to_string();
-        if text.is_empty() {
-            continue;
-        }
-        for cap in matches {
-            let min = cap
-                .get(1)
-                .and_then(|m| m.as_str().parse::<u32>().ok())
-                .unwrap_or(0);
-            let sec = cap
-                .get(2)
-                .and_then(|s| s.as_str().parse::<u32>().ok())
-                .unwrap_or(0);
-            let centi = cap
-                .get(3)
-                .and_then(|c| c.as_str().parse::<u32>().ok())
-                .unwrap_or(0);
-            let time = min as f64 * 60.0 + sec as f64 + centi as f64 / 100.0;
-            lines.push(LyricLine {
-                time,
-                text: text.clone(),
-                words: None,
-            });
-        }
-    }
-    lines
+    synced
+        .lines()
+        .flat_map(|line| {
+            let matches: Vec<_> = SYNCED_LYRICS_RE.captures_iter(line).collect();
+            if matches.is_empty() {
+                return Vec::new();
+            }
+
+            let text = SYNCED_LYRICS_RE.replace_all(line, "").trim().to_string();
+            if text.is_empty() {
+                return Vec::new();
+            }
+
+            matches
+                .into_iter()
+                .map(|cap| {
+                    let minutes = cap.get(1).and_then(|m| m.as_str().parse::<u32>().ok()).unwrap_or(0);
+                    let seconds = cap.get(2).and_then(|s| s.as_str().parse::<u32>().ok()).unwrap_or(0);
+                    let centiseconds = cap.get(3).and_then(|c| c.as_str().parse::<u32>().ok()).unwrap_or(0);
+                    
+                    let time = minutes as f64 * 60.0 + seconds as f64 + centiseconds as f64 / 100.0;
+                    
+                    LyricLine {
+                        time,
+                        text: text.clone(),
+                        words: None,
+                    }
+                })
+                .collect()
+        })
+        .collect()
 }
 
-/// Try to parse a musixmatch "richsync_body" JSON string into lyric lines with optional per-word timings.
-/// Returns Some((lines, raw_lrc_with_marker)) on success, or None if parsing/shape doesn't match.
+/// Parse Musixmatch subtitle_body JSON into lyric lines (line-level timing only).
+///
+/// Format: `[{"text": "lyrics", "time": {"total": 29.26, ...}}, ...]`
+///
+/// Returns (parsed_lines, lrc_string) or None if parsing fails.
+pub fn parse_subtitle_body(subtitle_body: &str) -> Option<(Vec<LyricLine>, String)> {
+    let lines_val = serde_json::from_str::<Value>(subtitle_body).ok()?;
+    let arr = lines_val.as_array()?;
+
+    let mut parsed = Vec::new();
+    let mut lrc_output = String::new();
+
+    for line in arr {
+        let time = line.pointer("/time/total").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let text = line.get("text").and_then(|v| v.as_str()).unwrap_or("♪");
+
+        // Generate LRC timestamp
+        lrc_output.push_str(&format_lrc_timestamp(time, text));
+
+        parsed.push(LyricLine {
+            time,
+            text: text.to_string(),
+            words: None, // No word-level timing in subtitle format
+        });
+    }
+
+    Some((parsed, lrc_output))
+}
+
+/// Parse Musixmatch richsync_body JSON into lyric lines with word-level timing.
+///
+/// Supports two formats:
+/// 1. Word array: `{"ts": 29.26, "te": 31.59, "x": "text", "words": [{start, end, text}]}`
+/// 2. Character array: `{"ts": 29.26, "te": 31.59, "x": "text", "l": [{c, o}]}`
+///
+/// Returns (parsed_lines, lrc_with_richsync_marker) or None if parsing fails.
 pub fn parse_richsync_body(richsync_body: &str) -> Option<(Vec<LyricLine>, String)> {
-    if let Ok(lines_val) = serde_json::from_str::<Value>(richsync_body)
-        && let Some(arr) = lines_val.as_array() {
-            let mut parsed = Vec::new();
-            let mut out = String::new();
-            for line in arr.iter() {
-                let t = line.pointer("/ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let te = line.pointer("/te").and_then(|v| v.as_f64()).unwrap_or(t + 3.0);
-                let text = line
-                    .get("x")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| line.get("text").and_then(|v| v.as_str()))
-                    .unwrap_or("\u{266a}");
-                let ms = (t * 1000.0).round() as u64;
-                let minutes = ms / 60000;
-                let seconds = (ms % 60000) / 1000;
-                let centi = ms % 1000 / 10;
-                out.push_str(&format!("[{:02}:{:02}.{:02}]{}\n", minutes, seconds, centi, text));
+    let lines_val = serde_json::from_str::<Value>(richsync_body).ok()?;
+    let arr = lines_val.as_array()?;
 
-                // Parse per-word timings. Two possible richsync shapes:
-                // - explicit `words` array with {start,end,text}
-                // - character-level `l` array with {c, o} items (offsets from ts)
-                let words = if let Some(words_arr) = line.get("words").and_then(|v| v.as_array()) {
-                    let mut wts = Vec::new();
-                    for w in words_arr {
-                        let start = w.get("start").and_then(|v| v.as_f64()).unwrap_or(t);
-                        let mut end = w.get("end").and_then(|v| v.as_f64()).unwrap_or(start);
-                        // Ensure end is after start; if not, fall back to the line end `te`.
-                        if end <= start {
-                            end = te;
-                        }
-                        let wtext = w.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                        // Precompute grapheme clusters and byte offsets for efficient slicing
-                        let graphemes: Vec<String> = UnicodeSegmentation::graphemes(wtext.as_str(), true)
-                            .map(|g| g.to_string())
-                            .collect();
-                        let mut offsets = Vec::with_capacity(graphemes.len());
-                        let mut acc = 0usize;
-                        for g in &graphemes {
-                            offsets.push(acc);
-                            acc += g.len();
-                        }
-                        wts.push(crate::lyrics::types::WordTiming { start, end, text: wtext, graphemes, grapheme_byte_offsets: offsets });
-                    }
-                    if wts.is_empty() { None } else { Some(wts) }
-                } else if let Some(l_arr) = line.get("l").and_then(|v| v.as_array()) {
-                    let mut wts = Vec::new();
-                    for (i, elem) in l_arr.iter().enumerate() {
-                        let word_text = elem.get("c").and_then(|v| v.as_str()).unwrap_or("");
-                        if word_text.trim().is_empty() {
-                            continue; // Skip spaces
-                        }
+    let mut parsed = Vec::new();
+    let mut lrc_output = String::new();
 
-                        let start_offset = elem.get("o").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                        let start = t + start_offset;
+    for line in arr {
+        let line_start = line.pointer("/ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let line_end = line.pointer("/te").and_then(|v| v.as_f64()).unwrap_or(line_start + 3.0);
+        let text = line
+            .get("x")
+            .or_else(|| line.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("♪");
 
-                        // The end time is the start time of the next element, or the line's end time.
-                        let end = l_arr.get(i + 1)
-                            .and_then(|next_elem| next_elem.get("o").and_then(|v| v.as_f64()))
-                            .map(|end_offset| t + end_offset)
-                            .unwrap_or(te);
+        // Generate LRC timestamp
+        lrc_output.push_str(&format_lrc_timestamp(line_start, text));
 
-                        // Ensure end is after start; if not, fall back to the line end `te`.
-                        let final_end = if end <= start { te } else { end };
+        // Parse word-level timings (if available)
+        let words = parse_word_timings(line, line_start, line_end);
 
-                        let graphemes: Vec<String> = UnicodeSegmentation::graphemes(word_text, true)
-                            .map(|g| g.to_string())
-                            .collect();
-                        let mut offsets = Vec::with_capacity(graphemes.len());
-                        let mut acc = 0usize;
-                        for g in &graphemes {
-                            offsets.push(acc);
-                            acc += g.len();
-                        }
+        parsed.push(LyricLine {
+            time: line_start,
+            text: text.to_string(),
+            words,
+        });
+    }
 
-                        wts.push(crate::lyrics::types::WordTiming {
-                            start,
-                            end: final_end,
-                            text: word_text.to_string(),
-                            graphemes,
-                            grapheme_byte_offsets: offsets,
-                        });
-                    }
-                    if wts.is_empty() { None } else { Some(wts) }
-                } else {
-                    None
-                };
+    let output_with_marker = format!(";;richsync=1\n{}", lrc_output);
+    Some((parsed, output_with_marker))
+}
 
-                parsed.push(LyricLine { time: t, text: text.to_string(), words });
-            }
-            let out_with_marker = format!(";;richsync=1\n{}", out);
-            return Some((parsed, out_with_marker));
-        }
+/// Format a timestamp and text into LRC format: [MM:SS.CC]text
+fn format_lrc_timestamp(time: f64, text: &str) -> String {
+    let ms = (time * 1000.0).round() as u64;
+    let minutes = ms / 60000;
+    let seconds = (ms % 60000) / 1000;
+    let centiseconds = (ms % 1000) / 10;
+    format!("[{:02}:{:02}.{:02}]{}\n", minutes, seconds, centiseconds, text)
+}
+
+/// Parse word timings from a richsync line object.
+/// Returns None if no word timing data is present.
+fn parse_word_timings(line: &Value, line_start: f64, line_end: f64) -> Option<Vec<crate::lyrics::types::WordTiming>> {
+    // Try explicit words array first
+    if let Some(words_arr) = line.get("words").and_then(|v| v.as_array()) {
+        return parse_explicit_word_array(words_arr, line_start, line_end);
+    }
+
+    // Fall back to character-level array
+    if let Some(char_arr) = line.get("l").and_then(|v| v.as_array()) {
+        return parse_character_array(char_arr, line_start, line_end);
+    }
+
     None
+}
+
+/// Parse explicit word array: [{start, end, text}, ...]
+fn parse_explicit_word_array(words_arr: &[Value], line_start: f64, line_end: f64) -> Option<Vec<crate::lyrics::types::WordTiming>> {
+    let word_timings: Vec<crate::lyrics::types::WordTiming> = words_arr
+        .iter()
+        .filter_map(|w| {
+            let start = w.get("start").and_then(|v| v.as_f64()).unwrap_or(line_start);
+            let end = w.get("end").and_then(|v| v.as_f64()).unwrap_or(start);
+            let text = w.get("text").and_then(|v| v.as_str()).unwrap_or("");
+
+            // Validate and fix timing
+            let final_end = if end <= start { line_end } else { end };
+
+            Some(create_word_timing(start, final_end, text))
+        })
+        .collect();
+
+    if word_timings.is_empty() {
+        None
+    } else {
+        Some(word_timings)
+    }
+}
+
+/// Parse character-level array: [{c: "word", o: offset}, ...]
+fn parse_character_array(char_arr: &[Value], line_start: f64, line_end: f64) -> Option<Vec<crate::lyrics::types::WordTiming>> {
+    let word_timings: Vec<crate::lyrics::types::WordTiming> = char_arr
+        .iter()
+        .enumerate()
+        .filter_map(|(i, elem)| {
+            let text = elem.get("c").and_then(|v| v.as_str()).unwrap_or("");
+            
+            // Skip whitespace-only entries
+            if text.trim().is_empty() {
+                return None;
+            }
+
+            let start_offset = elem.get("o").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let start = line_start + start_offset;
+
+            // Calculate end time from next element or use line end
+            let end = char_arr
+                .get(i + 1)
+                .and_then(|next| next.get("o").and_then(|v| v.as_f64()))
+                .map(|offset| line_start + offset)
+                .unwrap_or(line_end);
+
+            // Validate timing
+            let final_end = if end <= start { line_end } else { end };
+
+            Some(create_word_timing(start, final_end, text))
+        })
+        .collect();
+
+    if word_timings.is_empty() {
+        None
+    } else {
+        Some(word_timings)
+    }
+}
+
+/// Create a WordTiming struct with precomputed grapheme data.
+fn create_word_timing(start: f64, end: f64, text: &str) -> crate::lyrics::types::WordTiming {
+    // Precompute grapheme clusters for Unicode-aware rendering
+    let graphemes: Vec<String> = text.graphemes(true).map(String::from).collect();
+    
+    // Precompute byte offsets for efficient string slicing
+    let grapheme_byte_offsets: Vec<usize> = graphemes
+        .iter()
+        .scan(0, |offset, g| {
+            let current = *offset;
+            *offset += g.len();
+            Some(current)
+        })
+        .collect();
+
+    crate::lyrics::types::WordTiming {
+        start,
+        end,
+        text: text.to_string(),
+        graphemes,
+        grapheme_byte_offsets,
+    }
 }
