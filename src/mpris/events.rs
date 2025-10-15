@@ -2,6 +2,7 @@
 
 use crate::mpris::connection::{get_active_player_names, get_dbus_conn, is_blocked, MprisError};
 use crate::mpris::metadata::{extract_metadata, TrackMetadata};
+use crate::mpris::playback::get_position;
 use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -266,16 +267,12 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
     ) -> Result<(), MprisError> {
         if let Ok(pos_microsecs) = proxy.position().await {
             let position = pos_microsecs as f64 / 1_000_000.0;
-            
-            // Only notify if position changed significantly (not just minor drift)
-            if (position - self.state.position).abs() > 0.5 {
-                self.state.position = position;
-                self.callback.on_seek(
-                    self.state.track.clone(),
-                    position,
-                    self.state.service.clone(),
-                );
-            }
+            self.state.position = position;
+            self.callback.on_seek(
+                self.state.track.clone(),
+                position,
+                self.state.service.clone(),
+            );
         }
 
         Ok(())
@@ -289,9 +286,19 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             && status != self.state.playback_status
         {
             self.state.playback_status = status;
+            
+            // Get fresh position on playback status change
+            let position = if let Ok(pos) = get_position(&self.state.service).await {
+                self.state.position = pos;
+                pos
+            } else {
+                self.state.position
+            };
+            
+            // Notify about the playback status change
             self.callback.on_track_change(
                 self.state.track.clone(),
-                self.state.position,
+                position,
                 self.state.service.clone(),
             );
         }
