@@ -299,11 +299,10 @@ impl PlayerState {
             estimated = self.position;
         }
         
-        if let Some(len) = self.length {
-            if estimated.is_finite() {
+        if let Some(len) = self.length
+            && estimated.is_finite() {
                 estimated = estimated.clamp(0.0, len);
             }
-        }
         
         estimated
     }

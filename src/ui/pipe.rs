@@ -1,12 +1,127 @@
+//! Pipe mode for streaming lyrics to stdout.
+//!
+//! This module implements a simple, scripting-friendly output mode that:
+//! - Prints each lyric line as it becomes active
+//! - Uses progressive timing to print lines even between MPRIS updates
+//! - Handles track transitions cleanly
+//! - Outputs plain text suitable for pipes and redirects
+
 use crate::pool;
-// polling removed; no Duration needed here
 use tokio::sync::mpsc;
 use std::pin::Pin;
 use tokio::time::Sleep;
 use std::time::Instant;
 use crate::ui::estimate_update_and_next_sleep;
 
-/// Display lyrics in pipe mode (stdout only, for scripting)
+/// State tracker for pipe mode output.
+struct PipeState {
+    /// Current track identifier (artist, title, album)
+    last_track_id: Option<(String, String, String)>,
+    /// Whether the last track had lyrics (for spacing)
+    last_track_had_lyric: bool,
+    /// Last printed line index
+    last_line_idx: Option<usize>,
+    /// Last received update for position estimation
+    last_update: Option<crate::state::Update>,
+    /// Time when last update was received
+    last_update_instant: Option<Instant>,
+    /// Scheduled timer for next line/word boundary
+    next_sleep: Option<Pin<Box<Sleep>>>,
+}
+
+impl PipeState {
+    fn new() -> Self {
+        Self {
+            last_track_id: None,
+            last_track_had_lyric: false,
+            last_line_idx: None,
+            last_update: None,
+            last_update_instant: None,
+            next_sleep: None,
+        }
+    }
+
+    /// Update state with a new update from MPRIS.
+    fn update_from_mpris(&mut self, upd: crate::state::Update) {
+        let track_id = crate::ui::track_id(&upd);
+        let has_lyrics = !upd.lines.is_empty();
+        let track_changed = self.last_track_id.as_ref() != Some(&track_id);
+
+        if track_changed {
+            self.handle_track_change(has_lyrics);
+            self.last_track_id = Some(track_id);
+
+            if has_lyrics {
+                self.print_current_line(&upd);
+            }
+        } else if has_lyrics && upd.index != self.last_line_idx {
+            self.print_current_line(&upd);
+        }
+
+        // Store update for local position estimation
+        self.last_update = Some(upd);
+        self.last_update_instant = Some(Instant::now());
+
+        // Schedule next timer wakeup
+        let (_, next) = estimate_update_and_next_sleep(
+            &self.last_update,
+            self.last_update_instant,
+            true,
+        );
+        self.next_sleep = next;
+    }
+
+    /// Handle track change transition.
+    fn handle_track_change(&mut self, new_has_lyrics: bool) {
+        // Add spacing between tracks if previous had lyrics
+        if self.last_track_id.is_some() && self.last_track_had_lyric && !new_has_lyrics {
+            println!();
+        }
+        
+        self.last_line_idx = None;
+        self.last_track_had_lyric = false;
+    }
+
+    /// Print the current line from an update.
+    fn print_current_line(&mut self, upd: &crate::state::Update) {
+        if let Some(idx) = upd.index {
+            if let Some(line) = upd.lines.get(idx) {
+                println!("{}", line.text);
+                self.last_track_had_lyric = true;
+            }
+            self.last_line_idx = Some(idx);
+        }
+    }
+
+    /// Handle timer wakeup - estimate position and print new lines if changed.
+    fn handle_timer_wakeup(&mut self) {
+        let (maybe_estimated, next) = estimate_update_and_next_sleep(
+            &self.last_update,
+            self.last_update_instant,
+            true,
+        );
+
+        if let Some(estimated) = maybe_estimated {
+            // Print if line index has advanced
+            if estimated.index != self.last_line_idx {
+                if let Some(idx) = estimated.index
+                    && let Some(line) = estimated.lines.get(idx) {
+                        println!("{}", line.text);
+                        self.last_track_had_lyric = true;
+                    }
+                self.last_line_idx = estimated.index;
+
+                // Update stored update to the estimated one
+                self.last_update = Some(estimated);
+                self.last_update_instant = Some(Instant::now());
+            }
+        }
+
+        self.next_sleep = next;
+    }
+}
+
+/// Display lyrics in pipe mode (stdout only, for scripting).
 pub async fn display_lyrics_pipe(
     _meta: crate::mpris::TrackMetadata,
     _pos: f64,
@@ -16,95 +131,30 @@ pub async fn display_lyrics_pipe(
     let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
     tokio::spawn(pool::listen(tx, shutdown_rx, mpris_config.clone()));
 
-    // State for track transitions and lyric printing
-    let mut last_track_id: Option<(String, String, String)> = None;
-    let mut last_track_had_lyric = false;
-    let mut last_line_idx: Option<usize> = None;
-
-    // Optional per-word/line sleep for progressive printing
-    let mut next_sleep: Option<Pin<Box<Sleep>>> = None;
-    let mut last_update: Option<crate::state::Update> = None;
-    let mut last_update_instant: Option<Instant> = None;
+    let mut state = PipeState::new();
 
     loop {
         tokio::select! {
+            // MPRIS lyrics/position updates
             maybe_upd = rx.recv() => {
                 match maybe_upd {
-                    Some(upd) => {
-                        // store the last_update for local estimation
-                        last_update = Some(upd.clone());
-
-                        let track_id = crate::ui::track_id(&upd);
-                        let has_lyrics = !upd.lines.is_empty();
-                        let track_changed = last_track_id.as_ref() != Some(&track_id);
-
-                        if track_changed {
-                            if last_track_id.is_some() && last_track_had_lyric && !has_lyrics {
-                                println!();
-                            }
-                            last_track_id = Some(track_id);
-                            last_line_idx = None;
-                            last_track_had_lyric = false;
-                            if has_lyrics {
-                                if let Some(idx) = upd.index {
-                                    if let Some(line) = upd.lines.get(idx) {
-                                        println!("{}", line.text);
-                                        last_track_had_lyric = true;
-                                    }
-                                    last_line_idx = Some(idx);
-                                }
-                            }
-                        } else {
-                            if has_lyrics && upd.index != last_line_idx {
-                                if let Some(idx) = upd.index {
-                                    if let Some(line) = upd.lines.get(idx) {
-                                        println!("{}", line.text);
-                                        last_track_had_lyric = true;
-                                    }
-                                }
-                                last_line_idx = upd.index;
-                            }
-                        }
-
-                        // record when we received this update so local estimates can advance
-                        last_update_instant = Some(Instant::now());
-                        // (Re)compute next sleep using helper
-                        let (_maybe_tmp, next) = estimate_update_and_next_sleep(&last_update, last_update_instant, true);
-                        next_sleep = next;
-                    }
-                    None => break, // channel closed
+                    Some(upd) => state.update_from_mpris(upd),
+                    None => break, // Channel closed
                 }
             }
 
-            // wake on scheduled per-word/line timing
+            // Timer wakeup for progressive line printing
             _ = async {
-                if let Some(s) = &mut next_sleep {
+                if let Some(s) = &mut state.next_sleep {
                     s.as_mut().await;
                 } else {
                     futures_util::future::pending::<()>().await;
                 }
             } => {
-                // on wake, estimate update and print progressed lines if changed
-                let (maybe_tmp, next) = estimate_update_and_next_sleep(&last_update, last_update_instant, true);
-                if let Some(tmp) = maybe_tmp {
-                    // If index advanced compared to last_line_idx, print the new line(s)
-                    if tmp.index != last_line_idx {
-                        if let Some(idx) = tmp.index {
-                            if let Some(line) = tmp.lines.get(idx) {
-                                println!("{}", line.text);
-                                last_track_had_lyric = true;
-                            }
-                        }
-                        last_line_idx = tmp.index;
-                        // update stored last_update so future estimates are based on last wake time
-                        last_update = Some(tmp);
-                        // reset the instant to now so next estimate advances from here
-                        last_update_instant = Some(Instant::now());
-                    }
-                }
-                next_sleep = next;
+                state.handle_timer_wakeup();
             }
         }
     }
+
     Ok(())
 }

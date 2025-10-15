@@ -321,11 +321,10 @@ fn spawn_mpris_watcher(
 
         match handler_result {
             Ok(mut handler) => {
-                if let Err(e) = handler.handle_events().await {
-                    if debug {
+                if let Err(e) = handler.handle_events().await
+                    && debug {
                         eprintln!("[EventLoop] MPRIS handler terminated: {}", e);
                     }
-                }
             }
             Err(e) => {
                 if debug {

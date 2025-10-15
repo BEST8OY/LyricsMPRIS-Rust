@@ -51,11 +51,10 @@ impl From<MprisMetadata> for TrackMetadata {
         // Extract Spotify ID from track ID
         let spotify_id = md.trackid.and_then(|trackid| {
             // Try extracting from path like "/org/mpris/MediaPlayer2/Track/spotify/track/ID"
-            if let Some(id) = trackid.rsplit('/').next() {
-                if !id.is_empty() && id.len() == 22 {
+            if let Some(id) = trackid.rsplit('/').next()
+                && !id.is_empty() && id.len() == 22 {
                     return Some(id.to_string());
                 }
-            }
             
             // Try extracting from spotify:track:ID format
             if let Some(idx) = trackid.find("spotify:track:") {
@@ -124,11 +123,10 @@ pub fn extract_metadata(map: &HashMap<String, OwnedValue>) -> TrackMetadata {
 
     let spotify_id = get_string("mpris:trackid").and_then(|trackid| {
         // Try extracting from path
-        if let Some(id) = trackid.rsplit('/').next() {
-            if !id.is_empty() && id.len() == 22 {
+        if let Some(id) = trackid.rsplit('/').next()
+            && !id.is_empty() && id.len() == 22 {
                 return Some(id.to_string());
             }
-        }
         
         // Try spotify:track: format
         if let Some(idx) = trackid.find("spotify:track:") {

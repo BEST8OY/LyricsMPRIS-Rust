@@ -183,8 +183,8 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
             artist,
             if album.is_empty() { None } else { Some(album) },
             duration,
-        ) {
-            if let Some(best) = candidates.get(idx) {
+        )
+            && let Some(best) = candidates.get(idx) {
                 // best candidate obtained
                 // If candidate is instrumental, return a single instrumental line
                 if best.get("instrumental").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -215,7 +215,6 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
                     }
                 }
             }
-        }
     }
 
     Ok((Vec::new(), None))

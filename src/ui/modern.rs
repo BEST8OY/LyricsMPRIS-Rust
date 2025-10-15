@@ -1,3 +1,16 @@
+//! Modern TUI mode for real-time synchronized lyrics display.
+//!
+//! This module implements a full-screen terminal user interface with:
+//! - Centered, vertically aligned lyrics display
+//! - Real-time position estimation between MPRIS updates
+//! - Per-word karaoke highlighting for richsync lyrics
+//! - Dynamic event-driven rendering
+//!
+//! The event loop uses `tokio::select!` to handle:
+//! - Lyrics updates from MPRIS
+//! - User keyboard input (q/ESC to quit, k to toggle karaoke)
+//! - Per-word timer wakeups for smooth karaoke rendering
+
 use crate::pool;
 use crate::state::Update;
 use crate::ui::styles::LyricStyles;
@@ -13,8 +26,6 @@ use tokio::time::Sleep;
 use tokio::sync::mpsc;
 use std::thread;
 use tui::{Terminal, backend::CrosstermBackend};
-
-use crate::ui::estimate_update_and_next_sleep;
 
 /// UI state for the modern TUI mode
 pub struct ModernUIState {
@@ -100,48 +111,29 @@ pub async fn display_lyrics_modern(
             }
         }
     });
-    // use state.last_track_id for track-change detection; avoid redundant local copy
+    // Main event loop: handle updates, user input, and timer-driven redraws
     while !state.should_exit {
         tokio::select! {
             biased;
 
+            // MPRIS lyrics/position updates
             update = rx.recv() => {
-                // Robust track change detection for TUI mode
-                if let Some(ref upd) = update {
-                    let track_id = crate::ui::track_id(upd);
-                    if state.last_track_id.as_ref() != Some(&track_id) {
-                        state.last_track_id = None;
-                        state.last_track_id = Some(track_id);
-                    }
-                }
                 process_update(update, &mut state)?;
-
-                // After processing a new update, draw and (re)compute next per-word wakeup
-                let (maybe_tmp, next) = estimate_update_and_next_sleep(&state.last_update, state.last_update_instant, state.karaoke_enabled);
-                // Draw using the estimated update when available, otherwise fall back to the
-                // stored `state.last_update`. This ensures UI is redrawn to clear content
-                // (e.g. when cached_lines were cleared) even if no estimate exists.
-                let draw_arg = if let Some(tmp) = maybe_tmp.clone() { Some(tmp) } else { state.last_update.clone() };
-                let _ = crate::ui::modern_helpers::draw_ui_with_cache(&mut terminal, &draw_arg, &mut state.wrapped_cache, &state.cached_lines, &styles, state.karaoke_enabled);
-                next_word_sleep = next;
+                redraw_and_reschedule(&mut terminal, &mut state, &styles, &mut next_word_sleep)?;
             }
 
+            // User keyboard input
             maybe_event = event_rx.recv() => {
                 if let Some(event) = maybe_event {
                     process_event(event, &mut state)?;
-
-                    // user-driven state changes (toggle karaoke, etc) may change scheduling
-                    let (maybe_tmp, next) = estimate_update_and_next_sleep(&state.last_update, state.last_update_instant, state.karaoke_enabled);
-                    let draw_arg = if let Some(tmp) = maybe_tmp.clone() { Some(tmp) } else { state.last_update.clone() };
-                    let _ = crate::ui::modern_helpers::draw_ui_with_cache(&mut terminal, &draw_arg, &mut state.wrapped_cache, &state.cached_lines, &styles, state.karaoke_enabled);
-                    next_word_sleep = next;
+                    redraw_and_reschedule(&mut terminal, &mut state, &styles, &mut next_word_sleep)?;
                 } else {
-                    // channel closed -> exit
+                    // Event channel closed -> exit gracefully
                     state.should_exit = true;
                 }
             }
 
-            // per-word timer branch: only present when scheduled for richsync karaoke
+            // Per-word timer for smooth karaoke rendering
             _ = async {
                 if let Some(s) = &mut next_word_sleep {
                     s.as_mut().await;
@@ -149,16 +141,46 @@ pub async fn display_lyrics_modern(
                     futures_util::future::pending::<()>().await;
                 }
             } => {
-                // timer fired: redraw using estimated position and reschedule next boundary
-                let (maybe_tmp, next) = estimate_update_and_next_sleep(&state.last_update, state.last_update_instant, state.karaoke_enabled);
-                let draw_arg = if let Some(tmp) = maybe_tmp.clone() { Some(tmp) } else { state.last_update.clone() };
-                let _ = crate::ui::modern_helpers::draw_ui_with_cache(&mut terminal, &draw_arg, &mut state.wrapped_cache, &state.cached_lines, &styles, state.karaoke_enabled);
-                next_word_sleep = next;
+                redraw_and_reschedule(&mut terminal, &mut state, &styles, &mut next_word_sleep)?;
             }
         }
     }
     disable_raw_mode().map_err(to_boxed_err)?;
     execute!(io::stdout(), LeaveAlternateScreen).map_err(to_boxed_err)?;
+    Ok(())
+}
+
+/// Redraw the UI and reschedule the next timer wakeup.
+/// 
+/// Consolidates the repeated pattern of:
+/// 1. Estimate current position based on elapsed time
+/// 2. Draw UI with estimated/actual update
+/// 3. Compute next word boundary for karaoke timer
+fn redraw_and_reschedule<B: tui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    state: &mut ModernUIState,
+    styles: &LyricStyles,
+    next_word_sleep: &mut Option<Pin<Box<Sleep>>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (estimated_update, next_sleep) = crate::ui::estimate_update_and_next_sleep(
+        &state.last_update,
+        state.last_update_instant,
+        state.karaoke_enabled,
+    );
+
+    // Use estimated update if available, otherwise fall back to stored update
+    let draw_update = estimated_update.or_else(|| state.last_update.clone());
+
+    crate::ui::modern_helpers::draw_ui_with_cache(
+        terminal,
+        &draw_update,
+        &mut state.wrapped_cache,
+        &state.cached_lines,
+        styles,
+        state.karaoke_enabled,
+    )?;
+
+    *next_word_sleep = next_sleep;
     Ok(())
 }
 
@@ -169,36 +191,50 @@ fn update_cache_and_state(state: &mut ModernUIState, update: &Update) {
     state.last_update_instant = Some(Instant::now());
 }
 
-// Scheduling helpers moved to `modern_helpers.rs` (estimate_update_and_next_sleep).
-
 /// Encapsulates all logic for updating ModernUIState from an Update.
+/// 
+/// Handles track changes, errors, and position-only updates intelligently.
 fn update_state(state: &mut ModernUIState, update: Option<Update>) {
-    if let Some(update) = update {
-        let track_id = crate::ui::track_id(&update);
-        if update.lines.is_empty() && update.err.is_some() {
-            if state.last_track_id.as_ref() != Some(&track_id) {
-                state.cached_lines = None;
-                state.last_update = None;
-            }
-            state.last_track_id = Some(track_id);
-            return;
-        }
-        if update.lines.is_empty() && update.err.is_none() {
+    let Some(update) = update else {
+        // Channel closed - signal exit
+        state.should_exit = true;
+        return;
+    };
+
+    let track_id = crate::ui::track_id(&update);
+    let is_new_track = state.last_track_id.as_ref() != Some(&track_id);
+
+    // Update with error message
+    if update.lines.is_empty() && update.err.is_some() {
+        if is_new_track {
             state.cached_lines = None;
             state.last_update = None;
-            state.last_track_id = Some(track_id);
-            return;
-        }
-        if !update.lines.is_empty() {
-            update_cache_and_state(state, &update);
-        } else if let Some(ref mut last_upd) = state.last_update {
-            last_upd.index = update.index;
-            state.last_update_instant = Some(Instant::now());
         }
         state.last_track_id = Some(track_id);
-    } else {
-        state.should_exit = true;
+        return;
     }
+
+    // Empty update (no lyrics available)
+    if update.lines.is_empty() {
+        state.cached_lines = None;
+        state.last_update = None;
+        state.last_track_id = Some(track_id);
+        return;
+    }
+
+    // Full update with lyrics
+    if !update.lines.is_empty() {
+        update_cache_and_state(state, &update);
+        state.last_track_id = Some(track_id);
+        return;
+    }
+
+    // Position-only update (shouldn't reach here based on above conditions)
+    if let Some(ref mut last_upd) = state.last_update {
+        last_upd.index = update.index;
+        state.last_update_instant = Some(Instant::now());
+    }
+    state.last_track_id = Some(track_id);
 }
 
 // prepare_visible_spans moved to `ui_helpers::draw_ui_with_cache`.

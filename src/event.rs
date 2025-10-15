@@ -25,11 +25,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // Event Types
 // ============================================================================
 
+/// Context for handling new track events.
+struct NewTrackContext<'a> {
+    meta: TrackMetadata,
+    position: f64,
+    service: String,
+    playback_status: Option<String>,
+    state: &'a mut StateBundle,
+    update_tx: &'a mpsc::Sender<Update>,
+    debug_log: bool,
+    providers: &'a [String],
+}
+
 /// Events originating from MPRIS player interface.
 ///
 /// These events represent changes in the media player that require
-/// synchronization with the lyrics display.
-#[derive(Debug)]
+/// state updates and potentially UI refreshes.
+#[derive(Debug, Clone)]
 pub enum MprisEvent {
     /// Full player state update with metadata, position, and service name.
     ///
@@ -404,7 +416,7 @@ async fn handle_mpris_event(
 
     // New track detection on full updates
     if is_full_update && state.player_state.has_changed(&meta) {
-        handle_new_track(
+        handle_new_track(NewTrackContext {
             meta,
             position,
             service,
@@ -413,7 +425,7 @@ async fn handle_mpris_event(
             update_tx,
             debug_log,
             providers,
-        )
+        })
         .await;
         return;
     }
@@ -453,16 +465,18 @@ async fn handle_no_player(state: &mut StateBundle, update_tx: &mpsc::Sender<Upda
 /// Lyrics fetching is done synchronously within the event handler to ensure
 /// state consistency. The UI is updated before and after fetching to provide
 /// immediate feedback.
-async fn handle_new_track(
-    meta: TrackMetadata,
-    position: f64,
-    service: String,
-    playback_status: Option<String>,
-    state: &mut StateBundle,
-    update_tx: &mpsc::Sender<Update>,
-    debug_log: bool,
-    providers: &[String],
-) {
+async fn handle_new_track(ctx: NewTrackContext<'_>) {
+    let NewTrackContext {
+        meta,
+        position,
+        service,
+        playback_status,
+        state,
+        update_tx,
+        debug_log,
+        providers,
+    } = ctx;
+
     state.clear_lyrics();
 
     // Update playback state if available
