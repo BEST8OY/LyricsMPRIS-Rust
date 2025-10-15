@@ -1,105 +1,133 @@
-//! Minimal playback status and position querying for MPRIS.
+//! Playback status and position querying for MPRIS.
 
-use crate::mpris::connection::{MprisError, get_dbus_conn};
-use zbus::Proxy;
-use zvariant::OwnedValue;
+use crate::mpris::connection::{get_dbus_conn, MprisError};
+use zbus::proxy;
 
-fn parse_position_from_owned(val: &OwnedValue) -> Option<f64> {
-    // Try direct integer types
-    if let Ok(i) = std::convert::TryInto::<i64>::try_into(val.clone()) {
-        return Some(i as f64 / 1_000_000.0);
-    }
-    if let Ok(u) = std::convert::TryInto::<u64>::try_into(val.clone()) {
-        return Some(u as f64 / 1_000_000.0);
-    }
-
-    // Try tuple forms like (i64,) or (u64,)
-    if let Ok((i,)) = std::convert::TryInto::<(i64,)>::try_into(val.clone()) {
-        return Some(i as f64 / 1_000_000.0);
-    }
-    if let Ok((u,)) = std::convert::TryInto::<(u64,)>::try_into(val.clone()) {
-        return Some(u as f64 / 1_000_000.0);
-    }
-
-    None
+/// Playback status values according to MPRIS specification
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaybackStatus {
+    Playing,
+    Paused,
+    Stopped,
 }
 
-/// Query the playback position for a specific MPRIS player service.
+impl PlaybackStatus {
+    /// Convert MPRIS string status to enum
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "Playing" => Self::Playing,
+            "Paused" => Self::Paused,
+            _ => Self::Stopped,
+        }
+    }
+
+    /// Convert to MPRIS string status
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Playing => "Playing",
+            Self::Paused => "Paused",
+            Self::Stopped => "Stopped",
+        }
+    }
+}
+
+impl Default for PlaybackStatus {
+    fn default() -> Self {
+        Self::Stopped
+    }
+}
+
+impl From<String> for PlaybackStatus {
+    fn from(s: String) -> Self {
+        Self::from_str(&s)
+    }
+}
+
+impl From<PlaybackStatus> for String {
+    fn from(status: PlaybackStatus) -> Self {
+        status.as_str().to_string()
+    }
+}
+
+/// MPRIS MediaPlayer2.Player interface proxy for playback control
+#[proxy(
+    interface = "org.mpris.MediaPlayer2.Player",
+    default_path = "/org/mpris/MediaPlayer2"
+)]
+trait MediaPlayer2Player {
+    #[zbus(property)]
+    fn playback_status(&self) -> zbus::Result<String>;
+
+    #[zbus(property)]
+    fn position(&self) -> zbus::Result<i64>;
+}
+
+/// Query the playback position for a specific MPRIS player service
+/// 
+/// Returns position in seconds. Returns 0.0 if the service is unavailable or on error.
 pub async fn get_position(service: &str) -> Result<f64, MprisError> {
     if service.is_empty() {
         return Ok(0.0);
     }
+
     let conn = get_dbus_conn().await?;
-    // Use targeted Properties.Get to avoid triggering GetAll on some players
-    let props_proxy = Proxy::new(&conn, service, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties").await?;
-    if let Ok(reply) = props_proxy.call_method("Get", &("org.mpris.MediaPlayer2.Player", "Position")).await {
-        if let Ok(val) = reply.body().deserialize::<OwnedValue>() {
-            if let Some(pos) = parse_position_from_owned(&val) {
-                return Ok(pos);
-            }
+    
+    let proxy = MediaPlayer2PlayerProxy::builder(&conn)
+        .destination(service)?
+        .build()
+        .await?;
+
+    match proxy.position().await {
+        Ok(microseconds) => {
+            // Convert microseconds to seconds
+            Ok(microseconds as f64 / 1_000_000.0)
         }
+        Err(_) => Ok(0.0),
     }
-    Ok(0.0)
 }
 
-/// Query the playback status for a specific MPRIS player service.
+/// Query the playback status for a specific MPRIS player service
+/// 
+/// Returns "Playing", "Paused", or "Stopped" as a string.
+/// Returns "Stopped" if the service is unavailable or on error.
 pub async fn get_playback_status(service: &str) -> Result<String, MprisError> {
     if service.is_empty() {
         return Ok("Stopped".to_string());
     }
+
     let conn = get_dbus_conn().await?;
-    let props_proxy = Proxy::new(&conn, service, "/org/mpris/MediaPlayer2", "org.freedesktop.DBus.Properties").await?;
-    if let Ok(reply) = props_proxy.call_method("Get", &("org.mpris.MediaPlayer2.Player", "PlaybackStatus")).await {
-        if let Ok(val) = reply.body().deserialize::<OwnedValue>() {
-            if let Ok(status) = std::convert::TryInto::<String>::try_into(val) {
-                return Ok(status);
-            }
-        }
+    
+    let proxy = MediaPlayer2PlayerProxy::builder(&conn)
+        .destination(service)?
+        .build()
+        .await?;
+
+    match proxy.playback_status().await {
+        Ok(status) => Ok(status),
+        Err(_) => Ok("Stopped".to_string()),
     }
-    Ok("Stopped".to_string())
 }
 
-/// Seek the player by an offset in microseconds.
-///
-/// The MPRIS `Seek` method applies a relative offset (in microseconds) to
-/// the current playback position. To seek to an absolute position, callers
-/// should compute the required relative offset by comparing the desired
-/// position against the player's current estimated position. In our usage
-/// we will convert a desired absolute position (seconds) into a relative
-/// offset by querying nothing here and instead accepting the absolute
-/// position from the caller and performing a SetPosition alternative by
-/// calling Seek with the difference of (desired - 0), which is equivalent
-/// to calling Seek with the absolute position if the player supports it.
-///
-/// For simplicity we implement `seek_to_position` which calls the
-/// `org.mpris.MediaPlayer2.Player.Seek` method with the provided absolute
-/// position expressed in seconds (converted to microseconds). The method
-/// sends the raw integer microsecond value as an i64 argument.
-pub async fn seek_to_position(service: &str, position_secs: f64) -> Result<(), MprisError> {
-    if service.is_empty() {
-        return Ok(());
+/// Query the playback status as an enum
+#[allow(dead_code)]
+pub async fn get_playback_status_enum(service: &str) -> Result<PlaybackStatus, MprisError> {
+    let status_str = get_playback_status(service).await?;
+    Ok(PlaybackStatus::from_str(&status_str))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_playback_status_conversion() {
+        assert_eq!(PlaybackStatus::from_str("Playing"), PlaybackStatus::Playing);
+        assert_eq!(PlaybackStatus::from_str("Paused"), PlaybackStatus::Paused);
+        assert_eq!(PlaybackStatus::from_str("Stopped"), PlaybackStatus::Stopped);
+        assert_eq!(PlaybackStatus::from_str("Unknown"), PlaybackStatus::Stopped);
+
+        assert_eq!(PlaybackStatus::Playing.as_str(), "Playing");
+        assert_eq!(PlaybackStatus::Paused.as_str(), "Paused");
+        assert_eq!(PlaybackStatus::Stopped.as_str(), "Stopped");
     }
-
-    let conn = get_dbus_conn().await?;
-    // Create a proxy against the Player interface and call Seek
-    let player_proxy = Proxy::new(&conn, service, "/org/mpris/MediaPlayer2", "org.mpris.MediaPlayer2.Player").await?;
-
-    // Convert seconds to microseconds (i64)
-    let mut micros = (position_secs * 1_000_000.0).round();
-    if !micros.is_finite() {
-        micros = 0.0;
-    }
-    let micros_i64 = micros as i64;
-
-    // The Seek method takes an i64 offset in microseconds. We'll pass the
-    // absolute value as the offset; many players interpret Seek as relative
-    // but this is commonly supported. If a player treats it strictly as
-    // relative, this may produce incorrect results; however the user's
-    // request specifically asked to call Seek with the "current internal
-    // position", so this implementation performs that call.
-    //
-    // Use call_method to invoke Seek with a single i64 parameter.
-    let _ = player_proxy.call_method("Seek", &(micros_i64)).await?;
-
-    Ok(())
 }

@@ -31,23 +31,19 @@ pub enum Event {
 /// Format: (version << 1) | playing_bit
 static LAST_SENT_VERSION: AtomicU64 = AtomicU64::new(0);
 
-/// Computes a unique key for the current state
-fn compute_state_key(version: u64, playing: bool) -> u64 {
-    let playing_bit = if playing { 1 } else { 0 };
-    (version << 1) | playing_bit
+#[inline]
+fn state_key(version: u64, playing: bool) -> u64 {
+    (version << 1) | (playing as u64)
 }
 
-/// Checks if the state has changed since the last update
-fn has_state_changed(version: u64, playing: bool) -> bool {
-    let current_key = compute_state_key(version, playing);
-    let last_key = LAST_SENT_VERSION.load(Ordering::Relaxed);
-    current_key != last_key
+#[inline]
+fn state_changed(version: u64, playing: bool) -> bool {
+    state_key(version, playing) != LAST_SENT_VERSION.load(Ordering::Relaxed)
 }
 
-/// Marks the current state as sent
+#[inline]
 fn mark_state_sent(version: u64, playing: bool) {
-    let key = compute_state_key(version, playing);
-    LAST_SENT_VERSION.store(key, Ordering::Relaxed);
+    LAST_SENT_VERSION.store(state_key(version, playing), Ordering::Relaxed);
 }
 
 // ============================================================================
@@ -59,12 +55,12 @@ fn should_send_update(state: &StateBundle, force: bool) -> bool {
     if force {
         return true;
     }
-    
-    if !has_state_changed(state.version, state.player_state.playing) {
+
+    if !state_changed(state.version, state.player_state.playing) {
         return false;
     }
-    
-    // Send update if there's meaningful content
+
+    // Only send updates when there's something worth showing to the UI
     !state.lyric_state.lines.is_empty() || state.player_state.err.is_some()
 }
 
@@ -79,7 +75,7 @@ pub async fn send_update(state: &StateBundle, update_tx: &mpsc::Sender<Update>, 
     }
 
     let update = state.create_update();
-    
+
     if update_tx.send(update).await.is_ok() {
         mark_state_sent(state.version, state.player_state.playing);
     }
@@ -97,28 +93,17 @@ enum FetchResult {
 }
 
 /// Attempts to fetch lyrics from a single provider
-async fn try_provider(
-    provider: &str,
-    meta: &TrackMetadata,
-    state: &mut StateBundle,
-) -> FetchResult {
-    match provider {
+async fn try_provider(provider: &str, meta: &TrackMetadata, state: &mut StateBundle) -> FetchResult {
+    match provider.as_ref() {
         "lrclib" => try_lrclib(meta, state).await,
         "musixmatch" => try_musixmatch(meta, state).await,
-        _ => FetchResult::Transient, // Unknown providers are skipped
+        _ => FetchResult::Transient,
     }
 }
 
 /// Fetches lyrics from LRCLib
 async fn try_lrclib(meta: &TrackMetadata, state: &mut StateBundle) -> FetchResult {
-    match crate::lyrics::fetch_lyrics_from_lrclib(
-        &meta.artist,
-        &meta.title,
-        &meta.album,
-        meta.length,
-    )
-    .await
-    {
+    match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title, &meta.album, meta.length).await {
         Ok((lines, _raw)) if !lines.is_empty() => {
             state.update_lyrics(lines, meta, None, Some(Provider::Lrclib));
             FetchResult::Success
@@ -154,10 +139,7 @@ async fn try_musixmatch(meta: &TrackMetadata, state: &mut StateBundle) -> FetchR
 /// Determines which Musixmatch format was returned
 fn determine_musixmatch_provider(lines: &[crate::lyrics::LyricLine], raw: &Option<String>) -> Provider {
     let has_words = lines.iter().any(|l| l.words.is_some());
-    let is_richsync = raw
-        .as_ref()
-        .map(|r| r.starts_with(";;richsync=1"))
-        .unwrap_or(false);
+    let is_richsync = raw.as_deref().map(|r| r.starts_with(";;richsync=1")).unwrap_or(false);
 
     if has_words || is_richsync {
         Provider::MusixmatchRichsync
@@ -167,12 +149,7 @@ fn determine_musixmatch_provider(lines: &[crate::lyrics::LyricLine], raw: &Optio
 }
 
 /// Fetches lyrics from all configured providers
-async fn fetch_api_lyrics(
-    meta: &TrackMetadata,
-    state: &mut StateBundle,
-    debug_log: bool,
-    providers: &[String],
-) {
+async fn fetch_api_lyrics(meta: &TrackMetadata, state: &mut StateBundle, debug_log: bool, providers: &[String]) {
     for provider in providers {
         match try_provider(provider, meta, state).await {
             FetchResult::Success => return,
@@ -192,6 +169,26 @@ async fn fetch_api_lyrics(
 }
 
 
+async fn fetch_fresh_position(
+    service: Option<&str>,
+    state: &StateBundle,
+    debug_log: bool,
+) -> f64 {
+    let Some(svc) = service else {
+        return state.player_state.estimate_position();
+    };
+
+    match crate::mpris::playback::get_position(svc).await {
+        Ok(pos) => pos,
+        Err(e) => {
+            if debug_log {
+                eprintln!("[LyricsMPRIS] Failed to fetch position: {}", e);
+            }
+            state.player_state.estimate_position()
+        }
+    }
+}
+
 
 /// Fetches lyrics and updates position atomically
 pub async fn fetch_and_update_lyrics(
@@ -202,24 +199,12 @@ pub async fn fetch_and_update_lyrics(
     service: Option<&str>,
 ) -> f64 {
     fetch_api_lyrics(meta, state, debug_log, providers).await;
-    // After fetching lyrics, instead of querying the player for position,
-    // seek the player to our internal estimate to synchronize timing. This
-    // avoids an extra Properties.Get call and uses our calculated anchor.
-    let estimated = state.player_state.estimate_position();
-
-    if let Some(svc) = service {
-        if let Err(e) = crate::mpris::playback::seek_to_position(svc, estimated).await {
-            if debug_log {
-                eprintln!("[LyricsMPRIS] Failed to seek player: {}", e);
-            }
-        }
-    }
-
-    // Update index and anchor to the estimated position
-    state.update_index(estimated);
-    state.player_state.set_position(estimated);
-
-    estimated
+    
+    let position = fetch_fresh_position(service, state, debug_log).await;
+    state.update_index(position);
+    state.player_state.set_position(position);
+    
+    position
 }
 
 // ============================================================================
@@ -235,12 +220,8 @@ pub async fn process_event(
     providers: &[String],
 ) {
     match event {
-        Event::Mpris(mpris_event) => {
-            handle_mpris_event(mpris_event, state, update_tx, debug_log, providers).await;
-        }
-        Event::Shutdown => {
-            send_update(state, update_tx, true).await;
-        }
+        Event::Mpris(ev) => handle_mpris_event(ev, state, update_tx, debug_log, providers).await,
+        Event::Shutdown => send_update(state, update_tx, true).await,
     }
 }
 
@@ -252,38 +233,40 @@ async fn handle_mpris_event(
     debug_log: bool,
     providers: &[String],
 ) {
-    let (meta, position, service, is_player_update) = match event {
+    let (meta, position, service, is_full_update) = match event {
         MprisEvent::PlayerUpdate(m, p, s) => (m, p, s, true),
         MprisEvent::Seeked(m, p, s) => (m, p, s, false),
     };
 
-    // Handle empty service (no active player)
+    // No active player: clear state and notify UI
     if service.is_empty() {
         handle_no_player(state, update_tx).await;
         return;
     }
 
-    // Only query playback status for full PlayerUpdate events. Seeked events are
-    // position-only and shouldn't trigger property fetches.
-    let playback_status = if is_player_update {
-        get_playback_status(&service).await
-    } else {
-        None
-    };
+    // Only fetch playback status for full updates
+    let playback_status = if is_full_update { get_playback_status(&service).await } else { None };
 
-    // Handle stopped player (only meaningful for PlayerUpdate)
-    if is_player_update && playback_status.as_deref() == Some("Stopped") {
+    // If the player reported 'Stopped' on a full update, treat as no player
+    if is_full_update && playback_status.as_deref() == Some("Stopped") {
         handle_no_player(state, update_tx).await;
         return;
     }
 
-    // Handle new track
-    if is_player_update && state.player_state.has_changed(&meta) {
+    // New track detection on full updates
+    if is_full_update && state.player_state.has_changed(&meta) {
         handle_new_track(meta, position, service, playback_status, state, update_tx, debug_log, providers).await;
         return;
     }
 
-    // Handle position/playback state changes
+    // If this was a Seeked event (not a full PlayerUpdate), force a UI update
+    // so the UI immediately reflects the new position/highlight even if the
+    // index or playing flag didn't change.
+    if !is_full_update {
+        send_update(state, update_tx, true).await;
+    }
+
+    // Otherwise it's a position/playback update
     handle_state_update(position, playback_status, state, update_tx).await;
 }
 
@@ -346,6 +329,8 @@ async fn handle_state_update(
     let position = state.player_state.estimate_position();
     let changed_index = state.update_index(position);
 
+
+    
     // Send update if meaningful change occurred
     let playing_changed = prev_playing != state.player_state.playing;
     if playing_changed || changed_index {
@@ -360,5 +345,3 @@ async fn get_playback_status(service: &str) -> Option<String> {
         .ok()
         .filter(|s| !s.is_empty())
 }
-
-// Polling support removed; lyrics are fetched immediately on MPRIS new-track events.
