@@ -84,12 +84,12 @@ export RUST_LOG=debug                   # Show debug logs
 export RUST_LOG=lyricsmpris::lyrics=trace  # Trace specific module
 ```
 
-# Default provider list (if --providers not specified)
+### Default provider list (if --providers not specified)
 ```
 export LYRIC_PROVIDERS="lrclib,musixmatch"
 ```
 
-#### Getting a Musixmatch Token
+### Getting a Musixmatch Token
 
 **Method 1: Curators Settings (Easiest)**
 
