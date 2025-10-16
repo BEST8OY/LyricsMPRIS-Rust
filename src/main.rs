@@ -129,13 +129,13 @@ async fn start_ui(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initialize tracing with environment filter
+    // Logs are OFF by default. Users can enable with RUST_LOG environment variable.
+    // When enabled, logs go to stderr to avoid polluting stdout (used for pipe mode and TUI)
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into())
-        )
+        .with_env_filter(EnvFilter::from_default_env())
         .with_target(true)
         .with_thread_ids(false)
+        .with_writer(std::io::stderr)
         .init();
 
     let mut cfg = Config::parse();
