@@ -13,7 +13,7 @@ A lightweight, high-performance lyrics viewer for Linux that integrates seamless
 
 ### Lyrics Sources
 - **📚 LRCLIB**: Community-maintained database (returns LRC timestamp format)
-- **🎵 Musixmatch**: Professional lyrics with word-level timing (JSON formats)
+- **🎵 Musixmatch**: Professional lyrics with word-level/line-level timing (JSON formats)
 - **🔄 Configurable Priority**: Set your preferred provider order
 - **💾 Local Cache**: Optional database for offline access and reduced API calls
 
