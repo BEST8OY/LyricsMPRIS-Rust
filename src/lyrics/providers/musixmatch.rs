@@ -67,8 +67,9 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
                     .pointer("/track.richsync.get/message/body/richsync/richsync_body")
                     .and_then(|v| v.as_str())
                 {
-                    if let Some((parsed, raw)) = crate::lyrics::parse::parse_richsync_body(richsync_body) {
-                        return Ok(Some((parsed, raw)));
+                    if let Some(parsed) = crate::lyrics::parse::parse_richsync_body(richsync_body) {
+                        // Return parsed lines and the original JSON body
+                        return Ok(Some((parsed, richsync_body.to_string())));
                     }
                 }
             }
@@ -79,8 +80,9 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
                     .pointer("/track.subtitles.get/message/body/subtitle_list/0/subtitle/subtitle_body")
                     .and_then(|v| v.as_str())
                 {
-                    if let Some((parsed, raw)) = crate::lyrics::parse::parse_subtitle_body(subtitle_body) {
-                        return Ok(Some((parsed, raw)));
+                    if let Some(parsed) = crate::lyrics::parse::parse_subtitle_body(subtitle_body) {
+                        // Return parsed lines and the original JSON body
+                        return Ok(Some((parsed, subtitle_body.to_string())));
                     }
                 }
             }

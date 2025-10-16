@@ -29,17 +29,17 @@ use std::sync::Arc;
 /// Identifies the lyrics provider for the current track.
 ///
 /// Each variant represents a distinct lyrics source with different capabilities:
-/// - [`Provider::Lrclib`]: Community-maintained LRC database
-/// - [`Provider::MusixmatchRichsync`]: Word-level synchronized lyrics
-/// - [`Provider::MusixmatchSubtitles`]: Line-level synchronized lyrics
+/// - [`Provider::Lrclib`]: LRCLIB database (returns LRC timestamp format)
+/// - [`Provider::MusixmatchRichsync`]: Word-level synchronized lyrics (JSON)
+/// - [`Provider::MusixmatchSubtitles`]: Line-level synchronized lyrics (JSON)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Provider {
-    /// LRCLib community lyrics database
+    /// LRCLIB provider - returns LRC format: `[MM:SS.CC]lyrics`
     Lrclib,
-    /// Musixmatch with word-level timestamps (richsync format)
+    /// Musixmatch provider - richsync format with word-level timing (JSON)
     MusixmatchRichsync,
-    /// Musixmatch with line-level timestamps (subtitle format)
+    /// Musixmatch provider - subtitle format with line-level timing (JSON)
     MusixmatchSubtitles,
 }
 

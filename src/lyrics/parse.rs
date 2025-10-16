@@ -53,20 +53,16 @@ pub fn parse_synced_lyrics(synced: &str) -> Vec<LyricLine> {
 ///
 /// Format: `[{"text": "lyrics", "time": {"total": 29.26, ...}}, ...]`
 ///
-/// Returns (parsed_lines, lrc_string) or None if parsing fails.
-pub fn parse_subtitle_body(subtitle_body: &str) -> Option<(Vec<LyricLine>, String)> {
+/// Returns parsed lines or None if parsing fails.
+pub fn parse_subtitle_body(subtitle_body: &str) -> Option<Vec<LyricLine>> {
     let lines_val = serde_json::from_str::<Value>(subtitle_body).ok()?;
     let arr = lines_val.as_array()?;
 
     let mut parsed = Vec::new();
-    let mut lrc_output = String::new();
 
     for line in arr {
         let time = line.pointer("/time/total").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let text = line.get("text").and_then(|v| v.as_str()).unwrap_or("♪");
-
-        // Generate LRC timestamp
-        lrc_output.push_str(&format_lrc_timestamp(time, text));
 
         parsed.push(LyricLine {
             time,
@@ -75,7 +71,7 @@ pub fn parse_subtitle_body(subtitle_body: &str) -> Option<(Vec<LyricLine>, Strin
         });
     }
 
-    Some((parsed, lrc_output))
+    Some(parsed)
 }
 
 /// Parse Musixmatch richsync_body JSON into lyric lines with word-level timing.
@@ -84,13 +80,12 @@ pub fn parse_subtitle_body(subtitle_body: &str) -> Option<(Vec<LyricLine>, Strin
 /// 1. Word array: `{"ts": 29.26, "te": 31.59, "x": "text", "words": [{start, end, text}]}`
 /// 2. Character array: `{"ts": 29.26, "te": 31.59, "x": "text", "l": [{c, o}]}`
 ///
-/// Returns (parsed_lines, lrc_with_richsync_marker) or None if parsing fails.
-pub fn parse_richsync_body(richsync_body: &str) -> Option<(Vec<LyricLine>, String)> {
+/// Returns parsed lines or None if parsing fails.
+pub fn parse_richsync_body(richsync_body: &str) -> Option<Vec<LyricLine>> {
     let lines_val = serde_json::from_str::<Value>(richsync_body).ok()?;
     let arr = lines_val.as_array()?;
 
     let mut parsed = Vec::new();
-    let mut lrc_output = String::new();
 
     for line in arr {
         let line_start = line.pointer("/ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -100,9 +95,6 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<(Vec<LyricLine>, Strin
             .or_else(|| line.get("text"))
             .and_then(|v| v.as_str())
             .unwrap_or("♪");
-
-        // Generate LRC timestamp
-        lrc_output.push_str(&format_lrc_timestamp(line_start, text));
 
         // Parse word-level timings (if available)
         let words = parse_word_timings(line, line_start, line_end);
@@ -114,17 +106,7 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<(Vec<LyricLine>, Strin
         });
     }
 
-    let output_with_marker = format!(";;richsync=1\n{}", lrc_output);
-    Some((parsed, output_with_marker))
-}
-
-/// Format a timestamp and text into LRC format: [MM:SS.CC]text
-fn format_lrc_timestamp(time: f64, text: &str) -> String {
-    let ms = (time * 1000.0).round() as u64;
-    let minutes = ms / 60000;
-    let seconds = (ms % 60000) / 1000;
-    let centiseconds = (ms % 1000) / 10;
-    format!("[{:02}:{:02}.{:02}]{}\n", minutes, seconds, centiseconds, text)
+    Some(parsed)
 }
 
 /// Parse word timings from a richsync line object.

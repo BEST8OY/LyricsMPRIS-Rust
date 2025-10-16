@@ -200,18 +200,48 @@ async fn try_provider(provider: &str, meta: &TrackMetadata, state: &mut StateBun
     }
 }
 
-/// Fetches lyrics from LRCLib.
+/// Stores fetched lyrics in the database cache.
+///
+/// Helper to reduce duplication across provider implementations.
+async fn store_lyrics_in_cache(
+    meta: &TrackMetadata,
+    raw: Option<String>,
+    format: crate::lyrics::database::LyricsFormat,
+) {
+    if let Some(raw_text) = raw {
+        crate::lyrics::database::store_in_database(
+            &meta.artist,
+            &meta.title,
+            &meta.album,
+            meta.length,
+            format,
+            raw_text,
+        ).await;
+    }
+}
+
+/// Fetches lyrics from LRCLIB.
 ///
 /// Network errors are treated as transient to allow fallback to other providers.
 async fn try_lrclib(meta: &TrackMetadata, state: &mut StateBundle) -> FetchResult {
     match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title, &meta.album, meta.length).await {
-        Ok((lines, _raw)) if !lines.is_empty() => {
+        Ok((lines, raw)) if !lines.is_empty() => {
             state.update_lyrics(lines, meta, None, Some(Provider::Lrclib));
+            store_lyrics_in_cache(meta, raw, crate::lyrics::database::LyricsFormat::Lrclib).await;
             FetchResult::Success
         }
         Ok(_) => FetchResult::Transient,
         Err(crate::lyrics::LyricsError::Network(_)) => FetchResult::Transient,
         Err(e) => FetchResult::NonTransient(e),
+    }
+}
+
+/// Maps a Provider enum to the corresponding database LyricsFormat.
+fn provider_to_db_format(provider: Provider) -> crate::lyrics::database::LyricsFormat {
+    match provider {
+        Provider::Lrclib => crate::lyrics::database::LyricsFormat::Lrclib,
+        Provider::MusixmatchRichsync => crate::lyrics::database::LyricsFormat::Richsync,
+        Provider::MusixmatchSubtitles => crate::lyrics::database::LyricsFormat::Subtitles,
     }
 }
 
@@ -232,6 +262,10 @@ async fn try_musixmatch(meta: &TrackMetadata, state: &mut StateBundle) -> FetchR
         Ok((lines, raw)) if !lines.is_empty() => {
             let provider = determine_musixmatch_provider(&lines, &raw);
             state.update_lyrics(lines, meta, None, Some(provider));
+            
+            let format = provider_to_db_format(provider);
+            store_lyrics_in_cache(meta, raw, format).await;
+            
             FetchResult::Success
         }
         Ok(_) => FetchResult::Transient,
@@ -257,23 +291,113 @@ fn determine_musixmatch_provider(lines: &[crate::lyrics::LyricLine], raw: &Optio
     }
 }
 
+/// Determines provider type from raw lyrics format.
+///
+/// Used when retrieving lyrics from the database cache.
+/// Detects based on JSON structure since raw is now the original JSON.
+///
+/// # Format Detection
+///
+/// - **Richsync**: `[{"ts":29.26,"te":31.597,"l":[{"c":"Have","o":0}...],"x":"text"}...]`
+///   - Has `"ts"`, `"te"`, `"l"`, or `"words"` fields
+///   - Contains word-level timing data
+///
+/// - **Subtitles**: `[{"text":"lyrics","time":{"total":29.26,"minutes":0,"seconds":29,"hundredths":26}}...]`
+///   - Has `"time"` object with `"total"`, `"minutes"`, `"seconds"` fields
+///   - Line-level timing only
+///
+/// - **LRC**: `[00:29.26]Have you got colour in your cheeks?`
+///   - Plain text with timestamp markers
+fn detect_provider_from_raw(raw: &Option<String>) -> Option<Provider> {
+    raw.as_deref().map(|text| {
+        let trimmed = text.trim_start();
+        if trimmed.starts_with("[{") {
+            // JSON array - distinguish between richsync and subtitles
+            // Richsync has word-level timing: "l":[...] or "words":[...]
+            // Subtitles has line-level timing: "time":{"total":...}
+            if trimmed.contains("\"ts\":") || trimmed.contains("\"l\":[") || trimmed.contains("\"words\":[") {
+                Provider::MusixmatchRichsync
+            } else if trimmed.contains("\"time\":{") {
+                Provider::MusixmatchSubtitles
+            } else {
+                // Unknown JSON format, default to subtitles
+                Provider::MusixmatchSubtitles
+            }
+        } else if trimmed.starts_with('[') {
+            // LRC format starts with [MM:SS.CC]
+            Provider::Lrclib
+        } else {
+            // Default to LRCLIB
+            Provider::Lrclib
+        }
+    })
+}
+
+/// Attempts to fetch lyrics from the database cache.
+///
+/// Returns `true` if lyrics were found and loaded successfully.
+async fn try_database(
+    meta: &TrackMetadata,
+    state: &mut StateBundle,
+    debug_log: bool,
+) -> bool {
+    let Some(db_result) = crate::lyrics::database::fetch_from_database(
+        &meta.artist,
+        &meta.title,
+        &meta.album,
+    ).await else {
+        return false;
+    };
+
+    match db_result {
+        Ok((lines, raw)) if !lines.is_empty() => {
+            let provider = detect_provider_from_raw(&raw);
+            state.update_lyrics(lines, meta, None, provider);
+            
+            if debug_log {
+                eprintln!("[Database] Cache hit for {}", meta.title);
+            }
+            true
+        }
+        Ok(_) => {
+            if debug_log {
+                eprintln!("[Database] Empty lyrics in cache for {}", meta.title);
+            }
+            false
+        }
+        Err(e) => {
+            if debug_log {
+                eprintln!("[Database] Parse error for {}: {}", meta.title, e);
+            }
+            false
+        }
+    }
+}
+
 /// Fetches lyrics from all configured providers in order.
 ///
 /// Stops on the first successful fetch or non-transient error.
 ///
 /// # Behavior
 ///
-/// 1. Try each provider in order
-/// 2. On success: update state and return
-/// 3. On transient error: try next provider
-/// 4. On non-transient error: log, update state with error, return
-/// 5. If all fail: update state with empty lyrics
+/// 1. Check database first
+/// 2. Try each provider in order
+/// 3. On success: update state and return
+/// 4. On transient error: try next provider
+/// 5. On non-transient error: log, update state with error, return
+/// 6. If all fail: update state with empty lyrics
 async fn fetch_api_lyrics(
     meta: &TrackMetadata,
     state: &mut StateBundle,
     debug_log: bool,
     providers: &[String],
 ) {
+    // Try database cache first
+    if try_database(meta, state, debug_log).await {
+        return;
+    }
+
+    // Database miss - try external providers
     for provider in providers {
         match try_provider(provider, meta, state).await {
             FetchResult::Success => return,

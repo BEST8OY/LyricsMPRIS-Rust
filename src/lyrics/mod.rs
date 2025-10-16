@@ -1,4 +1,5 @@
 // lyrics/mod.rs - top-level lyrics module re-exporting submodules
+pub mod database;
 pub mod parse;
 pub mod providers;
 pub mod similarity;

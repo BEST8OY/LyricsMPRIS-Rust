@@ -91,7 +91,7 @@ pub fn extract_metadata(map: &HashMap<String, OwnedValue>) -> TrackMetadata {
     // Helper to extract string array from variant
     let get_string_array = |key: &str| -> Option<Vec<String>> {
         map.get(key).and_then(|v| {
-            // Try to deserialize directly from OwnedValue
+            // Try to deserialize directly from OwnedValue as array
             zvariant::Array::try_from(v.clone())
                 .ok()
                 .and_then(|arr| {
@@ -113,12 +113,19 @@ pub fn extract_metadata(map: &HashMap<String, OwnedValue>) -> TrackMetadata {
     };
 
     let title = get_string("xesam:title").unwrap_or_default();
+    
+    // Artist: try array first, fallback to string
     let artist = get_string_array("xesam:artist")
         .and_then(|arr| arr.into_iter().next())
+        .or_else(|| get_string("xesam:artist"))
         .unwrap_or_default();
+    
+    // Album: try array first, fallback to string
     let album = get_string_array("xesam:album")
         .and_then(|arr| arr.into_iter().next())
+        .or_else(|| get_string("xesam:album"))
         .unwrap_or_default();
+    
     let length = get_i64("mpris:length").map(|microsecs| microsecs as f64 / 1_000_000.0);
 
     let spotify_id = get_string("mpris:trackid").and_then(|trackid| {

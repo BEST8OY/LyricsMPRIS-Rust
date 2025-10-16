@@ -38,6 +38,9 @@ pub struct Config {
     /// If empty, the LYRIC_PROVIDERS env var will be used as a fallback.
     #[arg(long, value_delimiter = ',')]
     pub providers: Vec<String>,
+    /// Path to local lyrics database JSON file for caching
+    #[arg(long = "database")]
+    pub database: Option<String>,
     /// Cached current player service for efficient D-Bus queries
     pub player_service: Option<String>,
 }
@@ -49,6 +52,7 @@ impl Default for Config {
             block: vec![],
             debug_log: false,
             providers: vec!["lrclib".to_string(), "musixmatch".to_string()],
+            database: None,
             player_service: None,
             no_karaoke: false,
         }
@@ -70,51 +74,72 @@ fn providers_from_env_if_empty(cli: &mut Config) {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    let cfg = Config::parse();
-    let mut cfg = cfg;
-    providers_from_env_if_empty(&mut cfg);
-    // polling removed: rely solely on MPRIS events
+/// Initializes the database if a path is provided in the configuration.
+async fn initialize_database(config: &Config) {
+    if let Some(db_path) = &config.database {
+        lyrics::database::initialize(std::path::PathBuf::from(db_path)).await;
+    }
+}
 
-    // Always start the UI, even if no song is playing yet
-    // Try to get current metadata/position, but ignore errors and let UI handle waiting
-    let service = cfg.player_service.clone().unwrap_or_default();
-    let meta = match get_metadata(&service).await {
+/// Fetches initial metadata from the player service.
+///
+/// Returns default metadata on error, logging if debug is enabled.
+async fn fetch_initial_metadata(service: &str, debug_log: bool) -> crate::mpris::TrackMetadata {
+    match get_metadata(service).await {
         Ok(meta) => meta,
         Err(e) => {
-            if cfg.debug_log {
+            if debug_log {
                 eprintln!("[LyricsMPRIS] D-Bus error getting metadata: {}", e);
             }
             Default::default()
         }
-    };
-    let pos = match get_position(&service).await {
+    }
+}
+
+/// Fetches initial playback position from the player service.
+///
+/// Returns 0.0 on error, logging if debug is enabled.
+async fn fetch_initial_position(service: &str, debug_log: bool) -> f64 {
+    match get_position(service).await {
         Ok(pos) => pos,
         Err(e) => {
-            if cfg.debug_log {
+            if debug_log {
                 eprintln!("[LyricsMPRIS] D-Bus error getting position: {}", e);
             }
             0.0
         }
-    };
-
-    let result = if cfg.pipe {
-        crate::ui::pipe::display_lyrics_pipe(meta, pos, cfg.clone()).await
-    } else {
-        crate::ui::modern::display_lyrics_modern(
-            meta,
-            pos,
-            cfg.clone(),
-            !cfg.no_karaoke,
-        )
-        .await
-    };
-
-    // Print error if any, for better diagnostics
-    if let Err(e) = result {
-        eprintln!("Error: {}", e);
-        return Err(e);
     }
-    Ok(())
+}
+
+/// Starts the appropriate UI mode based on configuration.
+async fn start_ui(
+    meta: crate::mpris::TrackMetadata,
+    position: f64,
+    config: Config,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    if config.pipe {
+        crate::ui::pipe::display_lyrics_pipe(meta, position, config).await
+    } else {
+        let enable_karaoke = !config.no_karaoke;
+        crate::ui::modern::display_lyrics_modern(meta, position, config, enable_karaoke).await
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut cfg = Config::parse();
+    providers_from_env_if_empty(&mut cfg);
+
+    initialize_database(&cfg).await;
+
+    // Fetch initial state from player (fallback to defaults on error)
+    let service = cfg.player_service.as_deref().unwrap_or("");
+    let meta = fetch_initial_metadata(service, cfg.debug_log).await;
+    let position = fetch_initial_position(service, cfg.debug_log).await;
+
+    // Start UI and propagate any errors
+    start_ui(meta, position, cfg).await.map_err(|e| {
+        eprintln!("Error: {}", e);
+        e
+    })
 }
