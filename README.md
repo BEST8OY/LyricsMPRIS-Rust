@@ -70,7 +70,6 @@ cargo build --release
 | `--no-karaoke` | Disable word-level highlighting | - |
 | `--pipe` | Output to stdout instead of TUI | - |
 | `--block LIST` | Ignore specific MPRIS services | `--block vlc,chromium` |
-| `--debug-log` | Enable diagnostic logging | - |
 
 ### Environment Variables
 
@@ -78,17 +77,28 @@ cargo build --release
 # Musixmatch user token (required for Musixmatch provider)
 export MUSIXMATCH_USERTOKEN="your-token-here"
 
+# Logging configuration (uses tracing crate)
+# Levels: error, warn, info, debug, trace
+export RUST_LOG=info                    # Default: show info and above
+export RUST_LOG=debug                   # Show debug logs
+export RUST_LOG=lyricsmpris::lyrics=trace  # Trace specific module
+```
+
 # Default provider list (if --providers not specified)
 export LYRIC_PROVIDERS="lrclib,musixmatch"
 ```
 
 #### Getting a Musixmatch Token
 
-1. Open [Musixmatch Web Player](https://www.musixmatch.com)
-2. Open Browser DevTools (F12) → Network tab
-3. Play any song and look for requests to `apic-desktop.musixmatch.com`
-4. Find the `x-mxm-token-guid` cookie value
-5. Set it as `MUSIXMATCH_USERTOKEN`
+**Method 1: Curators Settings (Easiest)**
+
+1. Go to the [Musixmatch Curators Settings](https://curators.musixmatch.com/settings) page
+2. Login if prompted
+3. Scroll down to the bottom of the page
+4. Click **"Copy debug info"**
+5. Paste the debug info into a text editor
+6. Find the `UserToken` in the copied text
+7. Copy that token and set it as `MUSIXMATCH_USERTOKEN`
 
 ### TUI Keyboard Shortcuts
 
@@ -137,7 +147,6 @@ The database stores lyrics in their original format by provider:
       "duration": 272.0,
       "format": "richsync",
       "raw_lyrics": "[{\"ts\":29.26,\"te\":31.597,...}]",
-      "created_at": 1729123456
     }
   }
 }
@@ -170,7 +179,7 @@ Ignore specific players if needed:
 
 ```bash
 # Block web browsers and unwanted players
-lyricsmpris --block chromium,firefox,plasma-browser-integration
+lyricsmpris --block chromium,firefox
 ```
 
 ## 🔧 Advanced Usage
@@ -190,31 +199,7 @@ tail = true
 "custom/lyrics": {
   "exec": "lyricsmpris --pipe",
   "return-type": "text",
-  "interval": 1
 }
-```
-
-### Systemd User Service
-
-Create `~/.config/systemd/user/lyricsmpris.service`:
-
-```ini
-[Unit]
-Description=LyricsMPRIS Lyrics Viewer
-After=graphical-session.target
-
-[Service]
-Type=simple
-ExecStart=%h/.local/bin/lyricsmpris --database %h/.local/share/lyricsmpris/cache.json
-Restart=on-failure
-
-[Install]
-WantedBy=default.target
-```
-
-Enable and start:
-```bash
-systemctl --user enable --now lyricsmpris
 ```
 
 ## 🏗️ Architecture
@@ -253,8 +238,30 @@ src/
 
 1. **Check provider order**: Try `--providers musixmatch,lrclib`
 2. **Verify Musixmatch token**: Ensure `MUSIXMATCH_USERTOKEN` is set
-3. **Enable debug logging**: Use `--debug-log` to see API responses
+3. **Enable debug logging**: Use `RUST_LOG=debug` to see detailed logs
 4. **Check metadata**: Some players may not provide complete track info
+
+### Debugging
+
+Use the `RUST_LOG` environment variable for diagnostics:
+
+```bash
+# Show all debug information
+RUST_LOG=debug lyricsmpris
+
+# Only show errors
+RUST_LOG=error lyricsmpris
+
+# Debug specific components
+RUST_LOG=lyricsmpris::lyrics=debug lyricsmpris
+RUST_LOG=lyricsmpris::mpris=trace lyricsmpris
+
+# Multiple modules with different levels
+RUST_LOG=lyricsmpris::lyrics=debug,lyricsmpris::database=trace lyricsmpris
+
+# Save logs to file
+RUST_LOG=debug lyricsmpris 2> debug.log
+```
 
 ### Performance Issues
 
@@ -286,7 +293,10 @@ Contributions are welcome! Please:
 cargo run
 
 # Run with debug logging
-cargo run -- --debug-log
+RUST_LOG=debug cargo run
+
+# Run with trace logging for specific module
+RUST_LOG=lyricsmpris::lyrics=trace cargo run
 
 # Run tests
 cargo test
@@ -311,7 +321,7 @@ See the [LICENSE](LICENSE) file for details.
 
 - **Language**: Rust 🦀
 - **Architecture**: Event-driven, async/await
-- **Binary Size**: ~10MB (release, stripped)
+- **Binary Size**: ~12MB (release, stripped)
 - **Memory Usage**: <20MB typical
 - **CPU Usage**: ~0% typical
 - **Dependencies**: Minimal, security-conscious selection
