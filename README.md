@@ -2,6 +2,8 @@
 
 A lightweight, high-performance lyrics viewer for Linux that integrates seamlessly with MPRIS-compatible media players. Features real-time synchronized lyrics with optional karaoke-style word highlighting, local caching, and multiple provider support.
 
+![LyricMPRIS-Rust](https://github.com/user-attachments/assets/501f224e-6c40-46cd-ac66-cd9ae4f927cf)
+
 ## ✨ Features
 
 ### Display Modes
