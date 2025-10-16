@@ -69,11 +69,6 @@ impl LoopConfig {
         }
     }
 
-    /// Returns whether debug logging is enabled.
-    fn debug_log(&self) -> bool {
-        self.inner.debug_log
-    }
-
     /// Returns the list of blocked player services.
     fn block_list(&self) -> &[String] {
         &self.inner.block
@@ -206,16 +201,17 @@ async fn initialize_with_player(
 ///
 /// # Error Handling
 ///
-/// D-Bus enumeration errors are logged (if debug enabled) and treated as no player.
+/// D-Bus enumeration errors are logged and treated as no player.
 async fn discover_active_player(config: &LoopConfig) -> Option<String> {
     match crate::mpris::get_active_player_names().await {
         Ok(names) => names
             .into_iter()
             .find(|service| !crate::mpris::is_blocked(service, config.block_list())),
         Err(e) => {
-            if config.debug_log() {
-                eprintln!("[EventLoop] Failed to enumerate players: {}", e);
-            }
+            tracing::warn!(
+                error = %e,
+                "Failed to enumerate MPRIS players"
+            );
             None
         }
     }
@@ -241,17 +237,19 @@ async fn handle_no_player(
 ///
 /// # Error Handling
 ///
-/// Errors are logged (if debug enabled) and default metadata is returned.
+/// Errors are logged and default metadata is returned.
 async fn fetch_initial_metadata(
     service: &str,
-    config: &LoopConfig,
+    _config: &LoopConfig,
 ) -> TrackMetadata {
     match crate::mpris::metadata::get_metadata(service).await {
         Ok(metadata) => metadata,
         Err(e) => {
-            if config.debug_log() {
-                eprintln!("[EventLoop] Failed to fetch metadata for {}: {}", service, e);
-            }
+            tracing::warn!(
+                service = %service,
+                error = %e,
+                "Failed to fetch initial metadata"
+            );
             TrackMetadata::default()
         }
     }
@@ -272,7 +270,6 @@ async fn initialize_lyrics_state(
     let position = event::fetch_and_update_lyrics(
         metadata,
         &mut loop_state.state_bundle,
-        config.debug_log(),
         config.providers(),
         Some(service),
     )
@@ -301,7 +298,6 @@ fn spawn_mpris_watcher(
     let update_tx = event_tx.clone();
     let seek_tx = event_tx;
     let block_list = config.block_list().to_vec();
-    let debug = config.debug_log();
 
     tokio::spawn(async move {
         let handler_result = MprisEventHandler::with_closures(
@@ -321,15 +317,18 @@ fn spawn_mpris_watcher(
 
         match handler_result {
             Ok(mut handler) => {
-                if let Err(e) = handler.handle_events().await
-                    && debug {
-                        eprintln!("[EventLoop] MPRIS handler terminated: {}", e);
-                    }
+                if let Err(e) = handler.handle_events().await {
+                    tracing::error!(
+                        error = %e,
+                        "MPRIS event handler terminated"
+                    );
+                }
             }
             Err(e) => {
-                if debug {
-                    eprintln!("[EventLoop] Failed to initialize MPRIS handler: {}", e);
-                }
+                tracing::error!(
+                    error = %e,
+                    "Failed to initialize MPRIS event handler"
+                );
             }
         }
     });
@@ -383,7 +382,6 @@ async fn handle_shutdown(
         Event::Shutdown,
         &mut loop_state.state_bundle,
         update_tx,
-        config.debug_log(),
         config.providers(),
     )
     .await;
@@ -401,9 +399,7 @@ async fn handle_event(
 ) {
     let Some(event) = event else {
         // Event channel closed - MPRIS watcher terminated
-        if config.debug_log() {
-            eprintln!("[EventLoop] MPRIS channel closed");
-        }
+        tracing::warn!("MPRIS event channel closed");
         return;
     };
 
@@ -411,7 +407,6 @@ async fn handle_event(
         event,
         &mut loop_state.state_bundle,
         update_tx,
-        config.debug_log(),
         config.providers(),
     )
     .await;

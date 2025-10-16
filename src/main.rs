@@ -11,6 +11,7 @@ use crate::mpris::metadata::get_metadata;
 use crate::mpris::playback::get_position;
 use clap::Parser;
 use std::error::Error;
+use tracing_subscriber::EnvFilter;
 // polling removed; no Duration needed here
 
 /// Application configuration from CLI
@@ -28,9 +29,6 @@ pub struct Config {
         value_delimiter = ','
     )]
     block: Vec<String>,
-    /// Enable backend error logging to stderr
-    #[arg(long)]
-    pub debug_log: bool,
     /// Disable karaoke highlighting (per-word). Use --no-karaoke to disable karaoke (default: enabled).
     #[arg(long = "no-karaoke")]
     pub no_karaoke: bool,
@@ -50,7 +48,6 @@ impl Default for Config {
         Self {
             pipe: false,
             block: vec![],
-            debug_log: false,
             providers: vec!["lrclib".to_string(), "musixmatch".to_string()],
             database: None,
             player_service: None,
@@ -83,14 +80,16 @@ async fn initialize_database(config: &Config) {
 
 /// Fetches initial metadata from the player service.
 ///
-/// Returns default metadata on error, logging if debug is enabled.
-async fn fetch_initial_metadata(service: &str, debug_log: bool) -> crate::mpris::TrackMetadata {
+/// Returns default metadata on error with warning log.
+async fn fetch_initial_metadata(service: &str) -> crate::mpris::TrackMetadata {
     match get_metadata(service).await {
         Ok(meta) => meta,
         Err(e) => {
-            if debug_log {
-                eprintln!("[LyricsMPRIS] D-Bus error getting metadata: {}", e);
-            }
+            tracing::warn!(
+                service = %service,
+                error = %e,
+                "D-Bus error getting initial metadata"
+            );
             Default::default()
         }
     }
@@ -98,14 +97,16 @@ async fn fetch_initial_metadata(service: &str, debug_log: bool) -> crate::mpris:
 
 /// Fetches initial playback position from the player service.
 ///
-/// Returns 0.0 on error, logging if debug is enabled.
-async fn fetch_initial_position(service: &str, debug_log: bool) -> f64 {
+/// Returns 0.0 on error with warning log.
+async fn fetch_initial_position(service: &str) -> f64 {
     match get_position(service).await {
         Ok(pos) => pos,
         Err(e) => {
-            if debug_log {
-                eprintln!("[LyricsMPRIS] D-Bus error getting position: {}", e);
-            }
+            tracing::warn!(
+                service = %service,
+                error = %e,
+                "D-Bus error getting initial position"
+            );
             0.0
         }
     }
@@ -127,6 +128,16 @@ async fn start_ui(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    // Initialize tracing with environment filter
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into())
+        )
+        .with_target(true)
+        .with_thread_ids(false)
+        .init();
+
     let mut cfg = Config::parse();
     providers_from_env_if_empty(&mut cfg);
 
@@ -134,12 +145,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // Fetch initial state from player (fallback to defaults on error)
     let service = cfg.player_service.as_deref().unwrap_or("");
-    let meta = fetch_initial_metadata(service, cfg.debug_log).await;
-    let position = fetch_initial_position(service, cfg.debug_log).await;
+    let meta = fetch_initial_metadata(service).await;
+    let position = fetch_initial_position(service).await;
 
     // Start UI and propagate any errors
     start_ui(meta, position, cfg).await.map_err(|e| {
-        eprintln!("Error: {}", e);
+        tracing::error!(error = %e, "Application error");
         e
     })
 }

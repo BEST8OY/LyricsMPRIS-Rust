@@ -35,7 +35,6 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
     /// Try to call macro.subtitles.get and extract richsync or subtitle_body.
     async fn try_macro_for_lyrics(
         client: &Client,
-        token: &str,
         params: &[(String, String)],
     ) -> Result<Option<(Vec<LyricLine>, String)>, reqwest::Error> {
         let macro_base = "https://apic-desktop.musixmatch.com/ws/1.1/macro.subtitles.get?format=json&namespace=lyrics_richsynched&subtitle_format=mxm&optional_calls=track.richsync&app_id=web-desktop-app-v1.0&";
@@ -48,7 +47,7 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
 
         let macro_resp = client
             .get(&macro_url)
-            .header("Cookie", format!("x-mxm-token-guid={}", token))
+            .header("Cookie", "x-mxm-token-guid=")
             .send()
             .await?;
 
@@ -101,7 +100,7 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
             params.push(("q_duration".to_string(), len.to_string()));
         }
         
-        if let Some((parsed, raw)) = try_macro_for_lyrics(&client, &token, &params).await? {
+        if let Some((parsed, raw)) = try_macro_for_lyrics(&client, &params).await? {
             return Ok((parsed, Some(raw)));
         }
     }
@@ -126,7 +125,7 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
     let search_url = search_base.to_string() + &search_params.join("&");
     let search_resp = client
         .get(&search_url)
-        .header("Cookie", format!("x-mxm-token-guid={}", token))
+        .header("Cookie", "x-mxm-token-guid=")
         .send()
         .await?;
 
@@ -196,7 +195,7 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
                     params.push(("q_duration".to_string(), len.to_string()));
                 }
 
-                if let Some((parsed, raw)) = try_macro_for_lyrics(&client, &token, &params).await? {
+                if let Some((parsed, raw)) = try_macro_for_lyrics(&client, &params).await? {
                     return Ok((parsed, Some(raw)));
                 }
             }

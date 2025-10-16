@@ -147,7 +147,10 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                     }
                 } => {
                     if let Err(e) = self.discover_active_player().await {
-                        eprintln!("Error discovering active player: {}", e);
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to discover active player"
+                        );
                     }
                 }
                 
@@ -190,21 +193,33 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                 // Handle Metadata property change
                 Some(_) = metadata_stream.next() => {
                     if let Err(e) = self.handle_metadata_change(&proxy).await {
-                        eprintln!("Error handling metadata change: {}", e);
+                        tracing::warn!(
+                            service = %service,
+                            error = %e,
+                            "Failed to handle metadata change"
+                        );
                     }
                 }
                 
                 // Handle Position property change (not common, but some players use it)
                 Some(_) = position_stream.next() => {
                     if let Err(e) = self.handle_position_change(&proxy).await {
-                        eprintln!("Error handling position change: {}", e);
+                        tracing::warn!(
+                            service = %service,
+                            error = %e,
+                            "Failed to handle position change"
+                        );
                     }
                 }
                 
                 // Handle PlaybackStatus property change
                 Some(_) = status_stream.next() => {
                     if let Err(e) = self.handle_status_change(&proxy).await {
-                        eprintln!("Error handling status change: {}", e);
+                        tracing::warn!(
+                            service = %service,
+                            error = %e,
+                            "Failed to handle playback status change"
+                        );
                     }
                 }
                 
@@ -215,7 +230,10 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                     if proxy.playback_status().await.is_err() {
                         // Player disconnected, try to discover a new one
                         if let Err(e) = self.discover_active_player().await {
-                            eprintln!("Error discovering player after disconnect: {}", e);
+                            tracing::warn!(
+                                error = %e,
+                                "Failed to discover player after disconnect"
+                            );
                         }
                         break; // Exit inner loop to restart with new player
                     }

@@ -33,7 +33,6 @@ struct NewTrackContext<'a> {
     playback_status: Option<String>,
     state: &'a mut StateBundle,
     update_tx: &'a mpsc::Sender<Update>,
-    debug_log: bool,
     providers: &'a [String],
 }
 
@@ -339,7 +338,6 @@ fn detect_provider_from_raw(raw: &Option<String>) -> Option<Provider> {
 async fn try_database(
     meta: &TrackMetadata,
     state: &mut StateBundle,
-    debug_log: bool,
 ) -> bool {
     let Some(db_result) = crate::lyrics::database::fetch_from_database(
         &meta.artist,
@@ -353,23 +351,32 @@ async fn try_database(
     match db_result {
         Ok((lines, raw)) if !lines.is_empty() => {
             let provider = detect_provider_from_raw(&raw);
+            let line_count = lines.len();
             state.update_lyrics(lines, meta, None, provider);
             
-            if debug_log {
-                eprintln!("[Database] Cache hit for {}", meta.title);
-            }
+            tracing::debug!(
+                title = %meta.title,
+                artist = %meta.artist,
+                lines = line_count,
+                "Database cache hit"
+            );
             true
         }
         Ok(_) => {
-            if debug_log {
-                eprintln!("[Database] Empty lyrics in cache for {}", meta.title);
-            }
+            tracing::debug!(
+                title = %meta.title,
+                artist = %meta.artist,
+                "Empty lyrics in database cache"
+            );
             false
         }
         Err(e) => {
-            if debug_log {
-                eprintln!("[Database] Parse error for {}: {}", meta.title, e);
-            }
+            tracing::warn!(
+                title = %meta.title,
+                artist = %meta.artist,
+                error = %e,
+                "Failed to parse cached lyrics"
+            );
             false
         }
     }
@@ -390,11 +397,10 @@ async fn try_database(
 async fn fetch_api_lyrics(
     meta: &TrackMetadata,
     state: &mut StateBundle,
-    debug_log: bool,
     providers: &[String],
 ) {
     // Try database cache first
-    if try_database(meta, state, debug_log).await {
+    if try_database(meta, state).await {
         return;
     }
 
@@ -404,9 +410,13 @@ async fn fetch_api_lyrics(
             FetchResult::Success => return,
             FetchResult::Transient => continue,
             FetchResult::NonTransient(err) => {
-                if debug_log {
-                    eprintln!("[LyricsMPRIS] Provider error ({}): {}", provider, err);
-                }
+                tracing::error!(
+                    provider = %provider,
+                    error = %err,
+                    track = %meta.title,
+                    artist = %meta.artist,
+                    "Provider failed to fetch lyrics"
+                );
                 state.update_lyrics(Vec::new(), meta, Some(err.to_string()), None);
                 return;
             }
@@ -423,7 +433,6 @@ async fn fetch_api_lyrics(
 async fn fetch_fresh_position(
     service: Option<&str>,
     state: &StateBundle,
-    debug_log: bool,
 ) -> f64 {
     let Some(svc) = service else {
         return state.player_state.estimate_position();
@@ -432,9 +441,11 @@ async fn fetch_fresh_position(
     match crate::mpris::playback::get_position(svc).await {
         Ok(pos) => pos,
         Err(e) => {
-            if debug_log {
-                eprintln!("[LyricsMPRIS] Failed to fetch position: {}", e);
-            }
+            tracing::warn!(
+                service = %svc,
+                error = %e,
+                "Failed to fetch position, using estimation"
+            );
             state.player_state.estimate_position()
         }
     }
@@ -454,13 +465,12 @@ async fn fetch_fresh_position(
 pub async fn fetch_and_update_lyrics(
     meta: &TrackMetadata,
     state: &mut StateBundle,
-    debug_log: bool,
     providers: &[String],
     service: Option<&str>,
 ) -> f64 {
-    fetch_api_lyrics(meta, state, debug_log, providers).await;
+    fetch_api_lyrics(meta, state, providers).await;
     
-    let position = fetch_fresh_position(service, state, debug_log).await;
+    let position = fetch_fresh_position(service, state).await;
     state.update_index(position);
     state.player_state.set_position(position);
     
@@ -484,11 +494,10 @@ pub async fn process_event(
     event: Event,
     state: &mut StateBundle,
     update_tx: &mpsc::Sender<Update>,
-    debug_log: bool,
     providers: &[String],
 ) {
     match event {
-        Event::Mpris(ev) => handle_mpris_event(ev, state, update_tx, debug_log, providers).await,
+        Event::Mpris(ev) => handle_mpris_event(ev, state, update_tx, providers).await,
         Event::Shutdown => send_update(state, update_tx, true).await,
     }
 }
@@ -512,7 +521,6 @@ async fn handle_mpris_event(
     event: MprisEvent,
     state: &mut StateBundle,
     update_tx: &mpsc::Sender<Update>,
-    debug_log: bool,
     providers: &[String],
 ) {
     let (meta, position, service, is_full_update) = match event {
@@ -548,7 +556,6 @@ async fn handle_mpris_event(
             playback_status,
             state,
             update_tx,
-            debug_log,
             providers,
         })
         .await;
@@ -598,7 +605,6 @@ async fn handle_new_track(ctx: NewTrackContext<'_>) {
         playback_status,
         state,
         update_tx,
-        debug_log,
         providers,
     } = ctx;
 
@@ -617,7 +623,7 @@ async fn handle_new_track(ctx: NewTrackContext<'_>) {
 
     // Fetch lyrics synchronously and update state
     // This performs network IO within the event task for state consistency
-    let _ = fetch_and_update_lyrics(&meta, state, debug_log, providers, Some(&service)).await;
+    let _ = fetch_and_update_lyrics(&meta, state, providers, Some(&service)).await;
     
     // After fetching, send another forced update to refresh UI with lyrics
     send_update(state, update_tx, true).await;

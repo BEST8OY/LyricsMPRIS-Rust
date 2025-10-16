@@ -163,17 +163,28 @@ pub async fn load_database(path: &Path) -> LyricsDatabase {
     match load_database_inner(path).await {
         Ok(db) => {
             if db.len() > 0 {
-                eprintln!("[Database] Loaded {} entries from {}", db.len(), path.display());
+                tracing::info!(
+                    path = %path.display(),
+                    entries = db.len(),
+                    "Loaded lyrics database"
+                );
             }
             db
         }
         Err(e) if e.to_string().contains("No such file") => {
             // First run - file doesn't exist yet
-            eprintln!("[Database] Creating new database at {}", path.display());
+            tracing::info!(
+                path = %path.display(),
+                "Creating new lyrics database"
+            );
             LyricsDatabase::new()
         }
         Err(e) => {
-            eprintln!("[Database] Failed to load from {}: {}", path.display(), e);
+            tracing::error!(
+                path = %path.display(),
+                error = %e,
+                "Failed to load database, using empty database"
+            );
             LyricsDatabase::new()
         }
     }
@@ -313,6 +324,10 @@ pub async fn store_in_database(
     
     // Persist to disk asynchronously (don't block on errors)
     if let Err(e) = save_database(db, path).await {
-        eprintln!("[Database] Failed to save: {}", e);
+        tracing::error!(
+            path = %path.display(),
+            error = %e,
+            "Failed to save database"
+        );
     }
 }
