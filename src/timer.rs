@@ -226,7 +226,6 @@ impl PlaybackTimer {
             base
         }
     }
-
     /// Returns the current anchor position (without time progression).
     ///
     /// This is the last position set via [`set_position`](Self::set_position)

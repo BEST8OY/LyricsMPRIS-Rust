@@ -226,7 +226,7 @@ async fn store_lyrics_in_cache(
 async fn try_lrclib(meta: &TrackMetadata, state: &mut StateBundle) -> FetchResult {
     match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title, &meta.album, meta.length).await {
         Ok((lines, raw)) if !lines.is_empty() => {
-            state.update_lyrics(lines, meta, None, Some(Provider::Lrclib));
+            state.update_lyrics(lines, meta, None, Some(Provider::LRCLIB));
             store_lyrics_in_cache(meta, raw, crate::lyrics::database::LyricsFormat::Lrclib).await;
             FetchResult::Success
         }
@@ -239,7 +239,7 @@ async fn try_lrclib(meta: &TrackMetadata, state: &mut StateBundle) -> FetchResul
 /// Maps a Provider enum to the corresponding database LyricsFormat.
 fn provider_to_db_format(provider: Provider) -> crate::lyrics::database::LyricsFormat {
     match provider {
-        Provider::Lrclib => crate::lyrics::database::LyricsFormat::Lrclib,
+        Provider::LRCLIB => crate::lyrics::database::LyricsFormat::Lrclib,
         Provider::MusixmatchRichsync => crate::lyrics::database::LyricsFormat::Richsync,
         Provider::MusixmatchSubtitles => crate::lyrics::database::LyricsFormat::Subtitles,
     }
@@ -325,10 +325,10 @@ fn detect_provider_from_raw(raw: &Option<String>) -> Option<Provider> {
             }
         } else if trimmed.starts_with('[') {
             // LRC format starts with [MM:SS.CC]
-            Provider::Lrclib
+            Provider::LRCLIB
         } else {
             // Default to LRCLIB
-            Provider::Lrclib
+            Provider::LRCLIB
         }
     })
 }
@@ -345,6 +345,7 @@ async fn try_database(
         &meta.artist,
         &meta.title,
         &meta.album,
+        meta.length,
     ).await else {
         return false;
     };

@@ -5,7 +5,6 @@ use reqwest::Client;
 use crate::lyrics::types::{http_client, LyricLine, ProviderResult};
 
 /// Fetch lyrics using Musixmatch desktop "usertoken" (apic-desktop.musixmatch.com).
-#[allow(dead_code)]
 pub async fn fetch_lyrics_from_musixmatch_usertoken(
     artist: &str,
     title: &str,

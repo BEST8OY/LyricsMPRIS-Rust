@@ -42,19 +42,4 @@ impl Default for LyricStyles {
 }
 
 impl LyricStyles {
-    /// Create a new style set with custom colors.
-    ///
-    /// # Arguments
-    /// * `current_color` - Color for the active line
-    #[allow(dead_code)]
-    pub fn with_current_color(current_color: Color) -> Self {
-        Self {
-            before: Style::default()
-                .add_modifier(Modifier::ITALIC | Modifier::DIM),
-            current: Style::default()
-                .fg(current_color)
-                .add_modifier(Modifier::BOLD),
-            after: Style::default(),
-        }
-    }
 }

@@ -108,13 +108,6 @@ pub async fn get_playback_status(service: &str) -> Result<String, MprisError> {
     }
 }
 
-/// Query the playback status as an enum
-#[allow(dead_code)]
-pub async fn get_playback_status_enum(service: &str) -> Result<PlaybackStatus, MprisError> {
-    let status_str = get_playback_status(service).await?;
-    Ok(PlaybackStatus::from_str(&status_str))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

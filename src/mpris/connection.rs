@@ -11,12 +11,6 @@ pub enum MprisError {
     ZBus(#[from] zbus::Error),
     #[error("Failed to establish D-Bus connection")]
     NoConnection,
-    #[error("Failed to deserialize D-Bus message: {0}")]
-    #[allow(dead_code)]
-    Deserialization(String),
-    #[error("Property not found: {0}")]
-    #[allow(dead_code)]
-    PropertyNotFound(String),
 }
 
 /// Global D-Bus connection singleton

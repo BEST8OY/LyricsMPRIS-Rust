@@ -29,51 +29,20 @@ use std::sync::Arc;
 /// Identifies the lyrics provider for the current track.
 ///
 /// Each variant represents a distinct lyrics source with different capabilities:
-/// - [`Provider::Lrclib`]: LRCLIB database (returns LRC timestamp format)
+/// - [`Provider::LRCLIB`]: LRCLIB database (returns LRC timestamp format)
 /// - [`Provider::MusixmatchRichsync`]: Word-level synchronized lyrics (JSON)
 /// - [`Provider::MusixmatchSubtitles`]: Line-level synchronized lyrics (JSON)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Provider {
     /// LRCLIB provider - returns LRC format: `[MM:SS.CC]lyrics`
-    Lrclib,
+    LRCLIB,
     /// Musixmatch provider - richsync format with word-level timing (JSON)
     MusixmatchRichsync,
     /// Musixmatch provider - subtitle format with line-level timing (JSON)
     MusixmatchSubtitles,
 }
 
-impl Provider {
-    /// Returns the human-readable name of the provider.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// # use lyricsmpris::state::Provider;
-    /// assert_eq!(Provider::Lrclib.name(), "LRCLib");
-    /// assert_eq!(Provider::MusixmatchRichsync.name(), "Musixmatch (Richsync)");
-    /// ```
-    #[must_use]
-    #[allow(dead_code)]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Lrclib => "LRCLib",
-            Self::MusixmatchRichsync => "Musixmatch (Richsync)",
-            Self::MusixmatchSubtitles => "Musixmatch (Subtitles)",
-        }
-    }
-
-    /// Returns a short identifier suitable for logging.
-    #[must_use]
-    #[allow(dead_code)]
-    pub const fn id(self) -> &'static str {
-        match self {
-            Self::Lrclib => "lrclib",
-            Self::MusixmatchRichsync => "musixmatch_richsync",
-            Self::MusixmatchSubtitles => "musixmatch_subtitles",
-        }
-    }
-}
 
 // ============================================================================
 // Update Snapshot
@@ -149,28 +118,6 @@ impl Default for Update {
     }
 }
 
-impl Update {
-    /// Returns true if this update contains valid lyrics.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn has_lyrics(&self) -> bool {
-        !self.lines.is_empty()
-    }
-
-    /// Returns true if an error is present.
-    #[must_use]
-    #[allow(dead_code)]
-    pub const fn has_error(&self) -> bool {
-        self.err.is_some()
-    }
-
-    /// Returns true if lyrics are present and a line is currently active.
-    #[must_use]
-    #[allow(dead_code)]
-    pub const fn has_active_line(&self) -> bool {
-        self.index.is_some()
-    }
-}
 
 // ============================================================================
 // Player State
@@ -487,13 +434,6 @@ impl LyricState {
             self.index = new_index;
         }
         changed
-    }
-
-    /// Returns the number of lyrics lines.
-    #[must_use]
-    #[allow(dead_code)]
-    pub fn line_count(&self) -> usize {
-        self.lines.len()
     }
 
     /// Returns `true` if no lyrics are loaded.

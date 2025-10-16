@@ -48,12 +48,10 @@ impl PipeState {
         let track_changed = self.last_track_id.as_ref() != Some(&track_id);
 
         if track_changed {
-            self.handle_track_change(has_lyrics);
+            self.handle_track_change();
             self.last_track_id = Some(track_id);
 
-            if has_lyrics {
-                self.print_current_line(&upd);
-            }
+            // Don't print first line immediately - wait for it to become active
         } else if has_lyrics && upd.index != self.last_line_idx {
             self.print_current_line(&upd);
         }
@@ -72,9 +70,9 @@ impl PipeState {
     }
 
     /// Handle track change transition.
-    fn handle_track_change(&mut self, new_has_lyrics: bool) {
-        // Add spacing between tracks if previous had lyrics
-        if self.last_track_id.is_some() && self.last_track_had_lyric && !new_has_lyrics {
+    fn handle_track_change(&mut self) {
+        // Always print empty line for visual separation between tracks
+        if self.last_track_id.is_some() {
             println!();
         }
         

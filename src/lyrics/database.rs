@@ -78,9 +78,6 @@ pub struct LyricsEntry {
     
     /// Raw lyrics text (unparsed for richsync, LRCLIB text otherwise)
     pub raw_lyrics: String,
-    
-    /// Timestamp when the entry was created
-    pub created_at: u64,
 }
 
 /// In-memory database structure.
@@ -145,10 +142,6 @@ impl LyricsDatabase {
             duration,
             format,
             raw_lyrics,
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
         };
         self.entries.insert(key, entry);
     }
@@ -156,12 +149,6 @@ impl LyricsDatabase {
     /// Returns the number of entries in the database.
     pub fn len(&self) -> usize {
         self.entries.len()
-    }
-
-    /// Returns whether the database is empty.
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
     }
 }
 
@@ -286,11 +273,21 @@ pub async fn fetch_from_database(
     artist: &str,
     title: &str,
     album: &str,
+    duration: Option<f64>,
 ) -> Option<ProviderResult> {
     let guard = DATABASE.lock().await;
     let (db, _path) = guard.as_ref()?;
     
     let entry = db.get(artist, title, album)?;
+    
+    // Optional: Validate duration match if both are present
+    if let (Some(query_duration), Some(entry_duration)) = (duration, entry.duration) {
+        // Allow 5% tolerance for duration mismatch
+        let tolerance = query_duration * 0.05;
+        if (query_duration - entry_duration).abs() > tolerance {
+            return None;
+        }
+    }
     
     // Parse and return
     Some(parse_stored_lyrics(entry))
@@ -317,25 +314,5 @@ pub async fn store_in_database(
     // Persist to disk asynchronously (don't block on errors)
     if let Err(e) = save_database(db, path).await {
         eprintln!("[Database] Failed to save: {}", e);
-    }
-}
-
-/// Determines the format from raw lyrics text.
-///
-/// This is used when storing lyrics from providers to determine
-/// how they should be parsed when retrieved.
-#[allow(dead_code)]
-pub fn detect_format(raw: &str) -> LyricsFormat {
-    if raw.starts_with(";;richsync=1") {
-        LyricsFormat::Richsync
-    } else if raw.trim_start().starts_with('[') {
-        // Looks like subtitle JSON array
-        if raw.trim_start().starts_with("[{") {
-            LyricsFormat::Subtitles
-        } else {
-            LyricsFormat::Lrclib
-        }
-    } else {
-        LyricsFormat::Lrclib
     }
 }
