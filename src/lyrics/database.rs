@@ -180,7 +180,7 @@ pub async fn load_database(path: &Path) -> LyricsDatabase {
             LyricsDatabase::new()
         }
         Err(e) => {
-            tracing::error!(
+            tracing::warn!(
                 path = %path.display(),
                 error = %e,
                 "Failed to load database, using empty database"
@@ -324,7 +324,7 @@ pub async fn store_in_database(
     
     // Persist to disk asynchronously (don't block on errors)
     if let Err(e) = save_database(db, path).await {
-        tracing::error!(
+        tracing::warn!(
             path = %path.display(),
             error = %e,
             "Failed to save database"

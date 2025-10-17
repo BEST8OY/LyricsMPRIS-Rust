@@ -410,7 +410,7 @@ async fn fetch_api_lyrics(
             FetchResult::Success => return,
             FetchResult::Transient => continue,
             FetchResult::NonTransient(err) => {
-                tracing::error!(
+                tracing::warn!(
                     provider = %provider,
                     error = %err,
                     track = %meta.title,

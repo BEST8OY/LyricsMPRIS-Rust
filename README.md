@@ -81,7 +81,9 @@ export MUSIXMATCH_USERTOKEN="your-token-here"
 
 # Logging configuration (uses tracing crate)
 # Levels: error, warn, info, debug, trace
-export RUST_LOG=info                    # Default: show info and above
+# Logs are OFF by default. Set RUST_LOG to enable:
+export RUST_LOG=warn                    # Show warnings and errors
+export RUST_LOG=info                    # Show info, warnings and errors  
 export RUST_LOG=debug                   # Show debug logs
 export RUST_LOG=lyricsmpris::lyrics=trace  # Trace specific module
 ```
