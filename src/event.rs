@@ -593,21 +593,28 @@ async fn handle_mpris_event(
         return;
     }
 
-    // For seek events, ignore them during new track flow
+    // For seek events, ignore them within 2 seconds after lyrics load
     if !is_full_update {
-        // If this Seeked event is for the same track that just loaded lyrics,
-        // ignore it - it's a stale event from track start that arrived during lyrics fetch.
-        // We already have the correct position from the fresh fetch after lyrics load.
+        // After lyrics are loaded, we fetch a fresh position from D-Bus.
+        // Seeked events that arrive shortly after (within 2 seconds) are likely
+        // stale events from track start that arrived during lyrics fetch.
+        // After 2 seconds, user seeks should be processed normally.
         if state.player_state.title == meta.title 
             && state.player_state.artist == meta.artist 
-            && state.has_lyrics() 
+            && state.has_lyrics()
         {
-            tracing::debug!(
-                seek_position = %format!("{:.3}s", position),
-                current_position = %format!("{:.3}s", state.player_state.estimate_position()),
-                "Ignoring Seeked event during new track flow"
-            );
-            return;
+            if let Some(loaded_at) = state.lyrics_loaded_at {
+                let elapsed = loaded_at.elapsed();
+                if elapsed.as_secs_f64() < 0.5 {
+                    tracing::debug!(
+                        seek_position = %format!("{:.3}s", position),
+                        current_position = %format!("{:.3}s", state.player_state.estimate_position()),
+                        time_since_load = %format!("{:.3}s", elapsed.as_secs_f64()),
+                        "Ignoring Seeked event within 2s of lyrics load"
+                    );
+                    return;
+                }
+            }
         }
         
         // Legitimate seek event - update position immediately

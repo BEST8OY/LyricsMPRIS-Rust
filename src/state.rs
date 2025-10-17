@@ -504,6 +504,9 @@ pub struct StateBundle {
     
     /// Current lyrics provider (if lyrics are loaded)
     pub provider: Option<Provider>,
+    
+    /// Timestamp when lyrics were last loaded (for filtering stale Seeked events)
+    pub lyrics_loaded_at: Option<std::time::Instant>,
 }
 
 impl Default for StateBundle {
@@ -521,6 +524,7 @@ impl StateBundle {
             player_state: PlayerState::default(),
             version: 0,
             provider: None,
+            lyrics_loaded_at: None,
         }
     }
 
@@ -536,6 +540,7 @@ impl StateBundle {
     pub fn clear_lyrics(&mut self) {
         self.lyric_state.update_lines(Vec::new());
         self.provider = None;
+        self.lyrics_loaded_at = None;
         self.increment_version();
     }
 
@@ -571,10 +576,17 @@ impl StateBundle {
         err: Option<String>,
         provider: Option<Provider>,
     ) {
+        let has_lyrics = !lines.is_empty();
         self.lyric_state.update_lines(lines);
         self.player_state.update_metadata_only(meta);
         self.player_state.err = err;
         self.provider = provider;
+        
+        // Record when lyrics were loaded for filtering stale Seeked events
+        if has_lyrics {
+            self.lyrics_loaded_at = Some(std::time::Instant::now());
+        }
+        
         self.increment_version();
     }
 
