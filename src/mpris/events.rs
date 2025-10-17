@@ -130,15 +130,17 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
         let playerctld_proxy = PlayerctldProxy::new(&self.conn).await.ok();
 
         let mut player_names_stream = if let Some(ref proxy) = playerctld_proxy {
+            tracing::debug!("Subscribed to playerctld player_names changes");
             Some(proxy.receive_player_names_changed().await)
         } else {
+            tracing::debug!("playerctld not available, using fallback polling");
             None
         };
 
         // Main event processing loop
         loop {
             tokio::select! {
-                // Handle playerctld PlayerNames property changes
+                // Handle playerctld PropertyNames property changes
                 Some(_) = async {
                     if let Some(ref mut stream) = player_names_stream {
                         stream.next().await
@@ -146,6 +148,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                         None
                     }
                 } => {
+                    tracing::debug!("Player list changed, discovering active player");
                     if let Err(e) = self.discover_active_player().await {
                         tracing::warn!(
                             error = %e,
@@ -169,6 +172,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
         }
 
         let service = self.state.service.clone();
+        tracing::debug!(service = %service, "Subscribing to player events");
         
         let proxy = MediaPlayer2PlayerProxy::builder(&self.conn)
             .destination(service.as_str())?
@@ -186,12 +190,14 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                 // Handle Seeked signal
                 Some(signal) = seeked_stream.next() => {
                     if let Ok(args) = signal.args() {
+                        tracing::debug!(service = %service, position = args.position, "Seeked signal received");
                         self.handle_seek_signal(args.position).await;
                     }
                 }
                 
                 // Handle Metadata property change
                 Some(_) = metadata_stream.next() => {
+                    tracing::debug!(service = %service, "Metadata changed");
                     if let Err(e) = self.handle_metadata_change(&proxy).await {
                         tracing::warn!(
                             service = %service,
@@ -203,6 +209,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                 
                 // Handle Position property change (not common, but some players use it)
                 Some(_) = position_stream.next() => {
+                    tracing::debug!(service = %service, "Position changed");
                     if let Err(e) = self.handle_position_change(&proxy).await {
                         tracing::warn!(
                             service = %service,
@@ -214,6 +221,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                 
                 // Handle PlaybackStatus property change
                 Some(_) = status_stream.next() => {
+                    tracing::debug!(service = %service, "Playback status changed");
                     if let Err(e) = self.handle_status_change(&proxy).await {
                         tracing::warn!(
                             service = %service,
@@ -228,6 +236,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                     // Periodically check if the service is still valid
                     // This handles cases where the player disconnects
                     if proxy.playback_status().await.is_err() {
+                        tracing::debug!(service = %service, "Player disconnected, discovering new player");
                         // Player disconnected, try to discover a new one
                         if let Err(e) = self.discover_active_player().await {
                             tracing::warn!(
@@ -327,13 +336,16 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
     /// Discovers and switches to the active unblocked player
     async fn discover_active_player(&mut self) -> Result<(), MprisError> {
         let names = get_active_player_names().await?;
+        tracing::debug!(available_players = ?names, "Discovered available players");
 
         if let Some(service) = names.iter().find(|s| !is_blocked(s, &self.block_list)) {
             if *service != self.state.service {
+                tracing::debug!(old_service = %self.state.service, new_service = %service, "Switching to player");
                 self.switch_to_player(service).await?;
             }
         } else if self.state.is_active() {
             // No active players found, but we had one before
+            tracing::debug!(service = %self.state.service, "Deactivating player (no active players)");
             self.deactivate_player();
         }
 
@@ -363,6 +375,15 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             .playback_status()
             .await
             .unwrap_or_else(|_| "Stopped".to_string());
+
+        tracing::debug!(
+            service = %service,
+            title = %metadata.title,
+            artist = %metadata.artist,
+            position = position,
+            status = %playback_status,
+            "Switched to player"
+        );
 
         self.state = PlayerState {
             service: service.to_string(),
