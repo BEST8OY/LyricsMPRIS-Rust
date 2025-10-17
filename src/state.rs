@@ -204,6 +204,26 @@ impl PlayerState {
         self.err = None;
     }
 
+    /// Updates only the metadata fields without affecting position or playback state.
+    ///
+    /// This is used when metadata changes but the track is conceptually the same
+    /// (e.g., after fetching lyrics, we want to update the track info in state
+    /// but preserve the current playback position).
+    ///
+    /// # Behavior
+    ///
+    /// - Updates title, artist, album, and length
+    /// - **Preserves** current position and playback state
+    /// - **Preserves** timer state
+    /// - Clears any previous error state
+    pub fn update_metadata_only(&mut self, meta: &TrackMetadata) {
+        self.title.clone_from(&meta.title);
+        self.artist.clone_from(&meta.artist);
+        self.album.clone_from(&meta.album);
+        self.length = meta.length;
+        self.err = None;
+    }
+
     /// Updates playback state from an external source (e.g., D-Bus).
     ///
     /// Synchronizes both the anchor position and the playing/paused state.
@@ -246,10 +266,13 @@ impl PlayerState {
             estimated = self.position;
         }
         
-        if let Some(len) = self.length
-            && estimated.is_finite() {
-                estimated = estimated.clamp(0.0, len);
-            }
+        // Always ensure non-negative (defensive against timer bugs)
+        estimated = estimated.max(0.0);
+        
+        // Additionally clamp to track length if known
+        if let Some(len) = self.length {
+            estimated = estimated.min(len);
+        }
         
         estimated
     }
@@ -524,10 +547,16 @@ impl StateBundle {
     /// # Operations
     ///
     /// 1. Replaces lyric lines (sanitizing and sorting)
-    /// 2. Updates player metadata
+    /// 2. Updates player metadata (preserving position)
     /// 3. Sets error state
     /// 4. Records the provider
     /// 5. Increments version once
+    ///
+    /// # Position Preservation
+    ///
+    /// Unlike new track detection, this method **preserves the current position**
+    /// because it's called after lyrics are fetched for an already-playing track.
+    /// The position should have been set correctly before calling this method.
     ///
     /// # Arguments
     ///
@@ -543,7 +572,7 @@ impl StateBundle {
         provider: Option<Provider>,
     ) {
         self.lyric_state.update_lines(lines);
-        self.player_state.update_from_metadata(meta);
+        self.player_state.update_metadata_only(meta);
         self.player_state.err = err;
         self.provider = provider;
         self.increment_version();

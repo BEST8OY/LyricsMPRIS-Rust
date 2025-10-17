@@ -82,13 +82,10 @@ impl LoopConfig {
 
 /// Encapsulates the runtime state needed by the event loop.
 ///
-/// This struct maintains both the shared state bundle and loop-specific
-/// tracking variables.
+/// This struct maintains the shared state bundle for event processing.
 struct LoopState {
     /// Shared state bundle with lyrics and player state
     state_bundle: StateBundle,
-    /// Previous playing status for change detection
-    was_playing: bool,
 }
 
 impl LoopState {
@@ -96,15 +93,7 @@ impl LoopState {
     fn new() -> Self {
         Self {
             state_bundle: StateBundle::new(),
-            was_playing: false,
         }
-    }
-
-    /// Updates the cached playing status from the current state.
-    ///
-    /// Call this after processing events to track playback state changes.
-    fn update_playing_status(&mut self) {
-        self.was_playing = self.state_bundle.player_state.playing;
     }
 }
 
@@ -278,10 +267,8 @@ async fn fetch_initial_metadata(
 
 /// Initializes lyrics state based on initial metadata.
 ///
-/// This function:
-/// 1. Fetches lyrics from configured providers
-/// 2. Updates player position
-/// 3. Synchronizes playing status
+/// This function fetches lyrics from configured providers.
+/// Position and state updates are handled internally by `fetch_and_update_lyrics`.
 async fn initialize_lyrics_state(
     loop_state: &mut LoopState,
     metadata: &TrackMetadata,
@@ -294,16 +281,14 @@ async fn initialize_lyrics_state(
         "Fetching initial lyrics"
     );
     
-    let position = event::fetch_and_update_lyrics(
+    // fetch_and_update_lyrics already sets the position internally
+    let _position = event::fetch_and_update_lyrics(
         metadata,
         &mut loop_state.state_bundle,
         config.providers(),
         Some(service),
     )
     .await;
-    
-    loop_state.state_bundle.player_state.set_position(position);
-    loop_state.update_playing_status();
     
     if loop_state.state_bundle.has_lyrics() {
         tracing::debug!(
@@ -449,6 +434,4 @@ async fn handle_event(
         config.providers(),
     )
     .await;
-    
-    loop_state.update_playing_status();
 }

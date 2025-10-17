@@ -435,18 +435,32 @@ async fn fetch_fresh_position(
     state: &StateBundle,
 ) -> f64 {
     let Some(svc) = service else {
-        return state.player_state.estimate_position();
+        let estimated = state.player_state.estimate_position();
+        tracing::debug!(
+            position = %format!("{:.3}s", estimated),
+            "Using estimated position (no service)"
+        );
+        return estimated;
     };
 
     match crate::mpris::playback::get_position(svc).await {
-        Ok(pos) => pos,
+        Ok(pos) => {
+            tracing::debug!(
+                service = %svc,
+                position = %format!("{:.3}s", pos),
+                "Fetched fresh position from D-Bus"
+            );
+            pos
+        }
         Err(e) => {
+            let estimated = state.player_state.estimate_position();
             tracing::warn!(
                 service = %svc,
                 error = %e,
+                position = %format!("{:.3}s", estimated),
                 "Failed to fetch position, using estimation"
             );
-            state.player_state.estimate_position()
+            estimated
         }
     }
 }
@@ -468,9 +482,26 @@ pub async fn fetch_and_update_lyrics(
     providers: &[String],
     service: Option<&str>,
 ) -> f64 {
+    let position_before = state.player_state.estimate_position();
+    let start_time = std::time::Instant::now();
+    
     fetch_api_lyrics(meta, state, providers).await;
     
+    let fetch_duration = start_time.elapsed();
     let position = fetch_fresh_position(service, state).await;
+    let position_change = position - position_before;
+    
+    // Note: position_change can be negative if user seeked backward during fetch,
+    // or much larger than fetch_duration if user seeked forward.
+    // It only represents actual time drift when no seeking occurred.
+    tracing::debug!(
+        position_before = %format!("{:.3}s", position_before),
+        position_after = %format!("{:.3}s", position),
+        change = %format!("{:+.3}s", position_change),  // Show sign explicitly
+        fetch_duration = ?fetch_duration,
+        "Position updated after lyrics fetch"
+    );
+    
     state.update_index(position);
     state.player_state.set_position(position);
     
@@ -562,12 +593,31 @@ async fn handle_mpris_event(
         return;
     }
 
-    // Seek events always force UI update to show new position immediately
+    // For seek events, ignore them during new track flow
     if !is_full_update {
+        // If this Seeked event is for the same track that just loaded lyrics,
+        // ignore it - it's a stale event from track start that arrived during lyrics fetch.
+        // We already have the correct position from the fresh fetch after lyrics load.
+        if state.player_state.title == meta.title 
+            && state.player_state.artist == meta.artist 
+            && state.has_lyrics() 
+        {
+            tracing::debug!(
+                seek_position = %format!("{:.3}s", position),
+                current_position = %format!("{:.3}s", state.player_state.estimate_position()),
+                "Ignoring Seeked event during new track flow"
+            );
+            return;
+        }
+        
+        // Legitimate seek event - update position immediately
+        state.player_state.set_position(position);
+        state.update_index(position);
         send_update(state, update_tx, true).await;
+        return;
     }
 
-    // Position/playback state update
+    // Position/playback state update (for full updates)
     handle_state_update(position, playback_status, state, update_tx).await;
 }
 
@@ -600,7 +650,7 @@ async fn handle_no_player(state: &mut StateBundle, update_tx: &mpsc::Sender<Upda
 async fn handle_new_track(ctx: NewTrackContext<'_>) {
     let NewTrackContext {
         meta,
-        position,
+        position: _event_position,  // Ignored - often stale from previous track
         service,
         playback_status,
         state,
@@ -609,20 +659,29 @@ async fn handle_new_track(ctx: NewTrackContext<'_>) {
     } = ctx;
 
     state.clear_lyrics();
+    
+    // Update metadata immediately so first update has correct track info
+    state.player_state.update_from_metadata(&meta);
 
-    // Update playback state if available
+    // IMPORTANT: On track changes, the position from the MPRIS event is often stale
+    // (still from the previous track). We'll fetch a fresh position after lyrics.
+    // Set position to 0 first to establish a clean anchor point.
+    state.player_state.set_position(0.0);
+    
     if let Some(status) = playback_status {
         let playing = status == "Playing";
-        state.player_state.update_playback_dbus(playing, position);
-    } else {
-        state.player_state.set_position(position);
+        state.player_state.playing = playing;
+        if playing {
+            state.player_state.start_playing();
+        }
     }
 
     // Notify UI immediately that a new track started (lyrics may follow)
     send_update(state, update_tx, true).await;
 
-    // Fetch lyrics synchronously and update state
-    // This performs network IO within the event task for state consistency
+    // Fetch lyrics synchronously and update state.
+    // This will also fetch a FRESH position from D-Bus, avoiding the stale
+    // event position from the previous track.
     let _ = fetch_and_update_lyrics(&meta, state, providers, Some(&service)).await;
     
     // After fetching, send another forced update to refresh UI with lyrics
