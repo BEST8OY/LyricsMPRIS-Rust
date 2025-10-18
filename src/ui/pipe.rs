@@ -76,6 +76,8 @@ impl PipeState {
             println!();
         }
         
+        // Explicitly clear old update to free memory
+        self.last_update = None;
         self.last_line_idx = None;
         self.last_track_had_lyric = false;
     }

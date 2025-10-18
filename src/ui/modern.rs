@@ -186,6 +186,11 @@ fn redraw_and_reschedule<B: tui::backend::Backend>(
 
 /// Helper: Update cached lines and last update
 fn update_cache_and_state(state: &mut ModernUIState, update: &Update) {
+    // Explicitly clear old caches before creating new ones to free memory immediately
+    state.cached_lines = None;
+    state.wrapped_cache = None;
+    
+    // Create new caches
     state.cached_lines = Some(update.lines.iter().map(|l| l.text.clone()).collect());
     state.last_update = Some(update.clone());
     state.last_update_instant = Some(Instant::now());
