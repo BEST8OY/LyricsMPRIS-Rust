@@ -337,8 +337,8 @@ See the [LICENSE](LICENSE) file for details.
 
 - **Language**: Rust 🦀
 - **Architecture**: Event-driven, async/await
-- **Binary Size**: ~12MB (release, stripped)
-- **Memory Usage**: <20MB typical
+- **Binary Size**: ~15MB (release, stripped)
+- **Memory Usage**: ~20MB typical
 - **CPU Usage**: ~0% typical
 - **Dependencies**: Minimal, security-conscious selection
 
