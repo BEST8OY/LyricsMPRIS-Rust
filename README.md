@@ -8,6 +8,8 @@ A lightweight, high-performance lyrics viewer for Linux that integrates seamless
 
 ### Display Modes
 - **🎨 Modern TUI**: Beautiful terminal interface with centered lyrics and smooth scrolling
+  - **Compact View**: Limit visible lyrics with `--visible-lines` for small terminals
+  - **Manual Scrolling**: Browse lyrics with arrow keys when paused
 - **🔧 Pipe Mode**: Stream current lyrics to stdout for integration with status bars and scripts
 - **🎤 Karaoke Mode**: Per-word highlighting synchronized with playback (Musixmatch Richsync)
 
@@ -58,6 +60,9 @@ cargo build --release
 # Disable karaoke highlighting
 ./target/release/lyricsmpris --no-karaoke
 
+# Limit visible lyrics to 3 lines (compact mode)
+./target/release/lyricsmpris --visible-lines 3
+
 # Pipe mode for scripting
 ./target/release/lyricsmpris --pipe
 ```
@@ -70,6 +75,7 @@ cargo build --release
 |------|-------------|---------|
 | `--database PATH` | Enable local lyrics cache | `--database ~/.cache/lyrics.json` |
 | `--providers LIST` | Set provider priority | `--providers musixmatch,lrclib` |
+| `--visible-lines COUNT` | Limit visible lyric blocks (TUI only) | `--visible-lines 3` |
 | `--no-karaoke` | Disable word-level highlighting | - |
 | `--pipe` | Output to stdout instead of TUI | - |
 | `--block LIST` | Ignore specific MPRIS services | `--block vlc,chromium` |
@@ -111,7 +117,11 @@ export LYRIC_PROVIDERS="lrclib,musixmatch"
 | Key | Action |
 |-----|--------|
 | `k` | Toggle karaoke highlighting |
+| `↑` (Up) | Scroll up one lyric (when paused) |
+| `↓` (Down) | Scroll down one lyric (when paused) |
 | `q` or `Esc` | Quit application |
+
+> **Note**: Scrolling with arrow keys only works when playback is paused. When you resume playback, the view automatically resets to follow the current position.
 
 ## 💾 Local Database
 
