@@ -28,7 +28,6 @@ pub fn draw_ui_with_cache<B: Backend>(
     terminal: &mut Terminal<B>,
     last_update: &Option<Update>,
     wrapped_cache: &mut Option<(usize, Vec<Vec<String>>)>,
-    cached_lines: &Option<Vec<String>>,
     styles: &LyricStyles,
     karaoke_enabled: bool,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
@@ -41,7 +40,6 @@ pub fn draw_ui_with_cache<B: Backend>(
             let visible_spans = compute_visible_spans(
                 last_update,
                 wrapped_cache,
-                cached_lines,
                 width,
                 height,
                 styles,
@@ -59,7 +57,6 @@ pub fn draw_ui_with_cache<B: Backend>(
 fn compute_visible_spans<'a>(
     last_update: &Option<Update>,
     wrapped_cache: &mut Option<(usize, Vec<Vec<String>>)>,
-    cached_lines: &Option<Vec<String>>,
     width: usize,
     height: usize,
     styles: &'a LyricStyles,
@@ -77,16 +74,12 @@ fn compute_visible_spans<'a>(
             .collect();
     }
 
-    // Render cached lyrics
-    let Some(cached) = cached_lines else {
-        return Vec::new();
-    };
-
-    if cached.is_empty() || !update.index.map(|i| i < cached.len()).unwrap_or(true) {
+    // Check if we have lyrics
+    if update.lines.is_empty() || !update.index.map(|i| i < update.lines.len()).unwrap_or(true) {
         return Vec::new();
     }
 
-    let blocks = ensure_wrapped_cache(wrapped_cache, cached, width);
+    let blocks = ensure_wrapped_cache(wrapped_cache, &update.lines, width);
     let visible = gather_visible_lines(
         update,
         blocks,
@@ -104,18 +97,18 @@ fn compute_visible_spans<'a>(
 /// Returns a reference to the cached blocks.
 fn ensure_wrapped_cache<'a>(
     wrapped_cache: &'a mut Option<(usize, Vec<Vec<String>>)>,
-    cached_lines: &[String],
+    lines: &[crate::lyrics::LyricLine],
     width: usize,
 ) -> &'a Vec<Vec<String>> {
     let needs_rebuild = match wrapped_cache {
-        Some((cached_w, blocks)) => *cached_w != width || blocks.len() != cached_lines.len(),
+        Some((cached_w, blocks)) => *cached_w != width || blocks.len() != lines.len(),
         None => true,
     };
 
     if needs_rebuild {
-        let new_blocks: Vec<Vec<String>> = cached_lines
+        let new_blocks: Vec<Vec<String>> = lines
             .iter()
-            .map(|l| wrap_text(l, width))
+            .map(|l| wrap_text(&l.text, width))
             .collect();
         *wrapped_cache = Some((width, new_blocks));
     }

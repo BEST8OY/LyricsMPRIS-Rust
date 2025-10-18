@@ -30,7 +30,6 @@ use tui::{Terminal, backend::CrosstermBackend};
 /// UI state for the modern TUI mode
 pub struct ModernUIState {
     pub last_update: Option<Update>,
-    pub cached_lines: Option<Vec<String>>,
     /// Cached wrapped blocks for the current terminal width: (width, wrapped_blocks)
     pub wrapped_cache: Option<(usize, Vec<Vec<String>>)>,
     pub last_track_id: Option<(String, String, String)>,
@@ -45,7 +44,6 @@ impl ModernUIState {
     pub fn new() -> Self {
         Self {
             last_update: None,
-            cached_lines: None,
             wrapped_cache: None,
             last_track_id: None,
             should_exit: false,
@@ -175,7 +173,6 @@ fn redraw_and_reschedule<B: tui::backend::Backend>(
         terminal,
         &draw_update,
         &mut state.wrapped_cache,
-        &state.cached_lines,
         styles,
         state.karaoke_enabled,
     )?;
@@ -186,12 +183,9 @@ fn redraw_and_reschedule<B: tui::backend::Backend>(
 
 /// Helper: Update cached lines and last update
 fn update_cache_and_state(state: &mut ModernUIState, update: &Update) {
-    // Explicitly clear old caches before creating new ones to free memory immediately
-    state.cached_lines = None;
+    // Explicitly clear old cache before creating new one to free memory immediately
     state.wrapped_cache = None;
     
-    // Create new caches
-    state.cached_lines = Some(update.lines.iter().map(|l| l.text.clone()).collect());
     state.last_update = Some(update.clone());
     state.last_update_instant = Some(Instant::now());
 }
@@ -212,7 +206,6 @@ fn update_state(state: &mut ModernUIState, update: Option<Update>) {
     // Update with error message
     if update.lines.is_empty() && update.err.is_some() {
         if is_new_track {
-            state.cached_lines = None;
             state.last_update = None;
         }
         state.last_track_id = Some(track_id);
@@ -221,7 +214,6 @@ fn update_state(state: &mut ModernUIState, update: Option<Update>) {
 
     // Empty update (no lyrics available)
     if update.lines.is_empty() {
-        state.cached_lines = None;
         state.last_update = None;
         state.last_track_id = Some(track_id);
         return;
