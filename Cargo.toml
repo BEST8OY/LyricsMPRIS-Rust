@@ -22,3 +22,4 @@ textwrap = "0.16"
 unicode-segmentation = "1.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }

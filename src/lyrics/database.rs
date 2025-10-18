@@ -1,15 +1,37 @@
 //! Local lyrics database module.
 //!
-//! This module provides a persistent JSON-based cache for lyrics to reduce
-//! API calls and enable offline playback. It stores raw lyrics data and
-//! parses it on retrieval.
+//! This module provides persistent SQLite-based storage for lyrics to reduce
+//! API calls and enable offline playback. Uses SQLite for efficient indexed
+//! lookups with minimal memory usage.
 //!
 //! # Storage Format
 //!
+//! - **SQLite database** with indexed lookups by artist/title/album
 //! - **LRC format** (from LRCLIB): Stored as raw text with `[MM:SS.CC]` timestamps
 //! - **Richsync** (from Musixmatch): Stored as unparsed JSON (word-level timing)
 //! - **Subtitles** (from Musixmatch): Stored as unparsed JSON (line-level timing)
-//! - **Metadata**: Artist, title, album for efficient lookups
+//!
+//! # Memory Usage
+//!
+//! - **Minimal memory**: SQLite only loads requested rows
+//! - **Indexed queries**: Fast lookups without loading entire database
+//! - **Connection pool**: Reuses connections efficiently
+//! - **No cache needed**: SQLite's internal cache handles frequently-accessed data
+//!
+//! # Schema
+//!
+//! ```sql
+//! CREATE TABLE lyrics (
+//!     id INTEGER PRIMARY KEY,
+//!     artist TEXT NOT NULL,
+//!     title TEXT NOT NULL,
+//!     album TEXT NOT NULL,
+//!     duration REAL,
+//!     format TEXT NOT NULL,
+//!     raw_lyrics TEXT NOT NULL
+//! );
+//! CREATE INDEX idx_lookup ON lyrics(artist, title, album);
+//! ```
 //!
 //! # Architecture
 //!
@@ -20,7 +42,8 @@
 //!          │
 //!          ▼
 //! ┌─────────────────┐
-//! │ Database Check  │───── Hit ──────▶ Parse & Return
+//! │ SQL SELECT      │───── Hit ──────▶ Parse & Return
+//! │ (indexed)       │
 //! └────────┬────────┘
 //!          │ Miss
 //!          ▼
@@ -30,25 +53,24 @@
 //!          │
 //!          ▼
 //! ┌─────────────────┐
-//! │ Store in DB     │
+//! │ SQL INSERT      │
+//! │ (UPSERT)        │
 //! └─────────────────┘
 //! ```
 
 use crate::lyrics::parse::{parse_richsync_body, parse_subtitle_body, parse_synced_lyrics};
 use crate::lyrics::types::{LyricsError, ProviderResult};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
+use sqlx::Row;
+use std::path::PathBuf;
+use std::str::FromStr;
 
 // ============================================================================
 // Database Types
 // ============================================================================
 
 /// Format of stored lyrics for correct parsing on retrieval.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LyricsFormat {
     /// LRC timestamp format (from LRCLIB provider): `[MM:SS.CC]lyrics`
     Lrclib,
@@ -58,161 +80,99 @@ pub enum LyricsFormat {
     Subtitles,
 }
 
-/// Database entry for a single track's lyrics.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl LyricsFormat {
+    fn to_str(&self) -> &'static str {
+        match self {
+            Self::Lrclib => "lrclib",
+            Self::Richsync => "richsync",
+            Self::Subtitles => "subtitles",
+        }
+    }
+
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "lrclib" => Some(Self::Lrclib),
+            "richsync" => Some(Self::Richsync),
+            "subtitles" => Some(Self::Subtitles),
+            _ => None,
+        }
+    }
+}
+
+/// Database entry for a single track's lyrics (from SQL query).
+#[derive(Debug, Clone)]
 pub struct LyricsEntry {
-    /// Track artist (normalized for matching)
-    pub artist: String,
-    
-    /// Track title (normalized for matching)
-    pub title: String,
-    
-    /// Track album (normalized for matching)
-    pub album: String,
-    
-    /// Track duration in seconds (optional, for better matching)
     pub duration: Option<f64>,
-    
-    /// Format of the stored lyrics
     pub format: LyricsFormat,
-    
-    /// Raw lyrics text (unparsed for richsync, LRCLIB text otherwise)
     pub raw_lyrics: String,
 }
 
-/// In-memory database structure.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct LyricsDatabase {
-    /// Map of normalized key -> lyrics entry
-    entries: HashMap<String, LyricsEntry>,
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+/// Normalizes a string for case-insensitive matching.
+fn normalize(s: &str) -> String {
+    s.trim().to_lowercase()
 }
 
-impl LyricsDatabase {
-    /// Creates a new empty database.
-    pub fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-        }
-    }
+// ============================================================================
+// SQLite Connection & Schema
+// ============================================================================
 
-    /// Normalizes a string for case-insensitive matching.
-    ///
-    /// Converts to lowercase and trims whitespace.
-    fn normalize(s: &str) -> String {
-        s.trim().to_lowercase()
-    }
-
-    /// Generates a cache key from track metadata.
-    ///
-    /// Format: `artist|title|album` (all normalized)
-    fn cache_key(artist: &str, title: &str, album: &str) -> String {
-        format!(
-            "{}|{}|{}",
-            Self::normalize(artist),
-            Self::normalize(title),
-            Self::normalize(album)
+/// Creates the database schema if it doesn't exist.
+async fn create_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS lyrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            artist TEXT NOT NULL,
+            title TEXT NOT NULL,
+            album TEXT NOT NULL,
+            duration REAL,
+            format TEXT NOT NULL,
+            raw_lyrics TEXT NOT NULL
         )
-    }
+        "#,
+    )
+    .execute(pool)
+    .await?;
 
-    /// Looks up lyrics in the database.
-    ///
-    /// Returns `Some(entry)` if found, `None` otherwise.
-    pub fn get(&self, artist: &str, title: &str, album: &str) -> Option<&LyricsEntry> {
-        let key = Self::cache_key(artist, title, album);
-        self.entries.get(&key)
-    }
+    // Create index for fast lookups by artist/title/album
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_lookup 
+        ON lyrics(artist, title, album)
+        "#,
+    )
+    .execute(pool)
+    .await?;
 
-    /// Stores lyrics in the database.
-    ///
-    /// Overwrites existing entries with the same key.
-    pub fn insert(
-        &mut self,
-        artist: &str,
-        title: &str,
-        album: &str,
-        duration: Option<f64>,
-        format: LyricsFormat,
-        raw_lyrics: String,
-    ) {
-        let key = Self::cache_key(artist, title, album);
-        let entry = LyricsEntry {
-            artist: artist.to_string(),
-            title: title.to_string(),
-            album: album.to_string(),
-            duration,
-            format,
-            raw_lyrics,
-        };
-        self.entries.insert(key, entry);
-    }
-
-    /// Returns the number of entries in the database.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-}
-
-// ============================================================================
-// File I/O
-// ============================================================================
-
-/// Loads the database from a JSON file.
-///
-/// Returns a new empty database if the file doesn't exist or is invalid.
-pub async fn load_database(path: &Path) -> LyricsDatabase {
-    match load_database_inner(path).await {
-        Ok(db) => {
-            if db.len() > 0 {
-                tracing::info!(
-                    path = %path.display(),
-                    entries = db.len(),
-                    "Loaded lyrics database"
-                );
-            }
-            db
-        }
-        Err(e) if e.to_string().contains("No such file") => {
-            // First run - file doesn't exist yet
-            tracing::info!(
-                path = %path.display(),
-                "Creating new lyrics database"
-            );
-            LyricsDatabase::new()
-        }
-        Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                error = %e,
-                "Failed to load database, using empty database"
-            );
-            LyricsDatabase::new()
-        }
-    }
-}
-
-/// Inner implementation that returns errors for logging.
-async fn load_database_inner(path: &Path) -> Result<LyricsDatabase, Box<dyn std::error::Error>> {
-    let mut file = fs::File::open(path).await?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents).await?;
-    let db: LyricsDatabase = serde_json::from_str(&contents)?;
-    Ok(db)
-}
-
-/// Saves the database to a JSON file.
-///
-/// Creates parent directories if they don't exist.
-pub async fn save_database(db: &LyricsDatabase, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    // Create parent directory if it doesn't exist
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-
-    let json = serde_json::to_string_pretty(db)?;
-    let mut file = fs::File::create(path).await?;
-    file.write_all(json.as_bytes()).await?;
-    file.flush().await?;
     Ok(())
+}
+
+/// Opens or creates a SQLite database connection pool.
+async fn open_database(path: &PathBuf) -> Result<SqlitePool, sqlx::Error> {
+    // Create parent directory if needed
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    // Configure SQLite connection
+    let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal); // Write-Ahead Logging for better concurrency
+
+    // Create connection pool (max 5 connections)
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect_with(options)
+        .await?;
+
+    // Initialize schema
+    create_schema(&pool).await?;
+
+    Ok(pool)
 }
 
 // ============================================================================
@@ -238,7 +198,7 @@ fn parse_stored_lyrics(entry: &LyricsEntry) -> ProviderResult {
                     // Return the original JSON as raw
                     Ok((lines, Some(entry.raw_lyrics.clone())))
                 }
-                None => Err(LyricsError::Api(
+                _ => Err(LyricsError::Api(
                     "Failed to parse richsync lyrics from database".to_string()
                 )),
             }
@@ -250,7 +210,7 @@ fn parse_stored_lyrics(entry: &LyricsEntry) -> ProviderResult {
                     // Return the original JSON as raw
                     Ok((lines, Some(entry.raw_lyrics.clone())))
                 }
-                None => Err(LyricsError::Api(
+                _ => Err(LyricsError::Api(
                     "Failed to parse subtitle lyrics from database".to_string()
                 )),
             }
@@ -262,19 +222,36 @@ fn parse_stored_lyrics(entry: &LyricsEntry) -> ProviderResult {
 // Public API
 // ============================================================================
 
-/// Global database state wrapped in a mutex for thread-safe access.
-static DATABASE: tokio::sync::Mutex<Option<(LyricsDatabase, PathBuf)>> = tokio::sync::Mutex::const_new(None);
+/// Global SQLite connection pool.
+/// Pool maintains a small number of connections, reusing them efficiently.
+static DB_POOL: tokio::sync::OnceCell<SqlitePool> = tokio::sync::OnceCell::const_new();
 
-/// Initializes the database from the specified path.
+/// Initializes the SQLite database.
 ///
 /// This should be called once at application startup.
-/// Logging is handled by `load_database`.
+/// Creates the database file and schema if they don't exist.
 pub async fn initialize(path: PathBuf) {
-    let db = load_database(&path).await;
-    *DATABASE.lock().await = Some((db, path));
+    match open_database(&path).await {
+        Ok(pool) => {
+            tracing::info!(
+                path = %path.display(),
+                "SQLite database initialized"
+            );
+            let _ = DB_POOL.set(pool);
+        }
+        Err(e) => {
+            tracing::error!(
+                path = %path.display(),
+                error = %e,
+                "Failed to initialize SQLite database"
+            );
+        }
+    }
 }
 
 /// Attempts to fetch lyrics from the database.
+///
+/// Uses indexed SQL query for fast lookup with minimal memory usage.
 ///
 /// # Returns
 ///
@@ -286,10 +263,35 @@ pub async fn fetch_from_database(
     album: &str,
     duration: Option<f64>,
 ) -> Option<ProviderResult> {
-    let guard = DATABASE.lock().await;
-    let (db, _path) = guard.as_ref()?;
+    let pool = DB_POOL.get()?;
     
-    let entry = db.get(artist, title, album)?;
+    // Normalize search terms for case-insensitive matching
+    let artist_norm = normalize(artist);
+    let title_norm = normalize(title);
+    let album_norm = normalize(album);
+    
+    // Query database with indexed lookup
+    let row = sqlx::query(
+        r#"
+        SELECT duration, format, raw_lyrics
+        FROM lyrics
+        WHERE artist = ? AND title = ? AND album = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(&artist_norm)
+    .bind(&title_norm)
+    .bind(&album_norm)
+    .fetch_optional(pool)
+    .await
+    .ok()??;
+    
+    // Extract fields from row
+    let entry = LyricsEntry {
+        duration: row.get("duration"),
+        format: LyricsFormat::from_str(row.get("format"))?,
+        raw_lyrics: row.get("raw_lyrics"),
+    };
     
     // Optional: Validate duration match if both are present
     if let (Some(query_duration), Some(entry_duration)) = (duration, entry.duration) {
@@ -301,10 +303,13 @@ pub async fn fetch_from_database(
     }
     
     // Parse and return
-    Some(parse_stored_lyrics(entry))
+    Some(parse_stored_lyrics(&entry))
 }
 
-/// Stores lyrics in the database and persists to disk.
+/// Stores lyrics in the database.
+///
+/// Uses SQL DELETE + INSERT to replace existing entries.
+/// Minimal memory usage - only the new entry is in memory briefly.
 ///
 /// This should be called after successfully fetching lyrics from a provider.
 pub async fn store_in_database(
@@ -315,19 +320,50 @@ pub async fn store_in_database(
     format: LyricsFormat,
     raw_lyrics: String,
 ) {
-    let mut guard = DATABASE.lock().await;
-    let Some((db, path)) = guard.as_mut() else {
+    let Some(pool) = DB_POOL.get() else {
         return;
     };
     
-    db.insert(artist, title, album, duration, format, raw_lyrics);
+    // Normalize for consistent storage
+    let artist_norm = normalize(artist);
+    let title_norm = normalize(title);
+    let album_norm = normalize(album);
     
-    // Persist to disk asynchronously (don't block on errors)
-    if let Err(e) = save_database(db, path).await {
+    // Delete existing entry if it exists
+    let _ = sqlx::query(
+        r#"
+        DELETE FROM lyrics
+        WHERE artist = ? AND title = ? AND album = ?
+        "#,
+    )
+    .bind(&artist_norm)
+    .bind(&title_norm)
+    .bind(&album_norm)
+    .execute(pool)
+    .await;
+    
+    // Insert new entry
+    let result = sqlx::query(
+        r#"
+        INSERT INTO lyrics (artist, title, album, duration, format, raw_lyrics)
+        VALUES (?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&artist_norm)
+    .bind(&title_norm)
+    .bind(&album_norm)
+    .bind(duration)
+    .bind(format.to_str())
+    .bind(&raw_lyrics)
+    .execute(pool)
+    .await;
+    
+    if let Err(e) = result {
         tracing::warn!(
-            path = %path.display(),
+            artist = %artist,
+            title = %title,
             error = %e,
-            "Failed to save database"
+            "Failed to store lyrics in database"
         );
     }
 }
