@@ -77,7 +77,7 @@ fn schedule_next_richsync_boundary(upd: &Update) -> Option<Pin<Box<Sleep>>> {
             update_best_delay(&mut best_delay, word.end, upd.position);
 
             // Schedule grapheme boundaries for smooth per-character animation
-            if word.graphemes.len() > 1 {
+            if word.grapheme_count() > 1 {
                 for grapheme_boundary in compute_grapheme_boundaries(word) {
                     update_best_delay(&mut best_delay, grapheme_boundary, upd.position);
                 }
@@ -109,7 +109,7 @@ fn update_best_delay(best: &mut Option<f64>, boundary: f64, position: f64) {
 
 /// Compute grapheme boundaries for a word with per-word timing.
 fn compute_grapheme_boundaries(word: &crate::lyrics::types::WordTiming) -> Vec<f64> {
-    let total = word.graphemes.len();
+    let total = word.grapheme_count();
     let duration = (word.end - word.start).max(f64::EPSILON);
     
     (1..total)

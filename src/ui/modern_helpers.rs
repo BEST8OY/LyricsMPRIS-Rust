@@ -383,7 +383,7 @@ fn build_word_spans<'a>(
     // Word partially highlighted
     let duration = (word.end - word.start).max(f64::EPSILON);
     let fraction = ((position - word.start) / duration).clamp(0.0, 1.0);
-    let total_graphemes = word.graphemes.len();
+    let total_graphemes = word.grapheme_count();
     let highlighted_count = ((fraction * total_graphemes as f64).floor() as usize).min(total_graphemes);
 
     if highlighted_count == 0 {
@@ -394,10 +394,9 @@ fn build_word_spans<'a>(
         return vec![Span::styled(format!("{}{}", word.text, suffix), styles.current)];
     }
 
-    // Split at grapheme boundary
-    let start_byte = word.grapheme_byte_offsets[0];
-    let split_byte = word.grapheme_byte_offsets[highlighted_count];
-    let highlighted = &word.text[start_byte..split_byte];
+    // Split at grapheme boundary using the precomputed boundaries
+    let split_byte = word.grapheme_boundaries[highlighted_count];
+    let highlighted = &word.text[..split_byte];
     let remaining = &word.text[split_byte..];
 
     vec![

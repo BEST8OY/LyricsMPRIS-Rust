@@ -27,10 +27,17 @@ pub struct WordTiming {
     pub start: f64,
     pub end: f64,
     pub text: String,
-    /// Grapheme cluster slices of `text` (precomputed to avoid per-tick allocations).
-    pub graphemes: Vec<String>,
-    /// Byte offsets corresponding to the start of each grapheme in `text`.
-    pub grapheme_byte_offsets: Vec<usize>,
+    /// Byte indices of grapheme cluster boundaries in `text`.
+    /// To extract grapheme at index i: &text[boundaries[i]..boundaries[i+1]]
+    /// The last boundary equals text.len() for convenience.
+    pub grapheme_boundaries: Vec<usize>,
+}
+
+impl WordTiming {
+    /// Returns the number of grapheme clusters in this word.
+    pub fn grapheme_count(&self) -> usize {
+        self.grapheme_boundaries.len().saturating_sub(1)
+    }
 }
 
 #[derive(Error, Debug)]

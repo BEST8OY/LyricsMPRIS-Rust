@@ -4,6 +4,10 @@ use regex::Regex;
 use serde_json::Value;
 use unicode_segmentation::UnicodeSegmentation;
 
+// Limits to prevent excessive memory allocation from malformed/malicious data
+const MAX_LYRIC_LINES: usize = 1000;
+const MAX_WORDS_PER_LINE: usize = 100;
+
 /// Regex pattern for LRC timestamps: [MM:SS.CC]
 static SYNCED_LYRICS_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\[(\d{1,2}):(\d{2})[.](\d{1,2})\]").unwrap());
@@ -85,9 +89,18 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<Vec<LyricLine>> {
     let lines_val = serde_json::from_str::<Value>(richsync_body).ok()?;
     let arr = lines_val.as_array()?;
 
+    // Validate line count to prevent excessive allocation
+    if arr.len() > MAX_LYRIC_LINES {
+        tracing::warn!(
+            "Richsync data has {} lines, exceeds limit of {}, truncating",
+            arr.len(),
+            MAX_LYRIC_LINES
+        );
+    }
+
     let mut parsed = Vec::new();
 
-    for line in arr {
+    for line in arr.iter().take(MAX_LYRIC_LINES) {
         let line_start = line.pointer("/ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
         let line_end = line.pointer("/te").and_then(|v| v.as_f64()).unwrap_or(line_start + 3.0);
         let text = line
@@ -114,12 +127,28 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<Vec<LyricLine>> {
 fn parse_word_timings(line: &Value, line_start: f64, line_end: f64) -> Option<Vec<crate::lyrics::types::WordTiming>> {
     // Try explicit words array first
     if let Some(words_arr) = line.get("words").and_then(|v| v.as_array()) {
-        return parse_explicit_word_array(words_arr, line_start, line_end);
+        // Validate word count
+        if words_arr.len() > MAX_WORDS_PER_LINE {
+            tracing::warn!(
+                "Line has {} words, exceeds limit of {}, truncating",
+                words_arr.len(),
+                MAX_WORDS_PER_LINE
+            );
+        }
+        return parse_explicit_word_array(&words_arr[..words_arr.len().min(MAX_WORDS_PER_LINE)], line_start, line_end);
     }
 
     // Fall back to character-level array
     if let Some(char_arr) = line.get("l").and_then(|v| v.as_array()) {
-        return parse_character_array(char_arr, line_start, line_end);
+        // Validate word count (character array typically has more entries)
+        if char_arr.len() > MAX_WORDS_PER_LINE {
+            tracing::warn!(
+                "Line has {} character entries, exceeds limit of {}, truncating",
+                char_arr.len(),
+                MAX_WORDS_PER_LINE
+            );
+        }
+        return parse_character_array(&char_arr[..char_arr.len().min(MAX_WORDS_PER_LINE)], line_start, line_end);
     }
 
     None
@@ -185,26 +214,26 @@ fn parse_character_array(char_arr: &[Value], line_start: f64, line_end: f64) -> 
     }
 }
 
-/// Create a WordTiming struct with precomputed grapheme data.
+/// Create a WordTiming struct with precomputed grapheme boundary data.
 fn create_word_timing(start: f64, end: f64, text: &str) -> crate::lyrics::types::WordTiming {
-    // Precompute grapheme clusters for Unicode-aware rendering
-    let graphemes: Vec<String> = text.graphemes(true).map(String::from).collect();
+    // Precompute grapheme cluster boundaries for efficient Unicode-aware rendering
+    // This avoids storing each grapheme as a separate String (24 bytes overhead each)
+    let mut grapheme_boundaries: Vec<usize> = Vec::new();
+    grapheme_boundaries.push(0);
     
-    // Precompute byte offsets for efficient string slicing
-    let grapheme_byte_offsets: Vec<usize> = graphemes
-        .iter()
-        .scan(0, |offset, g| {
-            let current = *offset;
-            *offset += g.len();
-            Some(current)
-        })
-        .collect();
+    for (byte_offset, _grapheme) in text.grapheme_indices(true) {
+        if byte_offset > 0 {
+            grapheme_boundaries.push(byte_offset);
+        }
+    }
+    
+    // Add final boundary for convenience (allows simple slicing: text[boundaries[i]..boundaries[i+1]])
+    grapheme_boundaries.push(text.len());
 
     crate::lyrics::types::WordTiming {
         start,
         end,
         text: text.to_string(),
-        graphemes,
-        grapheme_byte_offsets,
+        grapheme_boundaries,
     }
 }
