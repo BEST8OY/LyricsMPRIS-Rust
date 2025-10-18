@@ -32,6 +32,9 @@ pub struct Config {
     /// Disable karaoke highlighting (per-word). Use --no-karaoke to disable karaoke (default: enabled).
     #[arg(long = "no-karaoke")]
     pub no_karaoke: bool,
+    /// Maximum number of visible lyric lines (treating wrapped lines as one line). Default: unlimited
+    #[arg(long = "visible-lines", value_name = "COUNT")]
+    pub visible_lines: Option<usize>,
     /// Comma-separated list of lyric providers in preferred order (e.g. "lrclib,musixmatch").
     /// If empty, the LYRIC_PROVIDERS env var will be used as a fallback.
     #[arg(long, value_delimiter = ',')]
@@ -52,6 +55,7 @@ impl Default for Config {
             database: None,
             player_service: None,
             no_karaoke: false,
+            visible_lines: None,
         }
     }
 }

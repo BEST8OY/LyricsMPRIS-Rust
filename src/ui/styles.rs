@@ -5,7 +5,7 @@
 //! - **Current**: The currently active line (bold/green)
 //! - **After**: Upcoming lines (normal styling)
 
-use tui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 
 /// Style configuration for lyrics rendering in TUI mode.
 ///

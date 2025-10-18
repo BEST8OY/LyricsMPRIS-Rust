@@ -9,11 +9,11 @@
 use crate::text_utils::wrap_text;
 use crate::state::Update;
 use crate::ui::styles::LyricStyles;
-use tui::{
+use ratatui::{
     backend::Backend,
     layout::{Alignment, Rect},
-    terminal::Terminal,
-    text::{Span, Spans},
+    Terminal,
+    text::{Span, Line},
     widgets::Paragraph,
 };
 use std::error::Error;
@@ -30,10 +30,12 @@ pub fn draw_ui_with_cache<B: Backend>(
     wrapped_cache: &mut Option<(usize, Vec<Vec<String>>)>,
     styles: &LyricStyles,
     karaoke_enabled: bool,
+    max_visible_lines: Option<usize>,
+    scroll_offset: isize,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     terminal
         .draw(|f| {
-            let size = f.size();
+            let size = f.area();
             let width = size.width as usize;
             let height = size.height as usize;
 
@@ -44,6 +46,8 @@ pub fn draw_ui_with_cache<B: Backend>(
                 height,
                 styles,
                 karaoke_enabled,
+                max_visible_lines,
+                scroll_offset,
             );
 
             render_centered_paragraph(f, size, visible_spans, height);
@@ -61,7 +65,9 @@ fn compute_visible_spans<'a>(
     height: usize,
     styles: &'a LyricStyles,
     karaoke_enabled: bool,
-) -> Vec<Spans<'a>> {
+    max_visible_lines: Option<usize>,
+    scroll_offset: isize,
+) -> Vec<Line<'a>> {
     let Some(update) = last_update else {
         return Vec::new();
     };
@@ -70,7 +76,7 @@ fn compute_visible_spans<'a>(
     if let Some(err) = &update.err {
         return wrap_text(err, width)
             .into_iter()
-            .map(|l| Spans::from(Span::styled(l, styles.current)))
+            .map(|l| Line::from(Span::styled(l, styles.current)))
             .collect();
     }
 
@@ -88,6 +94,8 @@ fn compute_visible_spans<'a>(
         styles,
         update.position,
         karaoke_enabled,
+        max_visible_lines,
+        scroll_offset,
     );
 
     visible.into_vec()
@@ -117,14 +125,14 @@ fn ensure_wrapped_cache<'a>(
 }
 
 /// Render a paragraph centered vertically in the given area.
-fn render_centered_paragraph<B: Backend>(
-    frame: &mut tui::Frame<B>,
+fn render_centered_paragraph(
+    frame: &mut ratatui::Frame,
     size: Rect,
-    spans: Vec<Spans>,
+    spans: Vec<Line>,
     height: usize,
 ) {
     if spans.is_empty() {
-        let paragraph = Paragraph::new(vec![Spans::from(Span::raw(""))])
+        let paragraph = Paragraph::new(vec![Line::from(Span::raw(""))])
             .alignment(Alignment::Center);
         frame.render_widget(paragraph, size);
         return;
@@ -146,24 +154,24 @@ fn render_centered_paragraph<B: Backend>(
 
 /// Collection of styled lines to render.
 pub struct VisibleLines<'a> {
-    pub before: Vec<Spans<'a>>,
-    pub current: Vec<Spans<'a>>,
-    pub after: Vec<Spans<'a>>,
+    pub before: Vec<Line<'a>>,
+    pub current: Vec<Line<'a>>,
+    pub after: Vec<Line<'a>>,
 }
 
 impl<'a> VisibleLines<'a> {
-    pub fn into_vec(self) -> Vec<Spans<'a>> {
+    pub fn into_vec(self) -> Vec<Line<'a>> {
         [self.before, self.current, self.after].concat()
     }
 }
 
-/// Collect lines before the current index. Returns Spans in visual top->down order.
+/// Collect lines before the current index. Returns Line in visual top->down order.
 fn collect_before_spans<'a>(
     current_index: usize,
     wrapped_blocks: &[Vec<String>],
     mut lines_needed: usize,
-    style: tui::style::Style,
-) -> Vec<Spans<'a>> {
+    style: ratatui::style::Style,
+) -> Vec<Line<'a>> {
     let mut result = Vec::new();
 
     // Walk backwards collecting lines; prepend each block's tail to maintain order
@@ -177,7 +185,7 @@ fn collect_before_spans<'a>(
         // insert at the front.
         let spans = block[start..]
             .iter()
-            .map(|l| Spans::from(Span::styled(l.clone(), style)))
+            .map(|l| Line::from(Span::styled(l.clone(), style)))
             .collect::<Vec<_>>();
         // prepend
         result.splice(0..0, spans);
@@ -187,24 +195,66 @@ fn collect_before_spans<'a>(
     result
 }
 
-/// Collect lines after the current index. Returns Spans in visual top->down order.
+/// Collect lines after the current index. Returns Line in visual top->down order.
 fn collect_after_spans<'a>(
     current_index: usize,
     wrapped_blocks: &[Vec<String>],
     mut lines_needed: usize,
-    style: tui::style::Style,
-) -> Vec<Spans<'a>> {
+    style: ratatui::style::Style,
+) -> Vec<Line<'a>> {
     let mut result = Vec::new();
     let mut j = current_index + 1;
     while j < wrapped_blocks.len() && lines_needed > 0 {
         let block = &wrapped_blocks[j];
         let take = block.len().min(lines_needed);
         for line in block.iter().take(take) {
-            result.push(Spans::from(Span::styled(line.clone(), style)));
+            result.push(Line::from(Span::styled(line.clone(), style)));
         }
         lines_needed -= take;
         j += 1;
     }
+    result
+}
+
+/// Collect complete lyric blocks before the current index (for max_visible_lines mode).
+/// Returns all wrapped lines from each block in visual top->down order.
+fn collect_before_blocks<'a>(
+    current_index: usize,
+    wrapped_blocks: &[Vec<String>],
+    blocks_needed: usize,
+    style: ratatui::style::Style,
+) -> Vec<Line<'a>> {
+    let mut result = Vec::new();
+    let start_index = current_index.saturating_sub(blocks_needed);
+    
+    for i in start_index..current_index {
+        let block = &wrapped_blocks[i];
+        for line in block {
+            result.push(Line::from(Span::styled(line.clone(), style)));
+        }
+    }
+    
+    result
+}
+
+/// Collect complete lyric blocks after the current index (for max_visible_lines mode).
+/// Returns all wrapped lines from each block in visual top->down order.
+fn collect_after_blocks<'a>(
+    current_index: usize,
+    wrapped_blocks: &[Vec<String>],
+    blocks_needed: usize,
+    style: ratatui::style::Style,
+) -> Vec<Line<'a>> {
+    let mut result = Vec::new();
+    let end_index = (current_index + 1 + blocks_needed).min(wrapped_blocks.len());
+    
+    for i in (current_index + 1)..end_index {
+        let block = &wrapped_blocks[i];
+        for line in block {
+            result.push(Line::from(Span::styled(line.clone(), style)));
+        }
+    }
+    
     result
 }
 
@@ -243,6 +293,10 @@ fn split_words_into_lines<'b>(
 ///
 /// If `update.index` is None, renders using `styles.after` (dimmed).
 /// For richsync with karaoke enabled, builds per-word spans with partial highlighting.
+/// 
+/// # Arguments
+/// * `max_visible_lines` - Maximum number of lyric blocks to display (None = unlimited)
+/// * `scroll_offset` - Manual scroll offset in lyric blocks when paused
 pub fn gather_visible_lines<'a>(
     update: &Update,
     wrapped_blocks: &[Vec<String>],
@@ -251,26 +305,48 @@ pub fn gather_visible_lines<'a>(
     styles: &'a LyricStyles,
     position: f64,
     karaoke_enabled: bool,
+    max_visible_lines: Option<usize>,
+    scroll_offset: isize,
 ) -> VisibleLines<'a> {
-    let idx_for_context = update.index.unwrap_or(0);
+    // Calculate the effective index considering scroll offset when paused
+    let base_index = update.index.unwrap_or(0);
+    let effective_index = if !update.playing {
+        // When paused, allow scrolling
+        (base_index as isize + scroll_offset)
+            .max(0)
+            .min(wrapped_blocks.len().saturating_sub(1) as isize) as usize
+    } else {
+        base_index
+    };
+    
     let current_block = wrapped_blocks
-        .get(idx_for_context)
+        .get(effective_index)
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
     let current_height = current_block.len();
 
-    // Build current line spans (with karaoke if applicable)
+    // Build current line spans (with karaoke if applicable, but only when not scrolled)
+    let use_karaoke = karaoke_enabled && scroll_offset == 0 && update.playing;
     let current_spans = build_current_spans(
         update,
         current_block,
         w,
         styles,
         position,
-        karaoke_enabled,
+        use_karaoke,
     );
 
-    // If current block fills the screen, no context needed
-    if current_height >= h {
+    // Calculate available height considering max_visible_lines
+    let available_height = if let Some(max) = max_visible_lines {
+        // max_visible_lines is in terms of lyric blocks, not wrapped screen lines
+        // We need to limit the total number of blocks (before + current + after)
+        h.min(max)
+    } else {
+        h
+    };
+
+    // If current block fills the available space, no context needed
+    if current_height >= available_height {
         return VisibleLines {
             before: Vec::new(),
             current: current_spans,
@@ -278,13 +354,35 @@ pub fn gather_visible_lines<'a>(
         };
     }
 
-    // Calculate context lines
-    let context_lines = h.saturating_sub(current_height);
-    let lines_before = context_lines / 2;
-    let lines_after = context_lines - lines_before;
+    // Calculate context lines for max_visible_lines
+    let (lines_before, lines_after) = if let Some(max) = max_visible_lines {
+        // Limit to max blocks total
+        let context_blocks = max.saturating_sub(1); // -1 for current block
+        let before_blocks = context_blocks / 2;
+        let after_blocks = context_blocks - before_blocks;
+        
+        // Count how many wrapped lines each block would contribute
+        // For simplicity, we'll use a heuristic approach
+        (before_blocks, after_blocks)
+    } else {
+        // Original behavior: fill screen with wrapped lines
+        let context_lines = available_height.saturating_sub(current_height);
+        let lines_before = context_lines / 2;
+        let lines_after = context_lines - lines_before;
+        (lines_before, lines_after)
+    };
 
-    let before = collect_before_spans(idx_for_context, wrapped_blocks, lines_before, styles.before);
-    let after = collect_after_spans(idx_for_context, wrapped_blocks, lines_after, styles.after);
+    let before = if max_visible_lines.is_some() {
+        collect_before_blocks(effective_index, wrapped_blocks, lines_before, styles.before)
+    } else {
+        collect_before_spans(effective_index, wrapped_blocks, lines_before, styles.before)
+    };
+    
+    let after = if max_visible_lines.is_some() {
+        collect_after_blocks(effective_index, wrapped_blocks, lines_after, styles.after)
+    } else {
+        collect_after_spans(effective_index, wrapped_blocks, lines_after, styles.after)
+    };
 
     VisibleLines {
         before,
@@ -301,7 +399,7 @@ fn build_current_spans<'a>(
     styles: &'a LyricStyles,
     position: f64,
     karaoke_enabled: bool,
-) -> Vec<Spans<'a>> {
+) -> Vec<Line<'a>> {
     // Try to build richsync karaoke spans
     if let Some(idx) = update.index
         && karaoke_enabled && matches!(update.provider, Some(crate::state::Provider::MusixmatchRichsync))
@@ -318,7 +416,7 @@ fn build_current_spans<'a>(
 
     current_block
         .iter()
-        .map(|line| Spans::from(Span::styled(line.clone(), style)))
+        .map(|line| Line::from(Span::styled(line.clone(), style)))
         .collect()
 }
 
@@ -329,7 +427,7 @@ fn try_build_karaoke_spans<'a>(
     width: usize,
     styles: &'a LyricStyles,
     position: f64,
-) -> Option<Vec<Spans<'a>>> {
+) -> Option<Vec<Line<'a>>> {
     let line = update.lines.get(idx)?;
     let words = line.words.as_ref()?;
 
@@ -338,7 +436,7 @@ fn try_build_karaoke_spans<'a>(
 
     for word_line in word_lines {
         let line_spans = build_word_line_spans(&word_line, position, styles);
-        result.push(Spans::from(line_spans));
+        result.push(Line::from(line_spans));
     }
 
     Some(result)

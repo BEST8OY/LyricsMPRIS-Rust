@@ -25,7 +25,7 @@ use std::pin::Pin;
 use tokio::time::Sleep;
 use tokio::sync::mpsc;
 use std::thread;
-use tui::{Terminal, backend::CrosstermBackend};
+use ratatui::{Terminal, backend::CrosstermBackend};
 
 /// UI state for the modern TUI mode
 pub struct ModernUIState {
@@ -38,6 +38,8 @@ pub struct ModernUIState {
     pub last_update_instant: Option<Instant>,
     /// Runtime karaoke toggle (can be toggled with 'k')
     pub karaoke_enabled: bool,
+    /// Manual scroll offset when paused (in lyric blocks, not wrapped lines)
+    pub scroll_offset: isize,
 }
 
 impl ModernUIState {
@@ -49,6 +51,7 @@ impl ModernUIState {
             should_exit: false,
             last_update_instant: None,
             karaoke_enabled: true,
+            scroll_offset: 0,
         }
     }
 }
@@ -64,6 +67,7 @@ pub async fn display_lyrics_modern(
     mpris_config: crate::Config,
     karaoke_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let max_visible_lines = mpris_config.visible_lines;
     let (tx, mut rx) = mpsc::channel(32);
     let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
     tokio::spawn(pool::listen(tx, shutdown_rx, mpris_config.clone()));
@@ -117,14 +121,14 @@ pub async fn display_lyrics_modern(
             // MPRIS lyrics/position updates
             update = rx.recv() => {
                 process_update(update, &mut state)?;
-                redraw_and_reschedule(&mut terminal, &mut state, &styles, &mut next_word_sleep)?;
+                redraw_and_reschedule(&mut terminal, &mut state, &styles, &mut next_word_sleep, max_visible_lines)?;
             }
 
             // User keyboard input
             maybe_event = event_rx.recv() => {
                 if let Some(event) = maybe_event {
                     process_event(event, &mut state)?;
-                    redraw_and_reschedule(&mut terminal, &mut state, &styles, &mut next_word_sleep)?;
+                    redraw_and_reschedule(&mut terminal, &mut state, &styles, &mut next_word_sleep, max_visible_lines)?;
                 } else {
                     // Event channel closed -> exit gracefully
                     state.should_exit = true;
@@ -139,7 +143,7 @@ pub async fn display_lyrics_modern(
                     futures_util::future::pending::<()>().await;
                 }
             } => {
-                redraw_and_reschedule(&mut terminal, &mut state, &styles, &mut next_word_sleep)?;
+                redraw_and_reschedule(&mut terminal, &mut state, &styles, &mut next_word_sleep, max_visible_lines)?;
             }
         }
     }
@@ -154,11 +158,12 @@ pub async fn display_lyrics_modern(
 /// 1. Estimate current position based on elapsed time
 /// 2. Draw UI with estimated/actual update
 /// 3. Compute next word boundary for karaoke timer
-fn redraw_and_reschedule<B: tui::backend::Backend>(
+fn redraw_and_reschedule<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     state: &mut ModernUIState,
     styles: &LyricStyles,
     next_word_sleep: &mut Option<Pin<Box<Sleep>>>,
+    max_visible_lines: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (estimated_update, next_sleep) = crate::ui::estimate_update_and_next_sleep(
         &state.last_update,
@@ -169,12 +174,21 @@ fn redraw_and_reschedule<B: tui::backend::Backend>(
     // Use estimated update if available, otherwise fall back to stored update
     let draw_update = estimated_update.or_else(|| state.last_update.clone());
 
+    // Reset scroll offset when playback resumes
+    if let Some(ref upd) = draw_update {
+        if upd.playing {
+            state.scroll_offset = 0;
+        }
+    }
+
     crate::ui::modern_helpers::draw_ui_with_cache(
         terminal,
         &draw_update,
         &mut state.wrapped_cache,
         styles,
         state.karaoke_enabled,
+        max_visible_lines,
+        state.scroll_offset,
     )?;
 
     *next_word_sleep = next_sleep;
@@ -258,6 +272,22 @@ fn process_event(
             KeyCode::Char('k') => {
                 // Toggle karaoke at runtime
                 state.karaoke_enabled = !state.karaoke_enabled;
+            }
+            KeyCode::Up => {
+                // Scroll up when paused
+                if let Some(ref update) = state.last_update {
+                    if !update.playing {
+                        state.scroll_offset = state.scroll_offset.saturating_sub(1);
+                    }
+                }
+            }
+            KeyCode::Down => {
+                // Scroll down when paused
+                if let Some(ref update) = state.last_update {
+                    if !update.playing {
+                        state.scroll_offset = state.scroll_offset.saturating_add(1);
+                    }
+                }
             }
             KeyCode::Char('c')
                 if key
