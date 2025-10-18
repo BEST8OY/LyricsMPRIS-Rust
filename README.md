@@ -31,6 +31,7 @@ A lightweight, high-performance lyrics viewer for Linux that integrates seamless
 - **Rust toolchain** (1.70+): Install from [rustup.rs](https://rustup.rs)
 - **Linux** with D-Bus support
 - **MPRIS-compatible media player**
+- **playerctld**
 
 ### Installation
 
