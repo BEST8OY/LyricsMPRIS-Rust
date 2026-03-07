@@ -86,7 +86,7 @@ cargo build --release
 | `--no-karaoke` | Disable word-level highlighting | - |
 | `--pipe` | Output to stdout instead of TUI | - |
 | `--block LIST` | Ignore specific MPRIS services | `--block vlc,chromium` |
-| `--target LIST` | Listen to specific MPRIS services | `--target spotify,vlc` |
+| `--target LIST` | Listen to specific MPRIS services | `--target spotify,mpv` |
 
 ### Environment Variables
 
