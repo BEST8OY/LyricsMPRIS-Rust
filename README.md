@@ -19,10 +19,13 @@ A lightweight, high-performance lyrics viewer for Linux that integrates seamless
 - **🔄 Configurable Priority**: Set your preferred provider order
 - **💾 Local Cache**: Optional database for offline access and reduced API calls
 
-> **Note on Terminology**: "LRCLIB" refers to the lrclib.net provider service, while "LRC format" refers to the timestamp standard (`[MM:SS.CC]lyrics`) that LRCLIB returns. Musixmatch returns different JSON-based formats (Richsync/Subtitles).
+
+> [!NOTE]
+> **Terminology**: "LRCLIB" refers to the lrclib.net provider service, while "LRC format" refers to the timestamp standard (`[MM:SS.CC]lyrics`) that LRCLIB returns. Musixmatch returns different JSON-based formats (Richsync/Subtitles).
 
 ### Player Integration
 - **🎧 MPRIS Support**: Works with any MPRIS-compatible player (Spotify, VLC, mpv, etc.)
+- 🎯 **Targets**: Target specific players to avoid player switching
 - **🚫 Blocklist**: Exclude specific players from monitoring
 - **⚡ Event-Driven**: Efficient architecture with zero polling overhead
 
@@ -70,6 +73,8 @@ cargo build --release
 ## ⚙️ Configuration
 
 ### Command Line Options
+> [!NOTE]
+> Use `playerctl --list-all` to view MPRIS services
 
 | Flag | Description | Example |
 |------|-------------|---------|
@@ -79,6 +84,7 @@ cargo build --release
 | `--no-karaoke` | Disable word-level highlighting | - |
 | `--pipe` | Output to stdout instead of TUI | - |
 | `--block LIST` | Ignore specific MPRIS services | `--block vlc,chromium` |
+| `--target LIST` | Listen to specific MPRIS services | `--target spotify,vlc` |
 
 ### Environment Variables
 
@@ -121,7 +127,8 @@ export LYRIC_PROVIDERS="lrclib,musixmatch"
 | `↓` (Down) | Scroll down one lyric (when paused) |
 | `q` or `Esc` | Quit application |
 
-> **Note**: Scrolling with arrow keys only works when playback is paused. When you resume playback, the view automatically resets to follow the current position.
+> [!NOTE]
+> Scrolling with arrow keys only works when playback is paused. When you resume playback, the view automatically resets to follow the current position.
 
 ## 💾 Local Database
 
@@ -177,10 +184,10 @@ Lyrics are stored in their original format by provider:
 | artist | title | album | duration | format | raw_lyrics |
 |--------|-------|-------|----------|--------|------------|
 | arctic monkeys | do i wanna know? | am | 272.0 | richsync | `[{"ts":29.26,"te":31.597,...}]` |
-
-> **Note**: `raw_lyrics` is shown above **decompressed** for readability.
-
-> **Note**: Artist, title, and album are normalized (lowercase, trimmed) for case-insensitive matching.
+> [!NOTE]
+> `raw_lyrics` is shown above **decompressed** for readability.
+> 
+> Artist, title, and album are normalized (lowercase, trimmed) for case-insensitive matching.
 
 ### Benefits
 
@@ -362,3 +369,4 @@ See the [LICENSE](LICENSE) file for details.
 ---
 
 **Made with ❤️ for the Linux audio community**
+
