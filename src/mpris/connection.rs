@@ -41,11 +41,12 @@ trait Playerctld {
 }
 
 /// Get list of active MPRIS player service names
-/// 
+///
 /// This queries playerctld if available, otherwise returns an empty list.
 pub async fn get_active_player_names() -> Result<Vec<String>, MprisError> {
     let conn = get_dbus_conn().await?;
-    
+
+
     match PlayerctldProxy::new(&conn).await {
         Ok(proxy) => {
             proxy.player_names().await.or(Ok(Vec::new()))
@@ -55,11 +56,27 @@ pub async fn get_active_player_names() -> Result<Vec<String>, MprisError> {
 }
 
 /// Check if a player service name should be blocked
-/// 
+///
 /// Returns true if the service name (case-insensitive) contains any blocked string.
 pub fn is_blocked(service: &str, block_list: &[String]) -> bool {
     let service_lower = service.to_lowercase();
     block_list
         .iter()
         .any(|blocked| service_lower.contains(&blocked.to_lowercase()))
+}
+
+/// Check if a player serivce is targeted, and should be listend to
+///
+/// Returns true if the serivce name (case-insensitive) is wanted by the target flag
+pub fn is_targeted(service: &str, target_list: &[String]) -> bool {
+    // If target_list is empty, return true
+    if target_list.is_empty() {
+        tracing::debug!("target list is empty, allowing switch");
+        return true;
+    }
+
+    let service_lower = service.to_lowercase();
+    target_list
+        .iter()
+        .any(|target| service_lower.contains(&target.to_lowercase()))
 }
