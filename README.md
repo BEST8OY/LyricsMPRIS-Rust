@@ -21,7 +21,9 @@ A lightweight, high-performance lyrics viewer for Linux that integrates seamless
 
 
 > [!NOTE]
-> **Terminology**: "LRCLIB" refers to the lrclib.net provider service, while "LRC format" refers to the timestamp standard (`[MM:SS.CC]lyrics`) that LRCLIB returns. Musixmatch returns different JSON-based formats (Richsync/Subtitles).
+> **Terminology**: "LRCLIB" refers to the lrclib.net provider service, while "LRC format" refers to the timestamp standard (`[MM:SS.CC]lyrics`) that LRCLIB returns.
+>
+> Musixmatch returns different JSON-based formats (Richsync/Subtitles).
 
 ### Player Integration
 - **🎧 MPRIS Support**: Works with any MPRIS-compatible player (Spotify, VLC, mpv, etc.)
