@@ -9,6 +9,8 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 
 `LyricsMPRIS-Rust` monitors your active media player in real-time using D-Bus, fetches synchronized lyrics automatically, and renders them beautifully in a modern Terminal User Interface (TUI). It also features a scriptable **Pipe Mode** for custom desktop widgets, standard **LRC file parsing**, and a highly optimized **local SQLite database** with Zstd compression for instant offline lookups.
 
+![LyricMPRIS-Rust](https://github.com/user-attachments/assets/501f224e-6c40-46cd-ac66-cd9ae4f927cf)
+
 ---
 
 ## 📖 Table of Contents
