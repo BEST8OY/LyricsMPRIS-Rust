@@ -1,6 +1,19 @@
+use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+
+static PUNCTUATION_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"[^\w\s]").unwrap());
+static WHITESPACE_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").unwrap());
+static TAG_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(
+        r"(?:[-(]|\s-\s)(remix|live|acoustic|instrumental|radio\sedit|remastered|explicit|clean|unplugged|re-recorded|edit|version|mono|stereo|deluxe|anniversary|reprise|demo)(?:\W|$)"
+    ).unwrap()
+});
+static BRACKET_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\[[^\]]+\]").unwrap());
+static DURATION_PAREN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\(\d+(?::\d+(?:\.\d+)?)?\)").unwrap());
+static PAREN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\([^)]*\)").unwrap());
+static DASH_TRAILING_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s-\s.*").unwrap());
 
 /// Comprehensive similarity scoring information for song matching.
 #[derive(Clone, Debug)]
@@ -8,20 +21,17 @@ pub struct ScoreInfo {
     /// Final aggregated similarity score (0.0..=1.0).
     pub score: f64,
 
-    /// Per-component scores (title, artist, album, duration).
-    /// Used for debugging and detailed match analysis.
+    /// Per-component scores: [title, artist, album, duration].
     #[allow(dead_code)]
-    pub components: HashMap<String, f64>,
+    pub components: [f64; 4],
 
-    /// Normalized importance weights for each component.
-    /// Used to calculate the final weighted score.
+    /// Normalized importance weights: [title, artist, album, duration].
     #[allow(dead_code)]
-    pub weights: HashMap<String, f64>,
+    pub weights: [f64; 4],
 
-    /// Duration values (in seconds) for query and candidate.
-    /// Useful for debugging duration-based scoring.
+    /// Duration values (query, candidate).
     #[allow(dead_code)]
-    pub durations: HashMap<String, Option<f64>>,
+    pub durations: [Option<f64>; 2],
 }
 
 /// Normalize a string for comparison: lowercase, remove punctuation, collapse whitespace.
@@ -31,10 +41,8 @@ fn normalize_string(s: &str) -> String {
     }
     
     let lower = s.to_lowercase();
-    let re = Regex::new(r"[^\w\s]").unwrap();
-    let replaced = re.replace_all(&lower, " ");
-    let ws = Regex::new(r"\s+").unwrap();
-    ws.replace_all(&replaced, " ").trim().to_string()
+    let replaced = PUNCTUATION_RE.replace_all(&lower, " ");
+    WHITESPACE_RE.replace_all(&replaced, " ").trim().to_string()
 }
 
 /// Generate n-grams of specified size from a string.
@@ -101,37 +109,27 @@ fn levenshtein_distance(s1: &str, s2: &str) -> usize {
 
 /// Analyze a title into a base title and a set of version tags (remix, live, etc.).
 fn analyze_title(title: &str) -> (String, HashSet<String>) {
-    let tag_re = Regex::new(
-        r"(?:[-(]|\s-\s)(remix|live|acoustic|instrumental|radio\sedit|remastered|explicit|clean|unplugged|re-recorded|edit|version|mono|stereo|deluxe|anniversary|reprise|demo)(?:\W|$)"
-    ).unwrap();
-    
     let mut base = normalize_string(title);
     let mut tags = HashSet::new();
     
     // Extract version tags
-    for cap in tag_re.captures_iter(&base) {
+    for cap in TAG_RE.captures_iter(&base) {
         if let Some(m) = cap.get(1) {
             tags.insert(m.as_str().replace(' ', ""));
         }
     }
     
     // Clean up the base title: remove brackets, parentheses, and trailing content
-    let patterns = [
-        (Regex::new(r"\[[^\]]+\]").unwrap(), ""),                      // [text]
-        (Regex::new(r"\(\d+(?::\d+(?:\.\d+)?)?\)").unwrap(), ""),     // (duration)
-        (Regex::new(r"\([^)]*\)").unwrap(), ""),                       // (text)
-    ];
-    
-    for (re, replacement) in &patterns {
-        base = re.replace_all(&base, *replacement).to_string();
-    }
+    base = BRACKET_RE.replace_all(&base, "").to_string();
+    base = DURATION_PAREN_RE.replace_all(&base, "").to_string();
+    base = PAREN_RE.replace_all(&base, "").to_string();
     
     // Remove tags and trailing content after dash
-    base = tag_re.replace_all(&base, " ").to_string();
-    base = Regex::new(r"\s-\s.*").unwrap().replace_all(&base, "").to_string();
+    base = TAG_RE.replace_all(&base, " ").to_string();
+    base = DASH_TRAILING_RE.replace_all(&base, "").to_string();
     
     // Normalize whitespace
-    base = Regex::new(r"\s+").unwrap().replace_all(&base, " ").trim().to_string();
+    base = WHITESPACE_RE.replace_all(&base, " ").trim().to_string();
     
     (base, tags)
 }
@@ -145,10 +143,8 @@ fn normalize_artist_name(artist: &str) -> String {
     let mut normalized = artist.to_lowercase();
     
     // Remove bracketed and parenthesized content
-    let re_brackets = Regex::new(r"\[[^\]]+\]").unwrap();
-    normalized = re_brackets.replace_all(&normalized, "").to_string();
-    let re_paren = Regex::new(r"\([^)]*\)").unwrap();
-    normalized = re_paren.replace_all(&normalized, "").to_string();
+    normalized = BRACKET_RE.replace_all(&normalized, "").to_string();
+    normalized = PAREN_RE.replace_all(&normalized, "").to_string();
     
     // Split by collaboration separators and process each part
     let parts: Vec<String> = normalized
@@ -318,51 +314,32 @@ pub fn calculate_song_similarity(
     let get_importance = |score: f64| ((score - 0.5).abs() * 2.0).powi(2);
     
     let importances = [
-        ("title", get_importance(title_score)),
-        ("artist", get_importance(artist_score)),
-        ("album", if query_album.is_some() { get_importance(album_score) } else { 0.0 }),
-        ("duration", if query_duration.is_some() { get_importance(duration_score) } else { 0.0 }),
+        get_importance(title_score),
+        get_importance(artist_score),
+        if query_album.is_some() { get_importance(album_score) } else { 0.0 },
+        if query_duration.is_some() { get_importance(duration_score) } else { 0.0 },
     ];
     
-    let total_importance: f64 = importances.iter().map(|(_, v)| v).sum();
+    let total_importance: f64 = importances.iter().sum();
     
     // If all importances are zero, use equal weights
-    let weights: HashMap<String, f64> = if total_importance == 0.0 {
-        importances.iter().map(|(k, _)| (k.to_string(), 0.25)).collect()
+    let weights: [f64; 4] = if total_importance == 0.0 {
+        [0.25; 4]
     } else {
-        importances.iter().map(|(k, v)| (k.to_string(), v / total_importance)).collect()
+        importances.map(|v| v / total_importance)
     };
 
     // Calculate weighted final score
-    let final_score = title_score * weights.get("title").copied().unwrap_or(0.0)
-        + artist_score * weights.get("artist").copied().unwrap_or(0.0)
-        + album_score * weights.get("album").copied().unwrap_or(0.0)
-        + duration_score * weights.get("duration").copied().unwrap_or(0.0);
-
-    // Build component scores map for debugging
-    let components = [
-        ("titleScore", title_score),
-        ("artistScore", artist_score),
-        ("albumScore", album_score),
-        ("durationScore", duration_score),
-    ]
-    .iter()
-    .map(|(k, v)| (k.to_string(), *v))
-    .collect();
-    
-    let durations = [
-        ("query", query_duration),
-        ("candidate", cand_duration),
-    ]
-    .iter()
-    .map(|(k, v)| (k.to_string(), *v))
-    .collect();
+    let final_score = title_score * weights[0]
+        + artist_score * weights[1]
+        + album_score * weights[2]
+        + duration_score * weights[3];
 
     ScoreInfo {
         score: final_score.clamp(0.0, 1.0),
-        components,
+        components: [title_score, artist_score, album_score, duration_score],
         weights,
-        durations,
+        durations: [query_duration, cand_duration],
     }
 }
 

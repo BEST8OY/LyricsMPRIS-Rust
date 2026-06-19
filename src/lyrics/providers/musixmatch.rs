@@ -119,37 +119,33 @@ async fn try_macro_for_lyrics(
     }
 
     let macro_json: Value = macro_resp.json().await?;
-    if let Some(code) = get_root_status_code(&macro_json) {
-        if is_token_error_code(code) {
-            return Ok(FetchOutcome::TokenError(format!("API Status {}", code)));
-        }
+    if let Some(code) = get_root_status_code(&macro_json)
+        && is_token_error_code(code)
+    {
+        return Ok(FetchOutcome::TokenError(format!("API Status {}", code)));
     }
 
     let macro_calls = macro_json.pointer("/message/body/macro_calls");
     
     if let Some(calls) = macro_calls {
         // Prefer richsync (word-level timing) if available
-        if is_success(calls, "track.richsync.get") {
-            if let Some(richsync_body) = calls
+        if is_success(calls, "track.richsync.get")
+            && let Some(richsync_body) = calls
                 .pointer("/track.richsync.get/message/body/richsync/richsync_body")
                 .and_then(|v| v.as_str())
-            {
-                if let Some(parsed) = crate::lyrics::parse::parse_richsync_body(richsync_body) {
-                    return Ok(FetchOutcome::Success(parsed, Some(richsync_body.to_string())));
-                }
-            }
+            && let Some(parsed) = crate::lyrics::parse::parse_richsync_body(richsync_body)
+        {
+            return Ok(FetchOutcome::Success(parsed, Some(richsync_body.to_string())));
         }
 
         // Fall back to subtitles (line-level timing)
-        if is_success(calls, "track.subtitles.get") {
-            if let Some(subtitle_body) = calls
+        if is_success(calls, "track.subtitles.get")
+            && let Some(subtitle_body) = calls
                 .pointer("/track.subtitles.get/message/body/subtitle_list/0/subtitle/subtitle_body")
                 .and_then(|v| v.as_str())
-            {
-                if let Some(parsed) = crate::lyrics::parse::parse_subtitle_body(subtitle_body) {
-                    return Ok(FetchOutcome::Success(parsed, Some(subtitle_body.to_string())));
-                }
-            }
+            && let Some(parsed) = crate::lyrics::parse::parse_subtitle_body(subtitle_body)
+        {
+            return Ok(FetchOutcome::Success(parsed, Some(subtitle_body.to_string())));
         }
     }
 
@@ -216,10 +212,10 @@ async fn fetch_lyrics_with_token(
     }
 
     let search_json: Value = search_resp.json().await?;
-    if let Some(code) = get_root_status_code(&search_json) {
-        if is_token_error_code(code) {
-            return Ok(FetchOutcome::TokenError(format!("Search API Status {}", code)));
-        }
+    if let Some(code) = get_root_status_code(&search_json)
+        && is_token_error_code(code)
+    {
+        return Ok(FetchOutcome::TokenError(format!("Search API Status {}", code)));
     }
 
     let track_list = search_json
@@ -251,43 +247,43 @@ async fn fetch_lyrics_with_token(
         duration,
     );
 
-    if let Some((idx, _score)) = best_match {
-        if let Some(best) = candidates.get(idx) {
-            // Check if track is instrumental
-            if best.get("instrumental").and_then(|v| v.as_bool()).unwrap_or(false) {
-                let line = LyricLine {
-                    time: 0.0,
-                    text: "♪ Instrumental ♪".to_string(),
-                    words: None,
-                };
-                return Ok(FetchOutcome::Success(vec![line], None));
+    if let Some((idx, _score)) = best_match
+        && let Some(best) = candidates.get(idx)
+    {
+        // Check if track is instrumental
+        if best.get("instrumental").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let line = LyricLine {
+                time: 0.0,
+                text: "♪ Instrumental ♪".to_string(),
+                words: None,
+            };
+            return Ok(FetchOutcome::Success(vec![line], None));
+        }
+
+        // Try to fetch lyrics using commontrack_id
+        if let Some(commontrack_id) = best
+            .get("commontrack_id")
+            .and_then(|v| v.as_i64())
+            .or_else(|| best.get("track_id").and_then(|v| v.as_i64()))
+        {
+            let track_length = best
+                .get("track_length")
+                .and_then(|v| v.as_i64())
+                .or_else(|| best.get("length").and_then(|v| v.as_i64()));
+
+            let mut params = vec![
+                ("commontrack_id".to_string(), commontrack_id.to_string()),
+                ("usertoken".to_string(), token.to_string()),
+            ];
+            
+            if let Some(len) = track_length {
+                params.push(("q_duration".to_string(), len.to_string()));
             }
 
-            // Try to fetch lyrics using commontrack_id
-            if let Some(commontrack_id) = best
-                .get("commontrack_id")
-                .and_then(|v| v.as_i64())
-                .or_else(|| best.get("track_id").and_then(|v| v.as_i64()))
-            {
-                let track_length = best
-                    .get("track_length")
-                    .and_then(|v| v.as_i64())
-                    .or_else(|| best.get("length").and_then(|v| v.as_i64()));
-
-                let mut params = vec![
-                    ("commontrack_id".to_string(), commontrack_id.to_string()),
-                    ("usertoken".to_string(), token.to_string()),
-                ];
-                
-                if let Some(len) = track_length {
-                    params.push(("q_duration".to_string(), len.to_string()));
-                }
-
-                match try_macro_for_lyrics(client, &params).await? {
-                    FetchOutcome::Success(parsed, raw) => return Ok(FetchOutcome::Success(parsed, raw)),
-                    FetchOutcome::TokenError(reason) => return Ok(FetchOutcome::TokenError(reason)),
-                    FetchOutcome::TrackNotFound => {}
-                }
+            match try_macro_for_lyrics(client, &params).await? {
+                FetchOutcome::Success(parsed, raw) => return Ok(FetchOutcome::Success(parsed, raw)),
+                FetchOutcome::TokenError(reason) => return Ok(FetchOutcome::TokenError(reason)),
+                FetchOutcome::TrackNotFound => {}
             }
         }
     }

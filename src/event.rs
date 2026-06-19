@@ -19,7 +19,6 @@
 use crate::mpris::TrackMetadata;
 use crate::state::{Provider, StateBundle, Update};
 use tokio::sync::mpsc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 // ============================================================================
 // Event Types
@@ -68,72 +67,8 @@ pub enum Event {
 }
 
 // ============================================================================
-// Update Tracking
-// ============================================================================
-
-/// Tracks the last sent state to avoid redundant UI updates.
-///
-/// This atomic variable stores a composite key: `(version << 1) | playing_bit`.
-/// By combining version and playing state, we can detect meaningful changes
-/// without explicit comparison.
-///
-/// # Format
-///
-/// ```text
-/// [63:1] - Version counter
-/// [0:0]  - Playing bit (1 = playing, 0 = paused)
-/// ```
-static LAST_SENT_VERSION: AtomicU64 = AtomicU64::new(0);
-
-/// Computes a composite state key from version and playing status.
-///
-/// This packs both values into a single u64 for atomic comparison.
-#[inline]
-fn state_key(version: u64, playing: bool) -> u64 {
-    (version << 1) | u64::from(playing)
-}
-
-/// Checks if the state has changed since the last sent update.
-///
-/// Uses relaxed ordering since this is an optimization hint, not a critical sync point.
-#[inline]
-fn state_changed(version: u64, playing: bool) -> bool {
-    state_key(version, playing) != LAST_SENT_VERSION.load(Ordering::Relaxed)
-}
-
-/// Marks the current state as sent to prevent redundant updates.
-#[inline]
-fn mark_state_sent(version: u64, playing: bool) {
-    LAST_SENT_VERSION.store(state_key(version, playing), Ordering::Relaxed);
-}
-
-// ============================================================================
 // Update Sending
 // ============================================================================
-
-/// Determines if an update should be sent to the UI.
-///
-/// # Logic
-///
-/// - Always send if `force` is true (e.g., shutdown, new track)
-/// - Skip if state hasn't changed (version + playing combination)
-/// - Only send if there's content (lyrics OR error message)
-///
-/// # Returns
-///
-/// `true` if the update should be sent to observers.
-fn should_send_update(state: &StateBundle, force: bool) -> bool {
-    if force {
-        return true;
-    }
-
-    if !state_changed(state.version, state.player_state.playing) {
-        return false;
-    }
-
-    // Only send updates when there's something worth showing to the UI
-    state.has_lyrics() || state.player_state.err.is_some()
-}
 
 /// Sends an update to the UI channel when appropriate.
 ///
@@ -152,15 +87,15 @@ fn should_send_update(state: &StateBundle, force: bool) -> bool {
 /// # Errors
 ///
 /// If the channel is closed, the update is silently dropped (receiver is gone).
-pub async fn send_update(state: &StateBundle, update_tx: &mpsc::Sender<Update>, force: bool) {
-    if !should_send_update(state, force) {
+pub async fn send_update(state: &mut StateBundle, update_tx: &mpsc::Sender<Update>, force: bool) {
+    if !state.should_send_update(force) {
         return;
     }
 
     let update = state.create_update();
 
     if update_tx.send(update).await.is_ok() {
-        mark_state_sent(state.version, state.player_state.playing);
+        state.mark_state_sent();
     }
 }
 
@@ -225,7 +160,7 @@ async fn store_lyrics_in_cache(
 async fn try_lrclib(meta: &TrackMetadata, state: &mut StateBundle) -> FetchResult {
     match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title, &meta.album, meta.length).await {
         Ok((lines, raw)) if !lines.is_empty() => {
-            state.update_lyrics(lines, meta, None, Some(Provider::LRCLIB));
+            state.update_lyrics(lines, meta, None, Some(Provider::Lrclib));
             store_lyrics_in_cache(meta, raw, crate::lyrics::database::LyricsFormat::Lrclib).await;
             FetchResult::Success
         }
@@ -238,7 +173,7 @@ async fn try_lrclib(meta: &TrackMetadata, state: &mut StateBundle) -> FetchResul
 /// Maps a Provider enum to the corresponding database LyricsFormat.
 fn provider_to_db_format(provider: Provider) -> crate::lyrics::database::LyricsFormat {
     match provider {
-        Provider::LRCLIB => crate::lyrics::database::LyricsFormat::Lrclib,
+        Provider::Lrclib => crate::lyrics::database::LyricsFormat::Lrclib,
         Provider::MusixmatchRichsync => crate::lyrics::database::LyricsFormat::Richsync,
         Provider::MusixmatchSubtitles => crate::lyrics::database::LyricsFormat::Subtitles,
     }
@@ -324,10 +259,10 @@ fn detect_provider_from_raw(raw: &Option<String>) -> Option<Provider> {
             }
         } else if trimmed.starts_with('[') {
             // LRC format starts with [MM:SS.CC]
-            Provider::LRCLIB
+            Provider::Lrclib
         } else {
             // Default to LRCLIB
-            Provider::LRCLIB
+            Provider::Lrclib
         }
     })
 }
@@ -437,7 +372,7 @@ async fn fetch_fresh_position(
     let Some(svc) = service else {
         let estimated = state.player_state.estimate_position();
         tracing::debug!(
-            position = %format!("{:.3}s", estimated),
+            position = estimated,
             "Using estimated position (no service)"
         );
         return estimated;
@@ -447,7 +382,7 @@ async fn fetch_fresh_position(
         Ok(pos) => {
             tracing::debug!(
                 service = %svc,
-                position = %format!("{:.3}s", pos),
+                position = pos,
                 "Fetched fresh position from D-Bus"
             );
             pos
@@ -457,7 +392,7 @@ async fn fetch_fresh_position(
             tracing::warn!(
                 service = %svc,
                 error = %e,
-                position = %format!("{:.3}s", estimated),
+                position = estimated,
                 "Failed to fetch position, using estimation"
             );
             estimated
@@ -495,9 +430,9 @@ pub async fn fetch_and_update_lyrics(
     // or much larger than fetch_duration if user seeked forward.
     // It only represents actual time drift when no seeking occurred.
     tracing::debug!(
-        position_before = %format!("{:.3}s", position_before),
-        position_after = %format!("{:.3}s", position),
-        change = %format!("{:+.3}s", position_change),  // Show sign explicitly
+        position_before,
+        position_after = position,
+        position_change,
         fetch_duration = ?fetch_duration,
         "Position updated after lyrics fetch"
     );
@@ -593,27 +528,26 @@ async fn handle_mpris_event(
         return;
     }
 
-    // For seek events, ignore them within 2 seconds after lyrics load
+    // For seek events, ignore them within 0.5 seconds after lyrics load
     if !is_full_update {
         // After lyrics are loaded, we fetch a fresh position from D-Bus.
-        // Seeked events that arrive shortly after (within 2 seconds) are likely
+        // Seeked events that arrive shortly after (within 0.5 seconds) are likely
         // stale events from track start that arrived during lyrics fetch.
-        // After 2 seconds, user seeks should be processed normally.
+        // After 0.5 seconds, user seeks should be processed normally.
         if state.player_state.title == meta.title 
             && state.player_state.artist == meta.artist 
             && state.has_lyrics()
+            && let Some(loaded_at) = state.lyrics_loaded_at
         {
-            if let Some(loaded_at) = state.lyrics_loaded_at {
-                let elapsed = loaded_at.elapsed();
-                if elapsed.as_secs_f64() < 0.5 {
-                    tracing::debug!(
-                        seek_position = %format!("{:.3}s", position),
-                        current_position = %format!("{:.3}s", state.player_state.estimate_position()),
-                        time_since_load = %format!("{:.3}s", elapsed.as_secs_f64()),
-                        "Ignoring Seeked event within 2s of lyrics load"
-                    );
-                    return;
-                }
+            let elapsed = loaded_at.elapsed();
+            if elapsed.as_secs_f64() < 0.5 {
+                tracing::debug!(
+                    seek_position = position,
+                    current_position = state.player_state.estimate_position(),
+                    time_since_load = elapsed.as_secs_f64(),
+                    "Ignoring Seeked event within 0.5s of lyrics load"
+                );
+                return;
             }
         }
         
@@ -677,9 +611,10 @@ async fn handle_new_track(ctx: NewTrackContext<'_>) {
     
     if let Some(status) = playback_status {
         let playing = status == "Playing";
-        state.player_state.playing = playing;
         if playing {
             state.player_state.start_playing();
+        } else {
+            state.player_state.pause();
         }
     }
 

@@ -76,11 +76,9 @@ fn schedule_next_richsync_boundary(upd: &Update) -> Option<Pin<Box<Sleep>>> {
             update_best_delay(&mut best_delay, word.start, upd.position);
             update_best_delay(&mut best_delay, word.end, upd.position);
 
-            // Schedule grapheme boundaries for smooth per-character animation
-            if word.grapheme_count() > 1 {
-                for grapheme_boundary in compute_grapheme_boundaries(word) {
-                    update_best_delay(&mut best_delay, grapheme_boundary, upd.position);
-                }
+            // Use pre-computed grapheme boundaries (no allocation)
+            for &grapheme_boundary in &word.grapheme_times {
+                update_best_delay(&mut best_delay, grapheme_boundary, upd.position);
             }
         }
 
@@ -105,16 +103,6 @@ fn update_best_delay(best: &mut Option<f64>, boundary: f64, position: f64) {
         Some(current) => current.min(delay),
         None => delay,
     });
-}
-
-/// Compute grapheme boundaries for a word with per-word timing.
-fn compute_grapheme_boundaries(word: &crate::lyrics::types::WordTiming) -> Vec<f64> {
-    let total = word.grapheme_count();
-    let duration = (word.end - word.start).max(f64::EPSILON);
-    
-    (1..total)
-        .map(|k| word.start + (k as f64 / total as f64) * duration)
-        .collect()
 }
 
 /// Create a tokio sleep with the given delay in seconds.
@@ -161,13 +149,13 @@ pub fn estimate_update_and_next_sleep(
 /// Compute the current line index from position using binary search.
 ///
 /// Returns `None` if:
-/// - Not enough lines
+/// - No lyrics
 /// - Position is invalid (NaN)
 /// - Any line time is invalid
 /// - Position is before the first line
 fn compute_line_index(update: &Update) -> Option<usize> {
-    // Need at least 2 lines for meaningful index
-    if update.lines.len() <= 1 {
+    // Need at least 1 line
+    if update.lines.is_empty() {
         return None;
     }
 
@@ -181,6 +169,11 @@ fn compute_line_index(update: &Update) -> Option<usize> {
         && update.position < first.time {
             return None;
         }
+
+    // Single line case
+    if update.lines.len() == 1 {
+        return Some(0);
+    }
 
     // Binary search for current line
     match update.lines.binary_search_by(|line| {

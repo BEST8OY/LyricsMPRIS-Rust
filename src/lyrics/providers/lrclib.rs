@@ -23,7 +23,6 @@ pub async fn fetch_lyrics_from_lrclib(
     
     let resp = http_client()
         .get(&url)
-        .header("User-Agent", "LyricsMPRIS/1.0")
         .send()
         .await?;
 

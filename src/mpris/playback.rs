@@ -4,10 +4,11 @@ use crate::mpris::connection::{get_dbus_conn, MprisError};
 use zbus::proxy;
 
 /// Playback status values according to MPRIS specification
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum PlaybackStatus {
     Playing,
     Paused,
+    #[default]
     Stopped,
 }
 
@@ -28,12 +29,6 @@ impl PlaybackStatus {
             Self::Paused => "Paused",
             Self::Stopped => "Stopped",
         }
-    }
-}
-
-impl Default for PlaybackStatus {
-    fn default() -> Self {
-        Self::Stopped
     }
 }
 

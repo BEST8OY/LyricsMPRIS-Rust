@@ -158,7 +158,7 @@ fn parse_word_timings(line: &Value, line_start: f64, line_end: f64) -> Option<Ve
 fn parse_explicit_word_array(words_arr: &[Value], line_start: f64, line_end: f64) -> Option<Vec<crate::lyrics::types::WordTiming>> {
     let word_timings: Vec<crate::lyrics::types::WordTiming> = words_arr
         .iter()
-        .filter_map(|w| {
+        .map(|w| {
             let start = w.get("start").and_then(|v| v.as_f64()).unwrap_or(line_start);
             let end = w.get("end").and_then(|v| v.as_f64()).unwrap_or(start);
             let text = w.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -166,7 +166,7 @@ fn parse_explicit_word_array(words_arr: &[Value], line_start: f64, line_end: f64
             // Validate and fix timing
             let final_end = if end <= start { line_end } else { end };
 
-            Some(create_word_timing(start, final_end, text))
+            create_word_timing(start, final_end, text)
         })
         .collect();
 
@@ -230,10 +230,18 @@ fn create_word_timing(start: f64, end: f64, text: &str) -> crate::lyrics::types:
     // Add final boundary for convenience (allows simple slicing: text[boundaries[i]..boundaries[i+1]])
     grapheme_boundaries.push(text.len());
 
+    // Pre-compute time boundaries for each grapheme transition
+    let total = grapheme_boundaries.len().saturating_sub(1);
+    let duration = (end - start).max(f64::EPSILON);
+    let grapheme_times: Vec<f64> = (1..total)
+        .map(|k| start + (k as f64 / total as f64) * duration)
+        .collect();
+
     crate::lyrics::types::WordTiming {
         start,
         end,
         text: text.to_string(),
         grapheme_boundaries,
+        grapheme_times,
     }
 }
