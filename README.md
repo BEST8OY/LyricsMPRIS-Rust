@@ -101,6 +101,7 @@ The optimized executable binary will be available at `./target/release/lyricsmpr
 | `--no-karaoke` | Disables word-by-word highlighted playback | `--no-karaoke` |
 | `--pipe` | Launches in CLI pipe mode instead of TUI | `--pipe` |
 | `-b`, `--block <LIST>` | Comma-separated player names to ignore | `--block chromium,firefox` |
+| `--target <LIST>` | Listen only to specific MPRIS services | `--target spotify,mpv` |
 
 ### Environment Variables
 Configure default parameters and authentication credentials in your shell startup file (e.g., `~/.bashrc` or `~/.zshrc`):

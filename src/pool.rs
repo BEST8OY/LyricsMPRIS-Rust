@@ -73,6 +73,11 @@ impl LoopConfig {
         &self.inner.block
     }
 
+    /// Returns the list of targeted player services
+    fn target_list(&self) -> &[String] {
+        &self.inner.target
+    }
+
     /// Returns the ordered list of lyrics providers.
     fn providers(&self) -> &[String] {
         &self.providers
@@ -320,6 +325,7 @@ fn spawn_mpris_watcher(
     let update_tx = event_tx.clone();
     let seek_tx = event_tx;
     let block_list = config.block_list().to_vec();
+    let target_list = config.target_list().to_vec();
 
     tokio::spawn(async move {
         let handler_result = MprisEventHandler::with_closures(
@@ -334,6 +340,7 @@ fn spawn_mpris_watcher(
                 ));
             },
             block_list,
+            target_list
         )
         .await;
 

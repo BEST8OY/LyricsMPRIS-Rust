@@ -21,7 +21,7 @@ pub struct Config {
     /// Pipe current lyric line to stdout (default is modern UI)
     #[arg(long)]
     pipe: bool,
-    
+
     /// Blocklist for MPRIS player service names (comma-separated, case-insensitive)
     #[arg(
         long = "block",
@@ -29,6 +29,15 @@ pub struct Config {
         value_delimiter = ','
     )]
     block: Vec<String>,
+
+    /// Only listen for certain MPRIS player service names (comma-separated, case-insensitive)
+    #[arg(
+        long = "target",
+        value_name = "SERVICE1,SERVICE2",
+        value_delimiter = ','
+    )]
+    target: Vec<String>,
+
     /// Disable karaoke highlighting (per-word). Use --no-karaoke to disable karaoke (default: enabled).
     #[arg(long = "no-karaoke")]
     pub no_karaoke: bool,
@@ -51,6 +60,7 @@ impl Default for Config {
         Self {
             pipe: false,
             block: vec![],
+            target: vec![],
             providers: vec!["lrclib".to_string(), "musixmatch".to_string()],
             database: None,
             player_service: None,

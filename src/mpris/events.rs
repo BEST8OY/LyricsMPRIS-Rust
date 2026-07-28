@@ -1,6 +1,6 @@
 //! Event watching and handler registration for MPRIS signals.
 
-use crate::mpris::connection::{get_active_player_names, get_dbus_conn, is_blocked, MprisError};
+use crate::mpris::connection::{MprisError, get_active_player_names, get_dbus_conn, is_blocked, is_targeted};
 use crate::mpris::metadata::{extract_metadata, TrackMetadata};
 use crate::mpris::playback::get_position;
 use futures_util::StreamExt;
@@ -102,18 +102,20 @@ trait Playerctld {
 pub struct MprisEventHandler<C: MprisEventCallback> {
     callback: C,
     block_list: Arc<Vec<String>>,
+    target_list: Arc<Vec<String>>,
     state: PlayerState,
     conn: Arc<zbus::Connection>,
 }
 
 impl<C: MprisEventCallback> MprisEventHandler<C> {
     /// Create a new MPRIS event handler
-    pub async fn new(callback: C, block_list: Vec<String>) -> Result<Self, MprisError> {
+    pub async fn new(callback: C, block_list: Vec<String>, target_list: Vec<String>) -> Result<Self, MprisError> {
         let conn = get_dbus_conn().await?;
 
         let mut handler = Self {
             callback,
             block_list: Arc::new(block_list),
+            target_list: Arc::new(target_list),
             state: PlayerState::default(),
             conn: conn.clone(),
         };
@@ -338,7 +340,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
         let names = get_active_player_names().await?;
         tracing::debug!(available_players = ?names, "Discovered available players");
 
-        if let Some(service) = names.iter().find(|s| !is_blocked(s, &self.block_list)) {
+        if let Some(service) = names.iter().find(|s| !is_blocked(s, &self.block_list) && is_targeted(s, &self.target_list)) {
             if *service != self.state.service {
                 tracing::debug!(old_service = %self.state.service, new_service = %service, "Switching to player");
                 self.switch_to_player(service).await?;
@@ -417,8 +419,9 @@ where
         on_track_change: F,
         on_seek: G,
         block_list: Vec<String>,
+        target_list: Vec<String>,
     ) -> Result<Self, MprisError> {
         let callback = ClosureCallback::new(on_track_change, on_seek);
-        Self::new(callback, block_list).await
+        Self::new(callback, block_list, target_list).await
     }
 }
