@@ -175,10 +175,10 @@ fn redraw_and_reschedule<B: ratatui::backend::Backend>(
     let draw_update = estimated_update.or_else(|| state.last_update.clone());
 
     // Reset scroll offset when playback resumes
-    if let Some(ref upd) = draw_update {
-        if upd.playing {
-            state.scroll_offset = 0;
-        }
+    if let Some(ref upd) = draw_update
+        && upd.playing
+    {
+        state.scroll_offset = 0;
     }
 
     crate::ui::modern_helpers::draw_ui_with_cache(
@@ -234,17 +234,7 @@ fn update_state(state: &mut ModernUIState, update: Option<Update>) {
     }
 
     // Full update with lyrics
-    if !update.lines.is_empty() {
-        update_cache_and_state(state, &update);
-        state.last_track_id = Some(track_id);
-        return;
-    }
-
-    // Position-only update (shouldn't reach here based on above conditions)
-    if let Some(ref mut last_upd) = state.last_update {
-        last_upd.index = update.index;
-        state.last_update_instant = Some(Instant::now());
-    }
+    update_cache_and_state(state, &update);
     state.last_track_id = Some(track_id);
 }
 
@@ -275,18 +265,18 @@ fn process_event(
             }
             KeyCode::Up => {
                 // Scroll up when paused
-                if let Some(ref update) = state.last_update {
-                    if !update.playing {
-                        state.scroll_offset = state.scroll_offset.saturating_sub(1);
-                    }
+                if let Some(ref update) = state.last_update
+                    && !update.playing
+                {
+                    state.scroll_offset = state.scroll_offset.saturating_sub(1);
                 }
             }
             KeyCode::Down => {
                 // Scroll down when paused
-                if let Some(ref update) = state.last_update {
-                    if !update.playing {
-                        state.scroll_offset = state.scroll_offset.saturating_add(1);
-                    }
+                if let Some(ref update) = state.last_update
+                    && !update.playing
+                {
+                    state.scroll_offset = state.scroll_offset.saturating_add(1);
                 }
             }
             KeyCode::Char('c')

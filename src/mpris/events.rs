@@ -234,7 +234,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                 }
                 
                 // Check if we should switch to a different player
-                _ = tokio::time::sleep(tokio::time::Duration::from_secs(1)) => {
+                _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
                     // Periodically check if the service is still valid
                     // This handles cases where the player disconnects
                     if proxy.playback_status().await.is_err() {

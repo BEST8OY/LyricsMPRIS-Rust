@@ -38,7 +38,6 @@
 use crate::event::{self, Event, MprisEvent, process_event, send_update};
 use crate::mpris::{TrackMetadata, events::MprisEventHandler};
 use crate::state::{StateBundle, Update};
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Configuration for the event loop.
@@ -46,8 +45,8 @@ use tokio::sync::mpsc;
 /// Wraps the main application config and provides convenient accessors
 /// for event loop operations.
 struct LoopConfig {
-    /// Shared reference to main app config
-    inner: Arc<crate::Config>,
+    /// Main app config
+    inner: crate::Config,
     /// Ordered list of lyrics providers
     providers: Vec<String>,
 }
@@ -64,7 +63,7 @@ impl LoopConfig {
         };
 
         Self {
-            inner: Arc::new(config),
+            inner: config,
             providers,
         }
     }
@@ -241,7 +240,7 @@ async fn handle_no_player(
 ) {
     loop_state.state_bundle.clear_lyrics();
     loop_state.state_bundle.player_state = Default::default();
-    send_update(&loop_state.state_bundle, update_tx, true).await;
+    send_update(&mut loop_state.state_bundle, update_tx, true).await;
 }
 
 /// Fetches initial metadata for the discovered player service.
@@ -394,7 +393,12 @@ async fn run_event_loop(
 
             // MPRIS event received from watcher
             event = event_rx.recv() => {
-                handle_event(event, &mut loop_state, &update_tx, &config).await;
+                if let Some(ev) = event {
+                    handle_event(ev, &mut loop_state, &update_tx, &config).await;
+                } else {
+                    tracing::warn!("MPRIS event channel closed, terminating event loop");
+                    break;
+                }
             }
         }
     }
@@ -419,21 +423,12 @@ async fn handle_shutdown(
 }
 
 /// Handles an incoming event from the event channel.
-///
-/// If the channel is closed (returns `None`), logs a warning and does nothing.
-/// This allows graceful degradation if the MPRIS watcher terminates.
 async fn handle_event(
-    event: Option<Event>,
+    event: Event,
     loop_state: &mut LoopState,
     update_tx: &mpsc::Sender<Update>,
     config: &LoopConfig,
 ) {
-    let Some(event) = event else {
-        // Event channel closed - MPRIS watcher terminated
-        tracing::warn!("MPRIS event channel closed");
-        return;
-    };
-
     process_event(
         event,
         &mut loop_state.state_bundle,

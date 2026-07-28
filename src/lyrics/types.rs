@@ -31,6 +31,9 @@ pub struct WordTiming {
     /// To extract grapheme at index i: &text[boundaries[i]..boundaries[i+1]]
     /// The last boundary equals text.len() for convenience.
     pub grapheme_boundaries: Vec<usize>,
+    /// Pre-computed time boundaries for each grapheme cluster transition.
+    /// Length is grapheme_count() - 1. Empty if single grapheme.
+    pub grapheme_times: Vec<f64>,
 }
 
 impl WordTiming {

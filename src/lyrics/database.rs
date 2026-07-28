@@ -63,6 +63,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::path::Path;
 use std::str::FromStr;
 
 // ============================================================================
@@ -165,7 +166,7 @@ async fn create_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 }
 
 /// Opens or creates a SQLite database connection pool.
-async fn open_database(path: &PathBuf) -> Result<SqlitePool, sqlx::Error> {
+async fn open_database(path: &Path) -> Result<SqlitePool, sqlx::Error> {
     // Create parent directory if needed
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
@@ -389,20 +390,7 @@ pub async fn store_in_database(
     let title_norm = normalize(title);
     let album_norm = normalize(album);
     
-    // Delete existing entry if it exists
-    let _ = sqlx::query(
-        r#"
-        DELETE FROM lyrics
-        WHERE artist = ? AND title = ? AND album = ?
-        "#,
-    )
-    .bind(&artist_norm)
-    .bind(&title_norm)
-    .bind(&album_norm)
-    .execute(pool)
-    .await;
-    
-    // Insert new entry
+    // Insert or replace existing entry (single query instead of DELETE + INSERT)
     let raw_lyrics_blob = match compress_raw_lyrics(&raw_lyrics) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -417,7 +405,7 @@ pub async fn store_in_database(
     };
     let result = sqlx::query(
         r#"
-        INSERT INTO lyrics (artist, title, album, duration, format, raw_lyrics)
+        INSERT OR REPLACE INTO lyrics (artist, title, album, duration, format, raw_lyrics)
         VALUES (?, ?, ?, ?, ?, ?)
         "#,
     )

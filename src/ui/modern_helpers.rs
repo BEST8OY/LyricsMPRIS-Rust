@@ -58,6 +58,7 @@ pub fn draw_ui_with_cache<B: Backend>(
 }
 
 /// Compute the visible spans to render based on current state.
+#[allow(clippy::too_many_arguments)]
 fn compute_visible_spans<'a>(
     last_update: &Option<Update>,
     wrapped_cache: &mut Option<(usize, Vec<Vec<String>>)>,
@@ -161,7 +162,12 @@ pub struct VisibleLines<'a> {
 
 impl<'a> VisibleLines<'a> {
     pub fn into_vec(self) -> Vec<Line<'a>> {
-        [self.before, self.current, self.after].concat()
+        let total = self.before.len() + self.current.len() + self.after.len();
+        let mut result = Vec::with_capacity(total);
+        result.extend(self.before);
+        result.extend(self.current);
+        result.extend(self.after);
+        result
     }
 }
 
@@ -227,8 +233,7 @@ fn collect_before_blocks<'a>(
     let mut result = Vec::new();
     let start_index = current_index.saturating_sub(blocks_needed);
     
-    for i in start_index..current_index {
-        let block = &wrapped_blocks[i];
+    for block in wrapped_blocks.iter().take(current_index).skip(start_index) {
         for line in block {
             result.push(Line::from(Span::styled(line.clone(), style)));
         }
@@ -248,8 +253,7 @@ fn collect_after_blocks<'a>(
     let mut result = Vec::new();
     let end_index = (current_index + 1 + blocks_needed).min(wrapped_blocks.len());
     
-    for i in (current_index + 1)..end_index {
-        let block = &wrapped_blocks[i];
+    for block in wrapped_blocks.iter().take(end_index).skip(current_index + 1) {
         for line in block {
             result.push(Line::from(Span::styled(line.clone(), style)));
         }
@@ -297,6 +301,7 @@ fn split_words_into_lines<'b>(
 /// # Arguments
 /// * `max_visible_lines` - Maximum number of lyric blocks to display (None = unlimited)
 /// * `scroll_offset` - Manual scroll offset in lyric blocks when paused
+#[allow(clippy::too_many_arguments)]
 pub fn gather_visible_lines<'a>(
     update: &Update,
     wrapped_blocks: &[Vec<String>],

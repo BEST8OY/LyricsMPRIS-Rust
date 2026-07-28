@@ -19,7 +19,6 @@
 use crate::lyrics::LyricLine;
 use crate::mpris::TrackMetadata;
 use crate::timer::{sanitize_position, PlaybackTimer};
-use std::cmp::Ordering;
 use std::sync::Arc;
 
 // ============================================================================
@@ -29,14 +28,14 @@ use std::sync::Arc;
 /// Identifies the lyrics provider for the current track.
 ///
 /// Each variant represents a distinct lyrics source with different capabilities:
-/// - [`Provider::LRCLIB`]: LRCLIB database (returns LRC timestamp format)
+/// - [`Provider::Lrclib`]: LRCLIB database (returns LRC timestamp format)
 /// - [`Provider::MusixmatchRichsync`]: Word-level synchronized lyrics (JSON)
 /// - [`Provider::MusixmatchSubtitles`]: Line-level synchronized lyrics (JSON)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Provider {
     /// LRCLIB provider - returns LRC format: `[MM:SS.CC]lyrics`
-    LRCLIB,
+    Lrclib,
     /// Musixmatch provider - richsync format with word-level timing (JSON)
     MusixmatchRichsync,
     /// Musixmatch provider - subtitle format with line-level timing (JSON)
@@ -68,7 +67,7 @@ pub enum Provider {
 /// - `version`: Monotonic counter for change detection
 /// - `err`: Error message from the most recent operation
 /// - `provider`: Source of the current lyrics
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Update {
     /// Lyrics lines (shared via Arc for efficient cloning)
     pub lines: Arc<Vec<LyricLine>>,
@@ -101,23 +100,6 @@ pub struct Update {
     pub provider: Option<Provider>,
 }
 
-impl Default for Update {
-    fn default() -> Self {
-        Self {
-            lines: Arc::new(Vec::new()),
-            index: None,
-            position: 0.0,
-            playing: false,
-            version: 0,
-            err: None,
-            artist: String::new(),
-            title: String::new(),
-            album: String::new(),
-            provider: None,
-        }
-    }
-}
-
 
 // ============================================================================
 // Player State
@@ -141,7 +123,7 @@ impl Default for Update {
 /// - `position` is always sanitized (no NaN, no negative values)
 /// - `length` if present, is always positive and finite
 /// - Timer state is synchronized with `playing` flag
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Default)]
 pub struct PlayerState {
     /// Current track title
     pub title: String,
@@ -166,21 +148,6 @@ pub struct PlayerState {
     
     /// Internal timer for position estimation during playback
     timer: PlaybackTimer,
-}
-
-impl Default for PlayerState {
-    fn default() -> Self {
-        Self {
-            title: String::new(),
-            artist: String::new(),
-            album: String::new(),
-            playing: false,
-            position: 0.0,
-            err: None,
-            length: None,
-            timer: PlaybackTimer::default(),
-        }
-    }
 }
 
 impl PlayerState {
@@ -335,22 +302,13 @@ impl PlayerState {
 /// # Performance
 ///
 /// Uses binary search for O(log n) line lookup by timestamp.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct LyricState {
     /// Sorted lyrics lines (shared via Arc for cheap cloning)
     pub lines: Arc<Vec<LyricLine>>,
     
     /// Index of the currently highlighted line (if any)
     pub index: Option<usize>,
-}
-
-impl Default for LyricState {
-    fn default() -> Self {
-        Self {
-            lines: Arc::new(Vec::new()),
-            index: None,
-        }
-    }
 }
 
 impl LyricState {
@@ -379,11 +337,6 @@ impl LyricState {
             return None;
         }
 
-        // Validate all timestamps are finite (defensive check)
-        if self.lines.iter().any(|line| !line.time.is_finite()) {
-            return None;
-        }
-
         // Check if position is before first line
         let first = self.lines.first()?;
         if position < first.time {
@@ -392,9 +345,7 @@ impl LyricState {
 
         // Binary search for the appropriate line
         match self.lines.binary_search_by(|line| {
-            line.time
-                .partial_cmp(&position)
-                .unwrap_or(Ordering::Less)
+            line.time.total_cmp(&position)
         }) {
             Ok(exact_match) => Some(exact_match),
             Err(0) => None,
@@ -425,9 +376,7 @@ impl LyricState {
             .filter_map(Self::sanitize_line)
             .collect();
 
-        sanitized.sort_by(|a, b| {
-            a.time.partial_cmp(&b.time).unwrap_or(Ordering::Equal)
-        });
+        sanitized.sort_by(|a, b| a.time.total_cmp(&b.time));
 
         sanitized
     }
@@ -491,7 +440,7 @@ impl LyricState {
 /// // ... modify state ...
 /// assert!(bundle.version > old_version);
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct StateBundle {
     /// Lyrics state with active line tracking
     pub lyric_state: LyricState,
@@ -507,25 +456,39 @@ pub struct StateBundle {
     
     /// Timestamp when lyrics were last loaded (for filtering stale Seeked events)
     pub lyrics_loaded_at: Option<std::time::Instant>,
-}
 
-impl Default for StateBundle {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Version when the last update was sent to UI
+    last_sent_version: u64,
+
+    /// Playback state when the last update was sent to UI
+    last_sent_playing: bool,
 }
 
 impl StateBundle {
     /// Creates a new state bundle with default values.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            lyric_state: LyricState::default(),
-            player_state: PlayerState::default(),
-            version: 0,
-            provider: None,
-            lyrics_loaded_at: None,
+        Self::default()
+    }
+
+    /// Checks if the state has changed since the last sent update.
+    pub fn should_send_update(&self, force: bool) -> bool {
+        if force {
+            return true;
         }
+
+        if self.version == self.last_sent_version && self.player_state.playing == self.last_sent_playing {
+            return false;
+        }
+
+        // Only send updates when there's something worth showing to the UI
+        self.has_lyrics() || self.player_state.err.is_some()
+    }
+
+    /// Marks the current state as sent to prevent redundant updates.
+    pub fn mark_state_sent(&mut self) {
+        self.last_sent_version = self.version;
+        self.last_sent_playing = self.player_state.playing;
     }
 
     /// Clears all lyrics and increments the version.
@@ -583,9 +546,7 @@ impl StateBundle {
         self.provider = provider;
         
         // Record when lyrics were loaded for filtering stale Seeked events
-        if has_lyrics {
-            self.lyrics_loaded_at = Some(std::time::Instant::now());
-        }
+        self.lyrics_loaded_at = has_lyrics.then(std::time::Instant::now);
         
         self.increment_version();
     }
