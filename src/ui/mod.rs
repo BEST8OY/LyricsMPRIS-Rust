@@ -1,7 +1,7 @@
 pub mod modern;
 pub mod modern_helpers;
-pub mod progression;
 pub mod pipe;
+pub mod progression;
 pub mod styles;
 pub mod util;
 

@@ -11,8 +11,17 @@ static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
         .expect("failed to build HTTP client")
 });
 
+/// Track identifiers extracted from or provided for a lyrics lookup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TrackMatchInfo {
+    pub track_isrc: Option<String>,
+    pub track_spotify_id: Option<String>,
+    pub track_itunes_id: Option<String>,
+}
+
 /// Provider result: parsed lines plus optional raw lyrics string (LRC format or JSON)
-pub type ProviderResult = Result<(Vec<LyricLine>, Option<String>), LyricsError>;
+/// and optional track identifiers extracted from the provider response.
+pub type ProviderResult = Result<(Vec<LyricLine>, Option<String>, TrackMatchInfo), LyricsError>;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LyricLine {

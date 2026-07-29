@@ -1,6 +1,6 @@
 //! Playback status and position querying for MPRIS.
 
-use crate::mpris::connection::{get_dbus_conn, MprisError};
+use crate::mpris::connection::{MprisError, get_dbus_conn};
 use zbus::proxy;
 
 /// Playback status values according to MPRIS specification
@@ -58,7 +58,7 @@ trait MediaPlayer2Player {
 }
 
 /// Query the playback position for a specific MPRIS player service
-/// 
+///
 /// Returns position in seconds. Returns 0.0 if the service is unavailable or on error.
 pub async fn get_position(service: &str) -> Result<f64, MprisError> {
     if service.is_empty() {
@@ -66,7 +66,7 @@ pub async fn get_position(service: &str) -> Result<f64, MprisError> {
     }
 
     let conn = get_dbus_conn().await?;
-    
+
     let proxy = MediaPlayer2PlayerProxy::builder(&conn)
         .destination(service)?
         .build()
@@ -82,7 +82,7 @@ pub async fn get_position(service: &str) -> Result<f64, MprisError> {
 }
 
 /// Query the playback status for a specific MPRIS player service
-/// 
+///
 /// Returns "Playing", "Paused", or "Stopped" as a string.
 /// Returns "Stopped" if the service is unavailable or on error.
 pub async fn get_playback_status(service: &str) -> Result<String, MprisError> {
@@ -91,7 +91,7 @@ pub async fn get_playback_status(service: &str) -> Result<String, MprisError> {
     }
 
     let conn = get_dbus_conn().await?;
-    
+
     let proxy = MediaPlayer2PlayerProxy::builder(&conn)
         .destination(service)?
         .build()

@@ -1,7 +1,9 @@
 //! Event watching and handler registration for MPRIS signals.
 
-use crate::mpris::connection::{MprisError, get_active_player_names, get_dbus_conn, is_blocked, is_targeted};
-use crate::mpris::metadata::{extract_metadata, TrackMetadata};
+use crate::mpris::connection::{
+    MprisError, get_active_player_names, get_dbus_conn, is_blocked, is_targeted,
+};
+use crate::mpris::metadata::{TrackMetadata, extract_metadata};
 use crate::mpris::playback::get_position;
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -31,7 +33,10 @@ where
     G: FnMut(TrackMetadata, f64, String) + Send + 'static,
 {
     pub fn new(on_track_change: F, on_seek: G) -> Self {
-        Self { on_track_change, on_seek }
+        Self {
+            on_track_change,
+            on_seek,
+        }
     }
 }
 
@@ -109,7 +114,11 @@ pub struct MprisEventHandler<C: MprisEventCallback> {
 
 impl<C: MprisEventCallback> MprisEventHandler<C> {
     /// Create a new MPRIS event handler
-    pub async fn new(callback: C, block_list: Vec<String>, target_list: Vec<String>) -> Result<Self, MprisError> {
+    pub async fn new(
+        callback: C,
+        block_list: Vec<String>,
+        target_list: Vec<String>,
+    ) -> Result<Self, MprisError> {
         let conn = get_dbus_conn().await?;
 
         let mut handler = Self {
@@ -158,7 +167,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                         );
                     }
                 }
-                
+
                 // Handle events from current player if active
                 _ = self.handle_player_events() => {}
             }
@@ -175,7 +184,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
 
         let service = self.state.service.clone();
         tracing::debug!(service = %service, "Subscribing to player events");
-        
+
         let proxy = MediaPlayer2PlayerProxy::builder(&self.conn)
             .destination(service.as_str())?
             .build()
@@ -196,7 +205,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                         self.handle_seek_signal(args.position).await;
                     }
                 }
-                
+
                 // Handle Metadata property change
                 Some(_) = metadata_stream.next() => {
                     tracing::debug!(service = %service, "Metadata changed");
@@ -208,7 +217,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                         );
                     }
                 }
-                
+
                 // Handle Position property change (not common, but some players use it)
                 Some(_) = position_stream.next() => {
                     tracing::debug!(service = %service, "Position changed");
@@ -220,7 +229,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                         );
                     }
                 }
-                
+
                 // Handle PlaybackStatus property change
                 Some(_) = status_stream.next() => {
                     tracing::debug!(service = %service, "Playback status changed");
@@ -232,7 +241,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                         );
                     }
                 }
-                
+
                 // Check if we should switch to a different player
                 _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {
                     // Periodically check if the service is still valid
@@ -271,15 +280,15 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
     ) -> Result<(), MprisError> {
         let metadata_map = proxy.metadata().await?;
         let new_track = extract_metadata(&metadata_map);
-        
+
         if new_track != self.state.track {
             self.state.track = new_track;
-            
+
             // Also update position when track changes
             if let Ok(pos_microsecs) = proxy.position().await {
                 self.state.position = pos_microsecs as f64 / 1_000_000.0;
             }
-            
+
             self.callback.on_track_change(
                 self.state.track.clone(),
                 self.state.position,
@@ -315,7 +324,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             && status != self.state.playback_status
         {
             self.state.playback_status = status;
-            
+
             // Get fresh position on playback status change
             let position = if let Ok(pos) = get_position(&self.state.service).await {
                 self.state.position = pos;
@@ -323,7 +332,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             } else {
                 self.state.position
             };
-            
+
             // Notify about the playback status change
             self.callback.on_track_change(
                 self.state.track.clone(),
@@ -340,7 +349,10 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
         let names = get_active_player_names().await?;
         tracing::debug!(available_players = ?names, "Discovered available players");
 
-        if let Some(service) = names.iter().find(|s| !is_blocked(s, &self.block_list) && is_targeted(s, &self.target_list)) {
+        if let Some(service) = names
+            .iter()
+            .find(|s| !is_blocked(s, &self.block_list) && is_targeted(s, &self.target_list))
+        {
             if *service != self.state.service {
                 tracing::debug!(old_service = %self.state.service, new_service = %service, "Switching to player");
                 self.switch_to_player(service).await?;
@@ -366,13 +378,13 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             .await
             .map(|map| extract_metadata(&map))
             .unwrap_or_default();
-        
+
         let position = proxy
             .position()
             .await
             .map(|microsecs| microsecs as f64 / 1_000_000.0)
             .unwrap_or(0.0);
-        
+
         let playback_status = proxy
             .playback_status()
             .await
@@ -394,18 +406,16 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             position,
         };
 
-        self.callback.on_track_change(metadata, position, service.to_string());
+        self.callback
+            .on_track_change(metadata, position, service.to_string());
 
         Ok(())
     }
 
     fn deactivate_player(&mut self) {
         self.state.clear();
-        self.callback.on_track_change(
-            TrackMetadata::default(),
-            0.0,
-            String::new(),
-        );
+        self.callback
+            .on_track_change(TrackMetadata::default(), 0.0, String::new());
     }
 }
 // Convenience constructor for closure-based callbacks

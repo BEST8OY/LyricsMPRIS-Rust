@@ -7,8 +7,8 @@
 
 use crate::state::Update;
 use std::pin::Pin;
-use tokio::time::Sleep;
 use std::time::{Duration, Instant};
+use tokio::time::Sleep;
 
 /// Compute the next tokio Sleep based on lyrics timing.
 ///
@@ -25,8 +25,11 @@ pub fn compute_next_word_sleep_from_update(upd: &Update) -> Option<Pin<Box<Sleep
         return schedule_first_line_start(upd);
     }
 
-    let is_richsync = matches!(upd.provider, Some(crate::state::Provider::MusixmatchRichsync));
-    
+    let is_richsync = matches!(
+        upd.provider,
+        Some(crate::state::Provider::MusixmatchRichsync)
+    );
+
     if is_richsync {
         schedule_next_richsync_boundary(upd)
     } else {
@@ -37,7 +40,7 @@ pub fn compute_next_word_sleep_from_update(upd: &Update) -> Option<Pin<Box<Sleep
 /// Schedule a wakeup at the first line's start time.
 fn schedule_first_line_start(upd: &Update) -> Option<Pin<Box<Sleep>>> {
     let first = upd.lines.first()?;
-    
+
     if !first.time.is_finite() || first.time <= upd.position {
         return None;
     }
@@ -49,7 +52,7 @@ fn schedule_first_line_start(upd: &Update) -> Option<Pin<Box<Sleep>>> {
 /// Schedule a wakeup at the next line start (non-richsync).
 fn schedule_next_line_start(upd: &Update) -> Option<Pin<Box<Sleep>>> {
     let current_idx = upd.index?;
-    
+
     // Search from current line onward for next line after current position
     for line in upd.lines.iter().skip(current_idx) {
         if line.time.is_finite() && line.time > upd.position {
@@ -84,9 +87,10 @@ fn schedule_next_richsync_boundary(upd: &Update) -> Option<Pin<Box<Sleep>>> {
 
         // Early exit if we found a very near boundary
         if let Some(d) = best_delay
-            && d <= 0.01 {
-                break;
-            }
+            && d <= 0.01
+        {
+            break;
+        }
     }
 
     best_delay.map(create_sleep)
@@ -133,9 +137,10 @@ pub fn estimate_update_and_next_sleep(
 
     // Advance position if playing
     if estimated.playing
-        && let Some(since) = last_update_instant {
-            estimated.position += since.elapsed().as_secs_f64();
-        }
+        && let Some(since) = last_update_instant
+    {
+        estimated.position += since.elapsed().as_secs_f64();
+    }
 
     // Recompute current line index from estimated position
     estimated.index = compute_line_index(&estimated);
@@ -166,9 +171,10 @@ fn compute_line_index(update: &Update) -> Option<usize> {
 
     // Before first line
     if let Some(first) = update.lines.first()
-        && update.position < first.time {
-            return None;
-        }
+        && update.position < first.time
+    {
+        return None;
+    }
 
     // Single line case
     if update.lines.len() == 1 {
@@ -182,7 +188,7 @@ fn compute_line_index(update: &Update) -> Option<usize> {
             .unwrap_or(std::cmp::Ordering::Less)
     }) {
         Ok(idx) => Some(idx),      // Exact match
-        Err(0) => None,             // Before first line
-        Err(idx) => Some(idx - 1),  // Between lines
+        Err(0) => None,            // Before first line
+        Err(idx) => Some(idx - 1), // Between lines
     }
 }

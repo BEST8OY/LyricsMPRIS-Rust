@@ -1,10 +1,10 @@
+use once_cell::sync::Lazy;
+use reqwest::Client;
 use serde_json::Value;
 use std::env;
 use std::sync::Mutex;
-use reqwest::Client;
-use once_cell::sync::Lazy;
 
-use crate::lyrics::types::{http_client, LyricLine, LyricsError, ProviderResult};
+use crate::lyrics::types::{LyricLine, LyricsError, ProviderResult, TrackMatchInfo, http_client};
 
 /// Round-robin token manager for multiple Musixmatch usertokens
 struct TokenManager {
@@ -24,7 +24,7 @@ impl TokenManager {
                     .collect()
             })
             .unwrap_or_default();
-        
+
         TokenManager {
             tokens,
             current_index: 0,
@@ -37,16 +37,14 @@ impl TokenManager {
         if self.tokens.is_empty() {
             return None;
         }
-        
+
         let token = self.tokens[self.current_index].clone();
         self.current_index = (self.current_index + 1) % self.tokens.len();
         Some(token)
     }
 }
 
-static TOKEN_MANAGER: Lazy<Mutex<TokenManager>> = Lazy::new(|| {
-    Mutex::new(TokenManager::new())
-});
+static TOKEN_MANAGER: Lazy<Mutex<TokenManager>> = Lazy::new(|| Mutex::new(TokenManager::new()));
 
 /// Get the next token from the round-robin manager
 fn get_next_token() -> Option<String> {
@@ -56,8 +54,8 @@ fn get_next_token() -> Option<String> {
 /// Outcome of a single token's fetch attempt.
 #[derive(Debug)]
 enum FetchOutcome {
-    /// Successfully found lyrics: (parsed lines, raw response content)
-    Success(Vec<LyricLine>, Option<String>),
+    /// Successfully found lyrics: (parsed lines, raw response content, track identifiers)
+    Success(Vec<LyricLine>, Option<String>, TrackMatchInfo),
     /// Track was not found on Musixmatch (200 status but empty list/no lyrics).
     TrackNotFound,
     /// A token-specific issue (401 unauthorized, 402 payment, 403 forbidden, 429 rate limit).
@@ -91,11 +89,71 @@ fn is_success(macro_calls: &Value, endpoint: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Extract track identifiers (isrc, spotify_id, itunes_id) from a musixmatch track object.
+/// Handles both flat string fields and array fields like `commontrack_itunes_ids`.
+fn extract_track_ids_from_json(track: &Value) -> TrackMatchInfo {
+    let itunes_id = track
+        .get("track_itunes_id")
+        .and_then(|v| v.as_str().map(String::from))
+        .or_else(|| {
+            track
+                .get("commontrack_itunes_ids")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_i64())
+                .map(|id| id.to_string())
+        });
+
+    let isrc = track
+        .get("track_isrc")
+        .and_then(|v| v.as_str().map(String::from))
+        .or_else(|| {
+            track
+                .get("commontrack_isrcs")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_array())
+                .and_then(|inner| inner.first())
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        });
+
+    let spotify_id = track
+        .get("track_spotify_id")
+        .and_then(|v| v.as_str().map(String::from))
+        .or_else(|| {
+            track
+                .get("commontrack_spotify_ids")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        });
+
+    TrackMatchInfo {
+        track_isrc: isrc,
+        track_spotify_id: spotify_id,
+        track_itunes_id: itunes_id,
+    }
+}
+
+/// Try to extract track identifiers from the macro response JSON.
+/// Musixmatch macro responses may include `matcher.track.get` with full track metadata.
+fn extract_track_ids_from_macro(macro_calls: &Value) -> TrackMatchInfo {
+    if let Some(track) = macro_calls.pointer("/matcher.track.get/message/body/track") {
+        return extract_track_ids_from_json(track);
+    }
+    if let Some(track) = macro_calls.pointer("/track") {
+        return extract_track_ids_from_json(track);
+    }
+    TrackMatchInfo::default()
+}
+
 /// Try to call macro.subtitles.get and extract richsync or subtitle_body.
 async fn try_macro_for_lyrics(
     client: &Client,
     params: &[(String, String)],
-) -> Result<FetchOutcome, reqwest::Error> {
+) -> Result<FetchOutcome, LyricsError> {
     let macro_base = "https://apic-desktop.musixmatch.com/ws/1.1/macro.subtitles.get?format=json&namespace=lyrics_richsynched&subtitle_format=mxm&optional_calls=track.richsync&app_id=web-desktop-app-v1.0&";
     let macro_url = macro_base.to_string()
         + &params
@@ -111,7 +169,10 @@ async fn try_macro_for_lyrics(
         .await?;
 
     if is_token_error_status(macro_resp.status()) {
-        return Ok(FetchOutcome::TokenError(format!("HTTP {}", macro_resp.status())));
+        return Ok(FetchOutcome::TokenError(format!(
+            "HTTP {}",
+            macro_resp.status()
+        )));
     }
 
     if !macro_resp.status().is_success() {
@@ -126,8 +187,10 @@ async fn try_macro_for_lyrics(
     }
 
     let macro_calls = macro_json.pointer("/message/body/macro_calls");
-    
+
     if let Some(calls) = macro_calls {
+        let track_ids = extract_track_ids_from_macro(calls);
+
         // Prefer richsync (word-level timing) if available
         if is_success(calls, "track.richsync.get")
             && let Some(richsync_body) = calls
@@ -135,7 +198,11 @@ async fn try_macro_for_lyrics(
                 .and_then(|v| v.as_str())
             && let Some(parsed) = crate::lyrics::parse::parse_richsync_body(richsync_body)
         {
-            return Ok(FetchOutcome::Success(parsed, Some(richsync_body.to_string())));
+            return Ok(FetchOutcome::Success(
+                parsed,
+                Some(richsync_body.to_string()),
+                track_ids,
+            ));
         }
 
         // Fall back to subtitles (line-level timing)
@@ -145,7 +212,11 @@ async fn try_macro_for_lyrics(
                 .and_then(|v| v.as_str())
             && let Some(parsed) = crate::lyrics::parse::parse_subtitle_body(subtitle_body)
         {
-            return Ok(FetchOutcome::Success(parsed, Some(subtitle_body.to_string())));
+            return Ok(FetchOutcome::Success(
+                parsed,
+                Some(subtitle_body.to_string()),
+                track_ids,
+            ));
         }
     }
 
@@ -161,8 +232,11 @@ async fn fetch_lyrics_with_token(
     album: &str,
     duration: Option<f64>,
     track_spotify_id: Option<&str>,
+    track_isrc: Option<&str>,
+    track_itunes_id: Option<&str>,
 ) -> Result<FetchOutcome, LyricsError> {
-    // Strategy 1: If we have a Spotify track ID, try direct lookup first
+    // Strategy 1: If we have track identifiers, try direct lookup first
+    // Try in order: Spotify ID, ISRC, iTunes ID
     if let Some(sid) = track_spotify_id {
         let mut params = vec![
             ("track_spotify_id".to_string(), sid.to_string()),
@@ -171,128 +245,154 @@ async fn fetch_lyrics_with_token(
         if let Some(len) = duration.map(|d| d.round() as i64) {
             params.push(("q_duration".to_string(), len.to_string()));
         }
-        
+
         match try_macro_for_lyrics(client, &params).await? {
-            FetchOutcome::Success(parsed, raw) => return Ok(FetchOutcome::Success(parsed, raw)),
+            FetchOutcome::Success(parsed, raw, ids) => {
+                return Ok(FetchOutcome::Success(parsed, raw, ids));
+            }
+            FetchOutcome::TokenError(reason) => return Ok(FetchOutcome::TokenError(reason)),
+            FetchOutcome::TrackNotFound => {} // fall through to next lookup
+        }
+    }
+
+    if let Some(isrc) = track_isrc {
+        let mut params = vec![
+            ("track_isrc".to_string(), isrc.to_string()),
+            ("usertoken".to_string(), token.to_string()),
+        ];
+        if let Some(len) = duration.map(|d| d.round() as i64) {
+            params.push(("q_duration".to_string(), len.to_string()));
+        }
+
+        match try_macro_for_lyrics(client, &params).await? {
+            FetchOutcome::Success(parsed, raw, ids) => {
+                return Ok(FetchOutcome::Success(parsed, raw, ids));
+            }
+            FetchOutcome::TokenError(reason) => return Ok(FetchOutcome::TokenError(reason)),
+            FetchOutcome::TrackNotFound => {} // fall through to next lookup
+        }
+    }
+
+    if let Some(itunes) = track_itunes_id {
+        let mut params = vec![
+            ("track_itunes_id".to_string(), itunes.to_string()),
+            ("usertoken".to_string(), token.to_string()),
+        ];
+        if let Some(len) = duration.map(|d| d.round() as i64) {
+            params.push(("q_duration".to_string(), len.to_string()));
+        }
+
+        match try_macro_for_lyrics(client, &params).await? {
+            FetchOutcome::Success(parsed, raw, ids) => {
+                return Ok(FetchOutcome::Success(parsed, raw, ids));
+            }
             FetchOutcome::TokenError(reason) => return Ok(FetchOutcome::TokenError(reason)),
             FetchOutcome::TrackNotFound => {} // fall through to search
         }
     }
 
-    // Strategy 2: Search by track metadata and use similarity matching
-    let search_base = "https://apic-desktop.musixmatch.com/ws/1.1/track.search?format=json&app_id=web-desktop-app-v1.0&";
-    let mut search_params = vec![
+    // Strategy 2: Use matcher.track.get for matching (musixmatch's own fuzzy matcher),
+    // then fetch lyrics via macro.subtitles.get with the matched commontrack_id.
+    let matcher_base = "https://apic-desktop.musixmatch.com/ws/1.1/matcher.track.get?format=json&app_id=web-desktop-app-v1.0&";
+    let mut matcher_params = vec![
         format!("q_artist={}", urlencoding::encode(artist)),
         format!("q_track={}", urlencoding::encode(title)),
         format!("usertoken={}", urlencoding::encode(token)),
-        "page_size=10".to_string(),
-        "f_has_lyrics=1".to_string(),
     ];
-    
+
     if !album.is_empty() {
-        search_params.push(format!("q_album={}", urlencoding::encode(album)));
+        matcher_params.push(format!("q_album={}", urlencoding::encode(album)));
     }
     if let Some(d) = duration {
-        search_params.push(format!("q_duration={}", d.round() as i64));
+        matcher_params.push(format!("q_duration={}", d.round() as i64));
     }
 
-    let search_url = search_base.to_string() + &search_params.join("&");
-    let search_resp = client
-        .get(&search_url)
+    let matcher_url = matcher_base.to_string() + &matcher_params.join("&");
+    let matcher_resp = client
+        .get(&matcher_url)
         .header("Cookie", "x-mxm-token-guid=")
         .send()
         .await?;
 
-    if is_token_error_status(search_resp.status()) {
-        return Ok(FetchOutcome::TokenError(format!("Search HTTP {}", search_resp.status())));
+    if is_token_error_status(matcher_resp.status()) {
+        return Ok(FetchOutcome::TokenError(format!(
+            "Matcher HTTP {}",
+            matcher_resp.status()
+        )));
     }
 
-    if !search_resp.status().is_success() {
+    if !matcher_resp.status().is_success() {
         return Ok(FetchOutcome::TrackNotFound);
     }
 
-    let search_json: Value = search_resp.json().await?;
-    if let Some(code) = get_root_status_code(&search_json)
+    let matcher_json: Value = matcher_resp.json().await?;
+    if let Some(code) = get_root_status_code(&matcher_json)
         && is_token_error_code(code)
     {
-        return Ok(FetchOutcome::TokenError(format!("Search API Status {}", code)));
+        return Ok(FetchOutcome::TokenError(format!(
+            "Matcher API Status {}",
+            code
+        )));
     }
 
-    let track_list = search_json
-        .pointer("/message/body/track_list")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-
-    if track_list.is_empty() {
+    let track = matcher_json.pointer("/message/body/track");
+    let Some(track) = track else {
         return Ok(FetchOutcome::TrackNotFound);
-    }
+    };
 
-    // Extract track objects from the track_list wrapper
-    let candidates: Vec<Value> = track_list
-        .iter()
-        .filter_map(|item| item.get("track").cloned())
-        .collect();
+    // Extract track identifiers from the matcher response
+    let ids = extract_track_ids_from_json(track);
 
-    if candidates.is_empty() {
-        return Ok(FetchOutcome::TrackNotFound);
-    }
-
-    // Find the best matching track using similarity scoring
-    let best_match = crate::lyrics::similarity::find_best_song_match(
-        &candidates,
-        title,
-        artist,
-        if album.is_empty() { None } else { Some(album) },
-        duration,
-    );
-
-    if let Some((idx, _score)) = best_match
-        && let Some(best) = candidates.get(idx)
+    // Check if track is instrumental
+    if track
+        .get("instrumental")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
     {
-        // Check if track is instrumental
-        if best.get("instrumental").and_then(|v| v.as_bool()).unwrap_or(false) {
-            let line = LyricLine {
-                time: 0.0,
-                text: "♪ Instrumental ♪".to_string(),
-                words: None,
-            };
-            return Ok(FetchOutcome::Success(vec![line], None));
+        let line = LyricLine {
+            time: 0.0,
+            text: "♪ Instrumental ♪".to_string(),
+            words: None,
+        };
+        return Ok(FetchOutcome::Success(vec![line], None, ids));
+    }
+
+    // Check if track has lyrics before attempting to fetch them
+    if !track
+        .get("has_lyrics")
+        .and_then(|v| v.as_i64())
+        .map(|v| v == 1)
+        .unwrap_or(false)
+    {
+        return Ok(FetchOutcome::TrackNotFound);
+    }
+
+    // Fetch lyrics using commontrack_id from the matcher
+    if let Some(commontrack_id) = track.get("commontrack_id").and_then(|v| v.as_i64()) {
+        let mut params = vec![
+            ("commontrack_id".to_string(), commontrack_id.to_string()),
+            ("usertoken".to_string(), token.to_string()),
+        ];
+
+        if let Some(d) = duration {
+            params.push(("q_duration".to_string(), (d.round() as i64).to_string()));
         }
 
-        // Try to fetch lyrics using commontrack_id
-        if let Some(commontrack_id) = best
-            .get("commontrack_id")
-            .and_then(|v| v.as_i64())
-            .or_else(|| best.get("track_id").and_then(|v| v.as_i64()))
-        {
-            let track_length = best
-                .get("track_length")
-                .and_then(|v| v.as_i64())
-                .or_else(|| best.get("length").and_then(|v| v.as_i64()));
-
-            let mut params = vec![
-                ("commontrack_id".to_string(), commontrack_id.to_string()),
-                ("usertoken".to_string(), token.to_string()),
-            ];
-            
-            if let Some(len) = track_length {
-                params.push(("q_duration".to_string(), len.to_string()));
+        match try_macro_for_lyrics(client, &params).await? {
+            FetchOutcome::Success(parsed, raw, _macro_ids) => {
+                return Ok(FetchOutcome::Success(parsed, raw, ids));
             }
-
-            match try_macro_for_lyrics(client, &params).await? {
-                FetchOutcome::Success(parsed, raw) => return Ok(FetchOutcome::Success(parsed, raw)),
-                FetchOutcome::TokenError(reason) => return Ok(FetchOutcome::TokenError(reason)),
-                FetchOutcome::TrackNotFound => {}
-            }
+            FetchOutcome::TokenError(reason) => return Ok(FetchOutcome::TokenError(reason)),
+            FetchOutcome::TrackNotFound => {}
         }
     }
 
     Ok(FetchOutcome::TrackNotFound)
 }
 
+/// Fetch lyrics using Musixmatch desktop
 /// Fetch lyrics using Musixmatch desktop "usertoken" (apic-desktop.musixmatch.com).
-/// 
+///
 /// Supports multiple usertokens (comma-separated in MUSIXMATCH_USERTOKEN env var)
 /// and uses them in a round-robin fashion.
 pub async fn fetch_lyrics_from_musixmatch_usertoken(
@@ -301,6 +401,8 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
     album: &str,
     duration: Option<f64>,
     track_spotify_id: Option<&str>,
+    track_isrc: Option<&str>,
+    track_itunes_id: Option<&str>,
 ) -> ProviderResult {
     let total_tokens = {
         let manager = TOKEN_MANAGER.lock().ok();
@@ -308,7 +410,7 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
     };
 
     if total_tokens == 0 {
-        return Ok((Vec::new(), None));
+        return Ok((Vec::new(), None, TrackMatchInfo::default()));
     }
 
     let client = http_client();
@@ -330,15 +432,17 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
             album,
             duration,
             track_spotify_id,
+            track_isrc,
+            track_itunes_id,
         )
         .await
         {
-            Ok(FetchOutcome::Success(parsed, raw)) => {
-                return Ok((parsed, raw));
+            Ok(FetchOutcome::Success(parsed, raw, ids)) => {
+                return Ok((parsed, raw, ids));
             }
             Ok(FetchOutcome::TrackNotFound) => {
                 // The track genuinely doesn't exist or doesn't have lyrics, no need to retry on other tokens
-                return Ok((Vec::new(), None));
+                return Ok((Vec::new(), None, TrackMatchInfo::default()));
             }
             Ok(FetchOutcome::TokenError(reason)) => {
                 tracing::warn!(
@@ -362,7 +466,7 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
         }
     }
 
-    Ok((Vec::new(), None))
+    Ok((Vec::new(), None, TrackMatchInfo::default()))
 }
 
 #[cfg(test)]
@@ -372,7 +476,11 @@ mod tests {
     #[test]
     fn test_token_manager_round_robin() {
         let mut tm = TokenManager {
-            tokens: vec!["token1".to_string(), "token2".to_string(), "token3".to_string()],
+            tokens: vec![
+                "token1".to_string(),
+                "token2".to_string(),
+                "token3".to_string(),
+            ],
             current_index: 0,
         };
 
@@ -390,5 +498,57 @@ mod tests {
         };
 
         assert_eq!(tm.next_token(), None);
+    }
+
+    #[test]
+    fn test_extract_track_ids_from_json() {
+        let json: Value = serde_json::from_str(
+            r#"{
+            "track_isrc": "USUM72345678",
+            "track_spotify_id": "6rqhFg4Kj6gIwR5v",
+            "track_itunes_id": "123456789"
+        }"#,
+        )
+        .unwrap();
+
+        let ids = extract_track_ids_from_json(&json);
+        assert_eq!(ids.track_isrc, Some("USUM72345678".to_string()));
+        assert_eq!(ids.track_spotify_id, Some("6rqhFg4Kj6gIwR5v".to_string()));
+        assert_eq!(ids.track_itunes_id, Some("123456789".to_string()));
+    }
+
+    #[test]
+    fn test_extract_track_ids_from_json_array_fields() {
+        let json: Value = serde_json::from_str(
+            r#"{
+            "commontrack_isrcs": [["GBCEL1300362"]],
+            "commontrack_spotify_ids": ["5FVd6KXrgO9B3JPmC8OPst"],
+            "commontrack_itunes_ids": [1442699400]
+        }"#,
+        )
+        .unwrap();
+
+        let ids = extract_track_ids_from_json(&json);
+        assert_eq!(ids.track_isrc, Some("GBCEL1300362".to_string()));
+        assert_eq!(
+            ids.track_spotify_id,
+            Some("5FVd6KXrgO9B3JPmC8OPst".to_string())
+        );
+        assert_eq!(ids.track_itunes_id, Some("1442699400".to_string()));
+    }
+
+    #[test]
+    fn test_extract_track_ids_missing() {
+        let json: Value = serde_json::from_str(
+            r#"{
+            "track_name": "Test Song"
+        }"#,
+        )
+        .unwrap();
+
+        let ids = extract_track_ids_from_json(&json);
+        assert_eq!(ids.track_isrc, None);
+        assert_eq!(ids.track_spotify_id, None);
+        assert_eq!(ids.track_itunes_id, None);
     }
 }

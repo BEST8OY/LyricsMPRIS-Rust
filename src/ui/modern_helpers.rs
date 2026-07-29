@@ -6,14 +6,14 @@
 //! - Per-word karaoke span generation for richsync lyrics
 //! - Centered vertical layout calculation
 
-use crate::text_utils::wrap_text;
 use crate::state::Update;
+use crate::text_utils::wrap_text;
 use crate::ui::styles::LyricStyles;
 use ratatui::{
+    Terminal,
     backend::Backend,
     layout::{Alignment, Rect},
-    Terminal,
-    text::{Span, Line},
+    text::{Line, Span},
     widgets::Paragraph,
 };
 use std::error::Error;
@@ -115,10 +115,8 @@ fn ensure_wrapped_cache<'a>(
     };
 
     if needs_rebuild {
-        let new_blocks: Vec<Vec<String>> = lines
-            .iter()
-            .map(|l| wrap_text(&l.text, width))
-            .collect();
+        let new_blocks: Vec<Vec<String>> =
+            lines.iter().map(|l| wrap_text(&l.text, width)).collect();
         *wrapped_cache = Some((width, new_blocks));
     }
 
@@ -133,8 +131,8 @@ fn render_centered_paragraph(
     height: usize,
 ) {
     if spans.is_empty() {
-        let paragraph = Paragraph::new(vec![Line::from(Span::raw(""))])
-            .alignment(Alignment::Center);
+        let paragraph =
+            Paragraph::new(vec![Line::from(Span::raw(""))]).alignment(Alignment::Center);
         frame.render_widget(paragraph, size);
         return;
     }
@@ -150,8 +148,6 @@ fn render_centered_paragraph(
     let paragraph = Paragraph::new(spans).alignment(Alignment::Center);
     frame.render_widget(paragraph, render_area);
 }
-
-
 
 /// Collection of styled lines to render.
 pub struct VisibleLines<'a> {
@@ -232,13 +228,13 @@ fn collect_before_blocks<'a>(
 ) -> Vec<Line<'a>> {
     let mut result = Vec::new();
     let start_index = current_index.saturating_sub(blocks_needed);
-    
+
     for block in wrapped_blocks.iter().take(current_index).skip(start_index) {
         for line in block {
             result.push(Line::from(Span::styled(line.clone(), style)));
         }
     }
-    
+
     result
 }
 
@@ -252,13 +248,17 @@ fn collect_after_blocks<'a>(
 ) -> Vec<Line<'a>> {
     let mut result = Vec::new();
     let end_index = (current_index + 1 + blocks_needed).min(wrapped_blocks.len());
-    
-    for block in wrapped_blocks.iter().take(end_index).skip(current_index + 1) {
+
+    for block in wrapped_blocks
+        .iter()
+        .take(end_index)
+        .skip(current_index + 1)
+    {
         for line in block {
             result.push(Line::from(Span::styled(line.clone(), style)));
         }
     }
-    
+
     result
 }
 
@@ -273,7 +273,11 @@ fn split_words_into_lines<'b>(
 
     for w in words {
         let wlen = w.text.chars().count();
-        let candidate = if current.is_empty() { wlen } else { cur_len + 1 + wlen };
+        let candidate = if current.is_empty() {
+            wlen
+        } else {
+            cur_len + 1 + wlen
+        };
         if !current.is_empty() && candidate > width && width > 0 {
             lines.push(current);
             current = Vec::new();
@@ -288,8 +292,12 @@ fn split_words_into_lines<'b>(
         }
     }
 
-    if !current.is_empty() { lines.push(current); }
-    if lines.is_empty() { lines.push(Vec::new()); }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(Vec::new());
+    }
     lines
 }
 
@@ -297,7 +305,7 @@ fn split_words_into_lines<'b>(
 ///
 /// If `update.index` is None, renders using `styles.after` (dimmed).
 /// For richsync with karaoke enabled, builds per-word spans with partial highlighting.
-/// 
+///
 /// # Arguments
 /// * `max_visible_lines` - Maximum number of lyric blocks to display (None = unlimited)
 /// * `scroll_offset` - Manual scroll offset in lyric blocks when paused
@@ -323,7 +331,7 @@ pub fn gather_visible_lines<'a>(
     } else {
         base_index
     };
-    
+
     let current_block = wrapped_blocks
         .get(effective_index)
         .map(|v| v.as_slice())
@@ -332,14 +340,8 @@ pub fn gather_visible_lines<'a>(
 
     // Build current line spans (with karaoke if applicable, but only when not scrolled)
     let use_karaoke = karaoke_enabled && scroll_offset == 0 && update.playing;
-    let current_spans = build_current_spans(
-        update,
-        current_block,
-        w,
-        styles,
-        position,
-        use_karaoke,
-    );
+    let current_spans =
+        build_current_spans(update, current_block, w, styles, position, use_karaoke);
 
     // Calculate available height considering max_visible_lines
     let available_height = if let Some(max) = max_visible_lines {
@@ -365,7 +367,7 @@ pub fn gather_visible_lines<'a>(
         let context_blocks = max.saturating_sub(1); // -1 for current block
         let before_blocks = context_blocks / 2;
         let after_blocks = context_blocks - before_blocks;
-        
+
         // Count how many wrapped lines each block would contribute
         // For simplicity, we'll use a heuristic approach
         (before_blocks, after_blocks)
@@ -382,7 +384,7 @@ pub fn gather_visible_lines<'a>(
     } else {
         collect_before_spans(effective_index, wrapped_blocks, lines_before, styles.before)
     };
-    
+
     let after = if max_visible_lines.is_some() {
         collect_after_blocks(effective_index, wrapped_blocks, lines_after, styles.after)
     } else {
@@ -407,10 +409,15 @@ fn build_current_spans<'a>(
 ) -> Vec<Line<'a>> {
     // Try to build richsync karaoke spans
     if let Some(idx) = update.index
-        && karaoke_enabled && matches!(update.provider, Some(crate::state::Provider::MusixmatchRichsync))
-            && let Some(spans) = try_build_karaoke_spans(update, idx, width, styles, position) {
-                return spans;
-            }
+        && karaoke_enabled
+        && matches!(
+            update.provider,
+            Some(crate::state::Provider::MusixmatchRichsync)
+        )
+        && let Some(spans) = try_build_karaoke_spans(update, idx, width, styles, position)
+    {
+        return spans;
+    }
 
     // Fallback: render wrapped block with appropriate style
     let style = if update.index.is_some() {
@@ -475,26 +482,39 @@ fn build_word_spans<'a>(
 
     // Word not yet reached
     if position < word.start {
-        return vec![Span::styled(format!("{}{}", word.text, suffix), styles.after)];
+        return vec![Span::styled(
+            format!("{}{}", word.text, suffix),
+            styles.after,
+        )];
     }
 
     // Word fully passed
     if position >= word.end {
-        return vec![Span::styled(format!("{}{}", word.text, suffix), styles.current)];
+        return vec![Span::styled(
+            format!("{}{}", word.text, suffix),
+            styles.current,
+        )];
     }
 
     // Word partially highlighted
     let duration = (word.end - word.start).max(f64::EPSILON);
     let fraction = ((position - word.start) / duration).clamp(0.0, 1.0);
     let total_graphemes = word.grapheme_count();
-    let highlighted_count = ((fraction * total_graphemes as f64).floor() as usize).min(total_graphemes);
+    let highlighted_count =
+        ((fraction * total_graphemes as f64).floor() as usize).min(total_graphemes);
 
     if highlighted_count == 0 {
-        return vec![Span::styled(format!("{}{}", word.text, suffix), styles.after)];
+        return vec![Span::styled(
+            format!("{}{}", word.text, suffix),
+            styles.after,
+        )];
     }
 
     if highlighted_count >= total_graphemes {
-        return vec![Span::styled(format!("{}{}", word.text, suffix), styles.current)];
+        return vec![Span::styled(
+            format!("{}{}", word.text, suffix),
+            styles.current,
+        )];
     }
 
     // Split at grapheme boundary using the precomputed boundaries

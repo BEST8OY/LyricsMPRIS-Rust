@@ -29,8 +29,7 @@ impl Default for LyricStyles {
     fn default() -> Self {
         Self {
             // Past lines: subtle, de-emphasized
-            before: Style::default()
-                .add_modifier(Modifier::ITALIC | Modifier::DIM),
+            before: Style::default().add_modifier(Modifier::ITALIC | Modifier::DIM),
             // Current line: prominent, easy to read
             current: Style::default()
                 .fg(Color::Green)
@@ -41,5 +40,4 @@ impl Default for LyricStyles {
     }
 }
 
-impl LyricStyles {
-}
+impl LyricStyles {}
