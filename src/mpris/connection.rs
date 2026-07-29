@@ -46,11 +46,8 @@ trait Playerctld {
 pub async fn get_active_player_names() -> Result<Vec<String>, MprisError> {
     let conn = get_dbus_conn().await?;
 
-
     match PlayerctldProxy::new(&conn).await {
-        Ok(proxy) => {
-            proxy.player_names().await.or(Ok(Vec::new()))
-        }
+        Ok(proxy) => proxy.player_names().await.or(Ok(Vec::new())),
         Err(_) => Ok(Vec::new()),
     }
 }

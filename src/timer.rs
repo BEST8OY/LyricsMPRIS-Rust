@@ -36,7 +36,7 @@ use std::time::Instant;
 /// let mut timer = PlaybackTimer::default();
 /// timer.set_position(10.0);
 /// timer.mark_playing();
-/// 
+///
 /// // ... time passes ...
 /// let estimated = timer.estimate(true); // > 10.0
 /// ```
@@ -196,10 +196,10 @@ impl PlaybackTimer {
     /// let mut timer = PlaybackTimer::default();
     /// timer.set_position(5.0);
     /// timer.mark_playing();
-    /// 
+    ///
     /// // Paused: returns anchor
     /// assert_eq!(timer.estimate(false), 5.0);
-    /// 
+    ///
     /// // Playing: returns anchor + elapsed (increases over time)
     /// sleep(Duration::from_millis(10));
     /// assert!(timer.estimate(true) > 5.0);
@@ -207,18 +207,18 @@ impl PlaybackTimer {
     #[must_use]
     pub fn estimate(&self, playing: bool) -> f64 {
         let base = self.anchor_position;
-        
+
         if !playing {
             return base;
         }
-        
+
         let Some(instant) = self.anchor_instant else {
             return base;
         };
 
         let elapsed = instant.elapsed().as_secs_f64();
         let estimated = base + elapsed;
-        
+
         // Fallback to base if arithmetic produces invalid result
         if estimated.is_finite() {
             estimated
@@ -294,10 +294,10 @@ mod tests {
     fn test_timer_reset() {
         let mut timer = PlaybackTimer::default();
         timer.reset(10.0);
-        
+
         // Should return anchor position when not playing
         assert_eq!(timer.estimate(false), 10.0);
-        
+
         // Should return anchor position when playing without instant
         assert_eq!(timer.estimate(true), 10.0);
     }
@@ -306,7 +306,7 @@ mod tests {
     fn test_timer_set_position() {
         let mut timer = PlaybackTimer::default();
         timer.set_position(5.0);
-        
+
         // Instant is set, so estimate should be >= anchor
         let estimate = timer.estimate(true);
         assert!(estimate >= 5.0);
@@ -317,11 +317,11 @@ mod tests {
         let mut timer = PlaybackTimer::default();
         timer.set_position(10.0);
         timer.mark_playing();
-        
+
         sleep(Duration::from_millis(10));
         let playing_estimate = timer.estimate(true);
         assert!(playing_estimate > 10.0, "Should advance when playing");
-        
+
         timer.mark_paused();
         let paused_estimate = timer.estimate(true);
         assert_eq!(paused_estimate, 10.0, "Should freeze when paused");
@@ -330,15 +330,15 @@ mod tests {
     #[test]
     fn test_timer_invalid_position() {
         let mut timer = PlaybackTimer::default();
-        
+
         // NaN should be sanitized to 0.0
         timer.set_position(f64::NAN);
         assert_eq!(timer.estimate(false), 0.0);
-        
+
         // Negative should be sanitized to 0.0
         timer.set_position(-5.0);
         assert_eq!(timer.estimate(false), 0.0);
-        
+
         // Infinity should be sanitized to 0.0
         timer.set_position(f64::INFINITY);
         assert_eq!(timer.estimate(false), 0.0);

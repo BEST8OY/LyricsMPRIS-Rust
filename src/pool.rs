@@ -129,17 +129,10 @@ pub async fn listen(
 ) {
     let loop_config = LoopConfig::new(config);
     let mut loop_state = LoopState::new();
-    
+
     let event_rx = initialize_loop(&mut loop_state, &update_tx, &loop_config).await;
 
-    run_event_loop(
-        loop_state,
-        event_rx,
-        update_tx,
-        shutdown_rx,
-        loop_config,
-    )
-    .await;
+    run_event_loop(loop_state, event_rx, update_tx, shutdown_rx, loop_config).await;
 }
 
 /// Initializes the event loop infrastructure.
@@ -160,9 +153,9 @@ async fn initialize_loop(
 ) -> mpsc::Receiver<Event> {
     tracing::debug!("Initializing event loop");
     let (event_tx, event_rx) = mpsc::channel::<Event>(16);
-    
+
     let active_service = discover_active_player(config).await;
-    
+
     if let Some(service) = active_service {
         tracing::debug!(service = %service, "Active player found");
         initialize_with_player(loop_state, &service, config).await;
@@ -170,20 +163,16 @@ async fn initialize_loop(
         tracing::debug!("No active player found");
         handle_no_player(loop_state, update_tx).await;
     }
-    
+
     spawn_mpris_watcher(event_tx, config);
-    
+
     event_rx
 }
 
 /// Initializes state with an active player.
 ///
 /// Fetches initial metadata and lyrics for the current track.
-async fn initialize_with_player(
-    loop_state: &mut LoopState,
-    service: &str,
-    config: &LoopConfig,
-) {
+async fn initialize_with_player(loop_state: &mut LoopState, service: &str, config: &LoopConfig) {
     tracing::debug!(
         service = %service,
         providers = ?config.providers(),
@@ -207,18 +196,24 @@ async fn discover_active_player(config: &LoopConfig) -> Option<String> {
     match crate::mpris::get_active_player_names().await {
         Ok(names) => {
             tracing::debug!(available_players = ?names, "Discovered MPRIS players");
-            
-            let blocked_count = names.iter().filter(|s| crate::mpris::is_blocked(s, config.block_list())).count();
+
+            let blocked_count = names
+                .iter()
+                .filter(|s| crate::mpris::is_blocked(s, config.block_list()))
+                .count();
             let active = names
                 .into_iter()
                 .find(|service| !crate::mpris::is_blocked(service, config.block_list()));
-            
+
             if let Some(ref service) = active {
                 tracing::debug!(selected_player = %service, "Selected active player");
             } else if blocked_count > 0 {
-                tracing::debug!(blocked_count = blocked_count, "All discovered players are blocked");
+                tracing::debug!(
+                    blocked_count = blocked_count,
+                    "All discovered players are blocked"
+                );
             }
-            
+
             active
         }
         Err(e) => {
@@ -234,10 +229,7 @@ async fn discover_active_player(config: &LoopConfig) -> Option<String> {
 /// Handles the case where no active player is found.
 ///
 /// Clears all state and notifies the UI to display an empty state.
-async fn handle_no_player(
-    loop_state: &mut LoopState,
-    update_tx: &mpsc::Sender<Update>,
-) {
+async fn handle_no_player(loop_state: &mut LoopState, update_tx: &mpsc::Sender<Update>) {
     loop_state.state_bundle.clear_lyrics();
     loop_state.state_bundle.player_state = Default::default();
     send_update(&mut loop_state.state_bundle, update_tx, true).await;
@@ -252,10 +244,7 @@ async fn handle_no_player(
 /// # Error Handling
 ///
 /// Errors are logged and default metadata is returned.
-async fn fetch_initial_metadata(
-    service: &str,
-    _config: &LoopConfig,
-) -> TrackMetadata {
+async fn fetch_initial_metadata(service: &str, _config: &LoopConfig) -> TrackMetadata {
     match crate::mpris::metadata::get_metadata(service).await {
         Ok(metadata) => metadata,
         Err(e) => {
@@ -284,7 +273,7 @@ async fn initialize_lyrics_state(
         artist = %metadata.artist,
         "Fetching initial lyrics"
     );
-    
+
     // fetch_and_update_lyrics already sets the position internally
     let _position = event::fetch_and_update_lyrics(
         metadata,
@@ -293,7 +282,7 @@ async fn initialize_lyrics_state(
         Some(service),
     )
     .await;
-    
+
     if loop_state.state_bundle.has_lyrics() {
         tracing::debug!(
             provider = ?loop_state.state_bundle.provider,
@@ -317,10 +306,7 @@ async fn initialize_lyrics_state(
 ///
 /// Initialization and runtime errors are logged (if debug enabled) but don't
 /// crash the application. The watcher task will terminate on fatal errors.
-fn spawn_mpris_watcher(
-    event_tx: mpsc::Sender<Event>,
-    config: &LoopConfig,
-) {
+fn spawn_mpris_watcher(event_tx: mpsc::Sender<Event>, config: &LoopConfig) {
     tracing::debug!("Spawning MPRIS event watcher");
     let update_tx = event_tx.clone();
     let seek_tx = event_tx;
@@ -330,17 +316,14 @@ fn spawn_mpris_watcher(
     tokio::spawn(async move {
         let handler_result = MprisEventHandler::with_closures(
             move |meta, pos, service| {
-                let _ = update_tx.try_send(Event::Mpris(
-                    MprisEvent::PlayerUpdate(meta, pos, service)
-                ));
+                let _ =
+                    update_tx.try_send(Event::Mpris(MprisEvent::PlayerUpdate(meta, pos, service)));
             },
             move |meta, pos, service| {
-                let _ = seek_tx.try_send(Event::Mpris(
-                    MprisEvent::Seeked(meta, pos, service)
-                ));
+                let _ = seek_tx.try_send(Event::Mpris(MprisEvent::Seeked(meta, pos, service)));
             },
             block_list,
-            target_list
+            target_list,
         )
         .await;
 

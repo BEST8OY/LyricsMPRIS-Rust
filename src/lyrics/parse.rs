@@ -13,7 +13,7 @@ static SYNCED_LYRICS_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"\[(\d{1,2}):(\d{2})[.](\d{1,2})\]").unwrap());
 
 /// Parse standard LRC format time-synced lyrics into LyricLine structs.
-/// 
+///
 /// Example input:
 /// ```text
 /// [00:29.26]Have you got colour in your cheeks?
@@ -36,12 +36,21 @@ pub fn parse_synced_lyrics(synced: &str) -> Vec<LyricLine> {
             matches
                 .into_iter()
                 .map(|cap| {
-                    let minutes = cap.get(1).and_then(|m| m.as_str().parse::<u32>().ok()).unwrap_or(0);
-                    let seconds = cap.get(2).and_then(|s| s.as_str().parse::<u32>().ok()).unwrap_or(0);
-                    let centiseconds = cap.get(3).and_then(|c| c.as_str().parse::<u32>().ok()).unwrap_or(0);
-                    
+                    let minutes = cap
+                        .get(1)
+                        .and_then(|m| m.as_str().parse::<u32>().ok())
+                        .unwrap_or(0);
+                    let seconds = cap
+                        .get(2)
+                        .and_then(|s| s.as_str().parse::<u32>().ok())
+                        .unwrap_or(0);
+                    let centiseconds = cap
+                        .get(3)
+                        .and_then(|c| c.as_str().parse::<u32>().ok())
+                        .unwrap_or(0);
+
                     let time = minutes as f64 * 60.0 + seconds as f64 + centiseconds as f64 / 100.0;
-                    
+
                     LyricLine {
                         time,
                         text: text.clone(),
@@ -65,7 +74,10 @@ pub fn parse_subtitle_body(subtitle_body: &str) -> Option<Vec<LyricLine>> {
     let mut parsed = Vec::new();
 
     for line in arr {
-        let time = line.pointer("/time/total").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let time = line
+            .pointer("/time/total")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
         let text = line.get("text").and_then(|v| v.as_str()).unwrap_or("♪");
 
         parsed.push(LyricLine {
@@ -102,7 +114,10 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<Vec<LyricLine>> {
 
     for line in arr.iter().take(MAX_LYRIC_LINES) {
         let line_start = line.pointer("/ts").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let line_end = line.pointer("/te").and_then(|v| v.as_f64()).unwrap_or(line_start + 3.0);
+        let line_end = line
+            .pointer("/te")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(line_start + 3.0);
         let text = line
             .get("x")
             .or_else(|| line.get("text"))
@@ -124,7 +139,11 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<Vec<LyricLine>> {
 
 /// Parse word timings from a richsync line object.
 /// Returns None if no word timing data is present.
-fn parse_word_timings(line: &Value, line_start: f64, line_end: f64) -> Option<Vec<crate::lyrics::types::WordTiming>> {
+fn parse_word_timings(
+    line: &Value,
+    line_start: f64,
+    line_end: f64,
+) -> Option<Vec<crate::lyrics::types::WordTiming>> {
     // Try explicit words array first
     if let Some(words_arr) = line.get("words").and_then(|v| v.as_array()) {
         // Validate word count
@@ -135,7 +154,11 @@ fn parse_word_timings(line: &Value, line_start: f64, line_end: f64) -> Option<Ve
                 MAX_WORDS_PER_LINE
             );
         }
-        return parse_explicit_word_array(&words_arr[..words_arr.len().min(MAX_WORDS_PER_LINE)], line_start, line_end);
+        return parse_explicit_word_array(
+            &words_arr[..words_arr.len().min(MAX_WORDS_PER_LINE)],
+            line_start,
+            line_end,
+        );
     }
 
     // Fall back to character-level array
@@ -148,18 +171,29 @@ fn parse_word_timings(line: &Value, line_start: f64, line_end: f64) -> Option<Ve
                 MAX_WORDS_PER_LINE
             );
         }
-        return parse_character_array(&char_arr[..char_arr.len().min(MAX_WORDS_PER_LINE)], line_start, line_end);
+        return parse_character_array(
+            &char_arr[..char_arr.len().min(MAX_WORDS_PER_LINE)],
+            line_start,
+            line_end,
+        );
     }
 
     None
 }
 
 /// Parse explicit word array: [{start, end, text}, ...]
-fn parse_explicit_word_array(words_arr: &[Value], line_start: f64, line_end: f64) -> Option<Vec<crate::lyrics::types::WordTiming>> {
+fn parse_explicit_word_array(
+    words_arr: &[Value],
+    line_start: f64,
+    line_end: f64,
+) -> Option<Vec<crate::lyrics::types::WordTiming>> {
     let word_timings: Vec<crate::lyrics::types::WordTiming> = words_arr
         .iter()
         .map(|w| {
-            let start = w.get("start").and_then(|v| v.as_f64()).unwrap_or(line_start);
+            let start = w
+                .get("start")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(line_start);
             let end = w.get("end").and_then(|v| v.as_f64()).unwrap_or(start);
             let text = w.get("text").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -178,13 +212,17 @@ fn parse_explicit_word_array(words_arr: &[Value], line_start: f64, line_end: f64
 }
 
 /// Parse character-level array: [{c: "word", o: offset}, ...]
-fn parse_character_array(char_arr: &[Value], line_start: f64, line_end: f64) -> Option<Vec<crate::lyrics::types::WordTiming>> {
+fn parse_character_array(
+    char_arr: &[Value],
+    line_start: f64,
+    line_end: f64,
+) -> Option<Vec<crate::lyrics::types::WordTiming>> {
     let word_timings: Vec<crate::lyrics::types::WordTiming> = char_arr
         .iter()
         .enumerate()
         .filter_map(|(i, elem)| {
             let text = elem.get("c").and_then(|v| v.as_str()).unwrap_or("");
-            
+
             // Skip whitespace-only entries
             if text.trim().is_empty() {
                 return None;
@@ -220,13 +258,13 @@ fn create_word_timing(start: f64, end: f64, text: &str) -> crate::lyrics::types:
     // This avoids storing each grapheme as a separate String (24 bytes overhead each)
     let mut grapheme_boundaries: Vec<usize> = Vec::new();
     grapheme_boundaries.push(0);
-    
+
     for (byte_offset, _grapheme) in text.grapheme_indices(true) {
         if byte_offset > 0 {
             grapheme_boundaries.push(byte_offset);
         }
     }
-    
+
     // Add final boundary for convenience (allows simple slicing: text[boundaries[i]..boundaries[i+1]])
     grapheme_boundaries.push(text.len());
 

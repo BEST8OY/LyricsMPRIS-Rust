@@ -18,7 +18,7 @@
 
 use crate::lyrics::LyricLine;
 use crate::mpris::TrackMetadata;
-use crate::timer::{sanitize_position, PlaybackTimer};
+use crate::timer::{PlaybackTimer, sanitize_position};
 use std::sync::Arc;
 
 // ============================================================================
@@ -41,7 +41,6 @@ pub enum Provider {
     /// Musixmatch provider - subtitle format with line-level timing (JSON)
     MusixmatchSubtitles,
 }
-
 
 // ============================================================================
 // Update Snapshot
@@ -71,35 +70,34 @@ pub enum Provider {
 pub struct Update {
     /// Lyrics lines (shared via Arc for efficient cloning)
     pub lines: Arc<Vec<LyricLine>>,
-    
+
     /// Index of the currently highlighted line (if any)
     pub index: Option<usize>,
-    
+
     /// Current playback position in seconds
     pub position: f64,
-    
+
     /// Whether the player is currently playing (true) or paused (false)
     pub playing: bool,
-    
+
     /// Monotonically increasing version counter for change detection
     pub version: u64,
-    
+
     /// Error message from the most recent operation (if any)
     pub err: Option<String>,
-    
+
     /// Current track artist
     pub artist: String,
-    
+
     /// Current track title
     pub title: String,
-    
+
     /// Current track album
     pub album: String,
-    
+
     /// Provider that supplied the current lyrics
     pub provider: Option<Provider>,
 }
-
 
 // ============================================================================
 // Player State
@@ -127,25 +125,25 @@ pub struct Update {
 pub struct PlayerState {
     /// Current track title
     pub title: String,
-    
+
     /// Current track artist
     pub artist: String,
-    
+
     /// Current track album
     pub album: String,
-    
+
     /// Playback state: true if playing, false if paused
     pub playing: bool,
-    
+
     /// Most recent anchor position in seconds (sanitized)
     pub position: f64,
-    
+
     /// Error from the most recent operation (if any)
     pub err: Option<String>,
-    
+
     /// Track length in seconds (if known)
     pub length: Option<f64>,
-    
+
     /// Internal timer for position estimation during playback
     timer: PlaybackTimer,
 }
@@ -201,7 +199,7 @@ impl PlayerState {
     /// * `position` - Current playback position in seconds
     pub fn update_playback_dbus(&mut self, playing: bool, position: f64) {
         self.set_position(position);
-        
+
         if playing {
             self.start_playing();
         } else {
@@ -228,19 +226,19 @@ impl PlayerState {
     #[must_use]
     pub fn estimate_position(&self) -> f64 {
         let mut estimated = self.timer.estimate(self.playing);
-        
+
         if !estimated.is_finite() {
             estimated = self.position;
         }
-        
+
         // Always ensure non-negative (defensive against timer bugs)
         estimated = estimated.max(0.0);
-        
+
         // Additionally clamp to track length if known
         if let Some(len) = self.length {
             estimated = estimated.min(len);
         }
-        
+
         estimated
     }
 
@@ -249,9 +247,7 @@ impl PlayerState {
     /// Compares title, artist, and album to detect track changes.
     #[must_use]
     pub fn has_changed(&self, meta: &TrackMetadata) -> bool {
-        self.title != meta.title 
-            || self.artist != meta.artist 
-            || self.album != meta.album
+        self.title != meta.title || self.artist != meta.artist || self.album != meta.album
     }
 
     /// Sets a new anchor position without changing playback state.
@@ -306,7 +302,7 @@ impl PlayerState {
 pub struct LyricState {
     /// Sorted lyrics lines (shared via Arc for cheap cloning)
     pub lines: Arc<Vec<LyricLine>>,
-    
+
     /// Index of the currently highlighted line (if any)
     pub index: Option<usize>,
 }
@@ -344,9 +340,10 @@ impl LyricState {
         }
 
         // Binary search for the appropriate line
-        match self.lines.binary_search_by(|line| {
-            line.time.total_cmp(&position)
-        }) {
+        match self
+            .lines
+            .binary_search_by(|line| line.time.total_cmp(&position))
+        {
             Ok(exact_match) => Some(exact_match),
             Err(0) => None,
             Err(insert_point) => Some(insert_point - 1),
@@ -371,10 +368,8 @@ impl LyricState {
     ///
     /// This is a pure function that doesn't mutate state.
     fn sanitize_and_sort(lines: Vec<LyricLine>) -> Vec<LyricLine> {
-        let mut sanitized: Vec<LyricLine> = lines
-            .into_iter()
-            .filter_map(Self::sanitize_line)
-            .collect();
+        let mut sanitized: Vec<LyricLine> =
+            lines.into_iter().filter_map(Self::sanitize_line).collect();
 
         sanitized.sort_by(|a, b| a.time.total_cmp(&b.time));
 
@@ -444,16 +439,16 @@ impl LyricState {
 pub struct StateBundle {
     /// Lyrics state with active line tracking
     pub lyric_state: LyricState,
-    
+
     /// Player state with position estimation
     pub player_state: PlayerState,
-    
+
     /// Monotonically increasing version counter
     pub version: u64,
-    
+
     /// Current lyrics provider (if lyrics are loaded)
     pub provider: Option<Provider>,
-    
+
     /// Timestamp when lyrics were last loaded (for filtering stale Seeked events)
     pub lyrics_loaded_at: Option<std::time::Instant>,
 
@@ -477,7 +472,9 @@ impl StateBundle {
             return true;
         }
 
-        if self.version == self.last_sent_version && self.player_state.playing == self.last_sent_playing {
+        if self.version == self.last_sent_version
+            && self.player_state.playing == self.last_sent_playing
+        {
             return false;
         }
 
@@ -544,10 +541,10 @@ impl StateBundle {
         self.player_state.update_metadata_only(meta);
         self.player_state.err = err;
         self.provider = provider;
-        
+
         // Record when lyrics were loaded for filtering stale Seeked events
         self.lyrics_loaded_at = has_lyrics.then(std::time::Instant::now);
-        
+
         self.increment_version();
     }
 
@@ -561,11 +558,11 @@ impl StateBundle {
     pub fn update_index(&mut self, position: f64) -> bool {
         let new_index = self.lyric_state.get_index(position);
         let changed = self.lyric_state.update_index(new_index);
-        
+
         if changed {
             self.increment_version();
         }
-        
+
         changed
     }
 
@@ -592,7 +589,7 @@ impl StateBundle {
         } else {
             self.player_state.position
         };
-        
+
         Update {
             lines: Arc::clone(&self.lyric_state.lines),
             index: self.lyric_state.index,
@@ -614,7 +611,6 @@ impl StateBundle {
     }
 }
 
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -632,9 +628,11 @@ mod tests {
     #[test]
     fn test_lyric_index_before_first() {
         let mut state = LyricState::default();
-        state.update_lines(vec![
-            LyricLine { time: 10.0, text: "First".into(), words: None },
-        ]);
+        state.update_lines(vec![LyricLine {
+            time: 10.0,
+            text: "First".into(),
+            words: None,
+        }]);
         assert_eq!(state.get_index(5.0), None);
     }
 
@@ -642,10 +640,18 @@ mod tests {
     fn test_lyric_index_basic() {
         let mut state = LyricState::default();
         state.update_lines(vec![
-            LyricLine { time: 10.0, text: "First".into(), words: None },
-            LyricLine { time: 20.0, text: "Second".into(), words: None },
+            LyricLine {
+                time: 10.0,
+                text: "First".into(),
+                words: None,
+            },
+            LyricLine {
+                time: 20.0,
+                text: "Second".into(),
+                words: None,
+            },
         ]);
-        
+
         assert_eq!(state.get_index(15.0), Some(0));
         assert_eq!(state.get_index(25.0), Some(1));
     }

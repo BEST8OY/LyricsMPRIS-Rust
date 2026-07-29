@@ -48,7 +48,7 @@ pub enum MprisEvent {
     /// - Player metadata changes
     /// - Periodic polling detects state changes
     PlayerUpdate(TrackMetadata, f64, String),
-    
+
     /// Seek event when user scrubs through track.
     ///
     /// Fired when:
@@ -123,7 +123,11 @@ enum FetchResult {
 /// - `Success` if lyrics were fetched and stored
 /// - `Transient` if the provider didn't have lyrics or had a recoverable error
 /// - `NonTransient` if a fatal error occurred
-async fn try_provider(provider: &str, meta: &TrackMetadata, state: &mut StateBundle) -> FetchResult {
+async fn try_provider(
+    provider: &str,
+    meta: &TrackMetadata,
+    state: &mut StateBundle,
+) -> FetchResult {
     match provider {
         "lrclib" => try_lrclib(meta, state).await,
         "musixmatch" => try_musixmatch(meta, state).await,
@@ -141,8 +145,15 @@ async fn store_lyrics_in_cache(
     meta: &TrackMetadata,
     raw: Option<String>,
     format: crate::lyrics::database::LyricsFormat,
+    provider_isrc: Option<&str>,
+    provider_spotify_id: Option<&str>,
+    provider_itunes_id: Option<&str>,
 ) {
     if let Some(raw_text) = raw {
+        let isrc = provider_isrc.or(meta.isrc.as_deref());
+        let spotify_id = provider_spotify_id.or(meta.spotify_id.as_deref());
+        let itunes_id = provider_itunes_id.or(meta.itunes_id.as_deref());
+
         crate::lyrics::database::store_in_database(
             &meta.artist,
             &meta.title,
@@ -150,7 +161,11 @@ async fn store_lyrics_in_cache(
             meta.length,
             format,
             raw_text,
-        ).await;
+            isrc,
+            spotify_id,
+            itunes_id,
+        )
+        .await;
     }
 }
 
@@ -158,10 +173,25 @@ async fn store_lyrics_in_cache(
 ///
 /// Network errors are treated as transient to allow fallback to other providers.
 async fn try_lrclib(meta: &TrackMetadata, state: &mut StateBundle) -> FetchResult {
-    match crate::lyrics::fetch_lyrics_from_lrclib(&meta.artist, &meta.title, &meta.album, meta.length).await {
-        Ok((lines, raw)) if !lines.is_empty() => {
+    match crate::lyrics::fetch_lyrics_from_lrclib(
+        &meta.artist,
+        &meta.title,
+        &meta.album,
+        meta.length,
+    )
+    .await
+    {
+        Ok((lines, raw, ids)) if !lines.is_empty() => {
             state.update_lyrics(lines, meta, None, Some(Provider::Lrclib));
-            store_lyrics_in_cache(meta, raw, crate::lyrics::database::LyricsFormat::Lrclib).await;
+            store_lyrics_in_cache(
+                meta,
+                raw,
+                crate::lyrics::database::LyricsFormat::Lrclib,
+                ids.track_isrc.as_deref(),
+                ids.track_spotify_id.as_deref(),
+                ids.track_itunes_id.as_deref(),
+            )
+            .await;
             FetchResult::Success
         }
         Ok(_) => FetchResult::Transient,
@@ -190,16 +220,26 @@ async fn try_musixmatch(meta: &TrackMetadata, state: &mut StateBundle) -> FetchR
         &meta.album,
         meta.length,
         meta.spotify_id.as_deref(),
+        meta.isrc.as_deref(),
+        meta.itunes_id.as_deref(),
     )
     .await
     {
-        Ok((lines, raw)) if !lines.is_empty() => {
+        Ok((lines, raw, ids)) if !lines.is_empty() => {
             let provider = determine_musixmatch_provider(&lines, &raw);
             state.update_lyrics(lines, meta, None, Some(provider));
-            
+
             let format = provider_to_db_format(provider);
-            store_lyrics_in_cache(meta, raw, format).await;
-            
+            store_lyrics_in_cache(
+                meta,
+                raw,
+                format,
+                ids.track_isrc.as_deref(),
+                ids.track_spotify_id.as_deref(),
+                ids.track_itunes_id.as_deref(),
+            )
+            .await;
+
             FetchResult::Success
         }
         Ok(_) => FetchResult::Transient,
@@ -212,7 +252,10 @@ async fn try_musixmatch(meta: &TrackMetadata, state: &mut StateBundle) -> FetchR
 ///
 /// Richsync format includes word-level timestamps, while Subtitles format
 /// only has line-level timestamps.
-fn determine_musixmatch_provider(lines: &[crate::lyrics::LyricLine], raw: &Option<String>) -> Provider {
+fn determine_musixmatch_provider(
+    lines: &[crate::lyrics::LyricLine],
+    raw: &Option<String>,
+) -> Provider {
     let has_words = lines.iter().any(|l| l.words.is_some());
     let is_richsync = raw
         .as_deref()
@@ -249,7 +292,10 @@ fn detect_provider_from_raw(raw: &Option<String>) -> Option<Provider> {
             // JSON array - distinguish between richsync and subtitles
             // Richsync has word-level timing: "l":[...] or "words":[...]
             // Subtitles has line-level timing: "time":{"total":...}
-            if trimmed.contains("\"ts\":") || trimmed.contains("\"l\":[") || trimmed.contains("\"words\":[") {
+            if trimmed.contains("\"ts\":")
+                || trimmed.contains("\"l\":[")
+                || trimmed.contains("\"words\":[")
+            {
                 Provider::MusixmatchRichsync
             } else if trimmed.contains("\"time\":{") {
                 Provider::MusixmatchSubtitles
@@ -270,32 +316,48 @@ fn detect_provider_from_raw(raw: &Option<String>) -> Option<Provider> {
 /// Attempts to fetch lyrics from the database cache.
 ///
 /// Returns `true` if lyrics were found and loaded successfully.
-async fn try_database(
-    meta: &TrackMetadata,
-    state: &mut StateBundle,
-) -> bool {
+async fn try_database(meta: &TrackMetadata, state: &mut StateBundle) -> bool {
     let Some(db_result) = crate::lyrics::database::fetch_from_database(
         &meta.artist,
         &meta.title,
         &meta.album,
         meta.length,
-    ).await else {
+        meta.isrc.as_deref(),
+        meta.spotify_id.as_deref(),
+        meta.itunes_id.as_deref(),
+    )
+    .await
+    else {
         return false;
     };
 
     match db_result {
-        Ok((lines, raw)) if !lines.is_empty() => {
+        Ok((lines, raw, ids)) if !lines.is_empty() => {
+            let has_ids = ids.track_isrc.is_some()
+                || ids.track_spotify_id.is_some()
+                || ids.track_itunes_id.is_some();
             let provider = detect_provider_from_raw(&raw);
             let line_count = lines.len();
             state.update_lyrics(lines, meta, None, provider);
-            
+
             tracing::debug!(
                 title = %meta.title,
                 artist = %meta.artist,
                 lines = line_count,
+                has_ids,
                 "Database cache hit"
             );
-            true
+
+            if !has_ids {
+                tracing::debug!(
+                    title = %meta.title,
+                    artist = %meta.artist,
+                    "Cache entry has no track IDs, re-fetching from providers"
+                );
+                false
+            } else {
+                true
+            }
         }
         Ok(_) => {
             tracing::debug!(
@@ -329,11 +391,7 @@ async fn try_database(
 /// 4. On transient error: try next provider
 /// 5. On non-transient error: log, update state with error, return
 /// 6. If all fail: update state with empty lyrics
-async fn fetch_api_lyrics(
-    meta: &TrackMetadata,
-    state: &mut StateBundle,
-    providers: &[String],
-) {
+async fn fetch_api_lyrics(meta: &TrackMetadata, state: &mut StateBundle, providers: &[String]) {
     // Try database cache first
     if try_database(meta, state).await {
         return;
@@ -365,10 +423,7 @@ async fn fetch_api_lyrics(
 /// Fetches a fresh position from the player or estimates it.
 ///
 /// Falls back to estimation if D-Bus query fails or no service is provided.
-async fn fetch_fresh_position(
-    service: Option<&str>,
-    state: &StateBundle,
-) -> f64 {
+async fn fetch_fresh_position(service: Option<&str>, state: &StateBundle) -> f64 {
     let Some(svc) = service else {
         let estimated = state.player_state.estimate_position();
         tracing::debug!(
@@ -419,13 +474,13 @@ pub async fn fetch_and_update_lyrics(
 ) -> f64 {
     let position_before = state.player_state.estimate_position();
     let start_time = std::time::Instant::now();
-    
+
     fetch_api_lyrics(meta, state, providers).await;
-    
+
     let fetch_duration = start_time.elapsed();
     let position = fetch_fresh_position(service, state).await;
     let position_change = position - position_before;
-    
+
     // Note: position_change can be negative if user seeked backward during fetch,
     // or much larger than fetch_duration if user seeked forward.
     // It only represents actual time drift when no seeking occurred.
@@ -436,10 +491,10 @@ pub async fn fetch_and_update_lyrics(
         fetch_duration = ?fetch_duration,
         "Position updated after lyrics fetch"
     );
-    
+
     state.update_index(position);
     state.player_state.set_position(position);
-    
+
     position
 }
 
@@ -534,8 +589,8 @@ async fn handle_mpris_event(
         // Seeked events that arrive shortly after (within 0.5 seconds) are likely
         // stale events from track start that arrived during lyrics fetch.
         // After 0.5 seconds, user seeks should be processed normally.
-        if state.player_state.title == meta.title 
-            && state.player_state.artist == meta.artist 
+        if state.player_state.title == meta.title
+            && state.player_state.artist == meta.artist
             && state.has_lyrics()
             && let Some(loaded_at) = state.lyrics_loaded_at
         {
@@ -550,7 +605,7 @@ async fn handle_mpris_event(
                 return;
             }
         }
-        
+
         // Legitimate seek event - update position immediately
         state.player_state.set_position(position);
         state.update_index(position);
@@ -591,7 +646,7 @@ async fn handle_no_player(state: &mut StateBundle, update_tx: &mpsc::Sender<Upda
 async fn handle_new_track(ctx: NewTrackContext<'_>) {
     let NewTrackContext {
         meta,
-        position: _event_position,  // Ignored - often stale from previous track
+        position: _event_position, // Ignored - often stale from previous track
         service,
         playback_status,
         state,
@@ -600,7 +655,7 @@ async fn handle_new_track(ctx: NewTrackContext<'_>) {
     } = ctx;
 
     state.clear_lyrics();
-    
+
     // Update metadata immediately so first update has correct track info
     state.player_state.update_from_metadata(&meta);
 
@@ -608,7 +663,7 @@ async fn handle_new_track(ctx: NewTrackContext<'_>) {
     // (still from the previous track). We'll fetch a fresh position after lyrics.
     // Set position to 0 first to establish a clean anchor point.
     state.player_state.set_position(0.0);
-    
+
     if let Some(status) = playback_status {
         let playing = status == "Playing";
         if playing {
@@ -625,7 +680,7 @@ async fn handle_new_track(ctx: NewTrackContext<'_>) {
     // This will also fetch a FRESH position from D-Bus, avoiding the stale
     // event position from the previous track.
     let _ = fetch_and_update_lyrics(&meta, state, providers, Some(&service)).await;
-    
+
     // After fetching, send another forced update to refresh UI with lyrics
     send_update(state, update_tx, true).await;
 }

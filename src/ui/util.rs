@@ -17,7 +17,7 @@
 /// # Example
 /// ```ignore
 /// use crate::ui::util::{AsTrackId, track_id};
-/// 
+///
 /// let update = get_update();
 /// let id = track_id(&update);
 /// if last_id != Some(id) {
@@ -33,21 +33,13 @@ pub trait AsTrackId {
 
 impl AsTrackId for crate::state::Update {
     fn as_track_id(&self) -> (String, String, String) {
-        (
-            self.artist.clone(),
-            self.title.clone(),
-            self.album.clone(),
-        )
+        (self.artist.clone(), self.title.clone(), self.album.clone())
     }
 }
 
 impl AsTrackId for crate::mpris::TrackMetadata {
     fn as_track_id(&self) -> (String, String, String) {
-        (
-            self.artist.clone(),
-            self.title.clone(),
-            self.album.clone(),
-        )
+        (self.artist.clone(), self.title.clone(), self.album.clone())
     }
 }
 

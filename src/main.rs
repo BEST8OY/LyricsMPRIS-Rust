@@ -3,11 +3,11 @@ mod lyrics;
 mod mpris;
 mod pool;
 mod state;
-mod timer;
 mod text_utils;
+mod timer;
 mod ui;
 
-use crate::mpris::metadata::get_metadata;
+use crate::mpris::metadata::{get_metadata, set_isrc_enabled};
 use crate::mpris::playback::get_position;
 use clap::Parser;
 use std::error::Error;
@@ -53,6 +53,9 @@ pub struct Config {
     pub database: Option<String>,
     /// Cached current player service for efficient D-Bus queries
     pub player_service: Option<String>,
+    /// Enable ISRC lookup from metadata for musixmatch lyrics search
+    #[arg(long)]
+    pub isrc: bool,
 }
 
 impl Default for Config {
@@ -66,6 +69,7 @@ impl Default for Config {
             player_service: None,
             no_karaoke: false,
             visible_lines: None,
+            isrc: false,
         }
     }
 }
@@ -154,6 +158,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let mut cfg = Config::parse();
     providers_from_env_if_empty(&mut cfg);
+
+    set_isrc_enabled(cfg.isrc);
 
     initialize_database(&cfg).await;
 

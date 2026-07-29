@@ -19,13 +19,13 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use std::io::{self};
-use std::time::Instant;
-use std::pin::Pin;
-use tokio::time::Sleep;
-use tokio::sync::mpsc;
-use std::thread;
 use ratatui::{Terminal, backend::CrosstermBackend};
+use std::io::{self};
+use std::pin::Pin;
+use std::thread;
+use std::time::Instant;
+use tokio::sync::mpsc;
+use tokio::time::Sleep;
 
 /// UI state for the modern TUI mode
 pub struct ModernUIState {
@@ -153,7 +153,7 @@ pub async fn display_lyrics_modern(
 }
 
 /// Redraw the UI and reschedule the next timer wakeup.
-/// 
+///
 /// Consolidates the repeated pattern of:
 /// 1. Estimate current position based on elapsed time
 /// 2. Draw UI with estimated/actual update
@@ -199,13 +199,13 @@ fn redraw_and_reschedule<B: ratatui::backend::Backend>(
 fn update_cache_and_state(state: &mut ModernUIState, update: &Update) {
     // Explicitly clear old cache before creating new one to free memory immediately
     state.wrapped_cache = None;
-    
+
     state.last_update = Some(update.clone());
     state.last_update_instant = Some(Instant::now());
 }
 
 /// Encapsulates all logic for updating ModernUIState from an Update.
-/// 
+///
 /// Handles track changes, errors, and position-only updates intelligently.
 fn update_state(state: &mut ModernUIState, update: Option<Update>) {
     let Some(update) = update else {

@@ -1,7 +1,7 @@
 use serde::Deserialize;
 
 use crate::lyrics::parse::parse_synced_lyrics;
-use crate::lyrics::types::{http_client, LyricsError, ProviderResult};
+use crate::lyrics::types::{LyricsError, ProviderResult, TrackMatchInfo, http_client};
 
 #[derive(Deserialize)]
 #[allow(non_snake_case)]
@@ -20,32 +20,26 @@ pub async fn fetch_lyrics_from_lrclib(
     duration: Option<f64>,
 ) -> ProviderResult {
     let url = build_lrclib_url(artist, title, album, duration);
-    
-    let resp = http_client()
-        .get(&url)
-        .send()
-        .await?;
+
+    let resp = http_client().get(&url).send().await?;
 
     // 404 means no lyrics found - not an error
     if resp.status().as_u16() == 404 {
-        return Ok((Vec::new(), None));
+        return Ok((Vec::new(), None, TrackMatchInfo::default()));
     }
 
     if !resp.status().is_success() {
-        return Err(LyricsError::Api(format!(
-            "lrclib: HTTP {}",
-            resp.status()
-        )));
+        return Err(LyricsError::Api(format!("lrclib: HTTP {}", resp.status())));
     }
 
     let response: LrcLibResponse = resp.json().await?;
-    
+
     match response.syncedLyrics {
         Some(synced) if !synced.is_empty() => {
             let parsed = parse_synced_lyrics(&synced);
-            Ok((parsed, Some(synced)))
+            Ok((parsed, Some(synced), TrackMatchInfo::default()))
         }
-        _ => Ok((Vec::new(), None)),
+        _ => Ok((Vec::new(), None, TrackMatchInfo::default())),
     }
 }
 

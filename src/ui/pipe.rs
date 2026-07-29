@@ -7,11 +7,11 @@
 //! - Outputs plain text suitable for pipes and redirects
 
 use crate::pool;
-use tokio::sync::mpsc;
-use std::pin::Pin;
-use tokio::time::Sleep;
-use std::time::Instant;
 use crate::ui::estimate_update_and_next_sleep;
+use std::pin::Pin;
+use std::time::Instant;
+use tokio::sync::mpsc;
+use tokio::time::Sleep;
 
 /// State tracker for pipe mode output.
 struct PipeState {
@@ -61,11 +61,8 @@ impl PipeState {
         self.last_update_instant = Some(Instant::now());
 
         // Schedule next timer wakeup
-        let (_, next) = estimate_update_and_next_sleep(
-            &self.last_update,
-            self.last_update_instant,
-            true,
-        );
+        let (_, next) =
+            estimate_update_and_next_sleep(&self.last_update, self.last_update_instant, true);
         self.next_sleep = next;
     }
 
@@ -75,7 +72,7 @@ impl PipeState {
         if self.last_track_id.is_some() {
             println!();
         }
-        
+
         // Explicitly clear old update to free memory
         self.last_update = None;
         self.last_line_idx = None;
@@ -95,20 +92,18 @@ impl PipeState {
 
     /// Handle timer wakeup - estimate position and print new lines if changed.
     fn handle_timer_wakeup(&mut self) {
-        let (maybe_estimated, next) = estimate_update_and_next_sleep(
-            &self.last_update,
-            self.last_update_instant,
-            true,
-        );
+        let (maybe_estimated, next) =
+            estimate_update_and_next_sleep(&self.last_update, self.last_update_instant, true);
 
         if let Some(estimated) = maybe_estimated {
             // Print if line index has advanced
             if estimated.index != self.last_line_idx {
                 if let Some(idx) = estimated.index
-                    && let Some(line) = estimated.lines.get(idx) {
-                        println!("{}", line.text);
-                        self.last_track_had_lyric = true;
-                    }
+                    && let Some(line) = estimated.lines.get(idx)
+                {
+                    println!("{}", line.text);
+                    self.last_track_had_lyric = true;
+                }
                 self.last_line_idx = estimated.index;
 
                 // Update stored update to the estimated one
