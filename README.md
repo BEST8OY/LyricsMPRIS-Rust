@@ -54,6 +54,7 @@ Make sure your Linux environment has:
 - **Rust Toolchain** (1.70+): Install via [rustup.rs](https://rustup.rs)
 - **D-Bus** development libraries (usually pre-installed on most modern Linux desktop systems)
 - **playerctld** (recommended for tracking the active MPRIS target player)
+- **lofty**-compatible audio files (FLAC, MP3, MP4, OGG — for `--isrc` mode)
 
 ### Build from Source
 ```bash
@@ -77,6 +78,9 @@ The optimized executable binary will be available at `./target/release/lyricsmpr
 # Run with local database caching enabled
 ./target/release/lyricsmpris --database ~/.local/share/lyricsmpris/cache.db
 
+# Enable ISRC-based track matching (reads ISRC from local audio files)
+./target/release/lyricsmpris --isrc
+
 # Disable word-level karaoke highlight mode
 ./target/release/lyricsmpris --no-karaoke
 
@@ -95,13 +99,14 @@ The optimized executable binary will be available at `./target/release/lyricsmpr
 
 | Command-line Argument | Description | Example |
 | :--- | :--- | :--- |
-| `-d`, `--database <PATH>` | Paths to SQLite local cache file | `--database ~/.cache/lyrics.db` |
+| `-d`, `--database <PATH>` | Path to SQLite local cache file | `--database ~/.cache/lyrics.db` |
 | `-p`, `--providers <LIST>` | Comma-separated list to prioritize providers | `--providers musixmatch,lrclib` |
 | `-v`, `--visible-lines <NUM>` | Limits visible TUI lyric lines (compact view) | `--visible-lines 3` |
 | `--no-karaoke` | Disables word-by-word highlighted playback | `--no-karaoke` |
 | `--pipe` | Launches in CLI pipe mode instead of TUI | `--pipe` |
 | `-b`, `--block <LIST>` | Comma-separated player names to ignore | `--block chromium,firefox` |
 | `--target <LIST>` | Listen only to specific MPRIS services | `--target spotify,mpv` |
+| `--isrc` | Enable ISRC-based track matching (reads from local file metadata) | `--isrc` |
 
 ### Environment Variables
 Configure default parameters and authentication credentials in your shell startup file (e.g., `~/.bashrc` or `~/.zshrc`):
@@ -171,10 +176,15 @@ CREATE TABLE lyrics (
     album TEXT NOT NULL,
     duration REAL,
     format TEXT NOT NULL,
-    raw_lyrics BLOB NOT NULL
+    raw_lyrics BLOB NOT NULL,
+    isrc TEXT,
+    spotify_id TEXT,
+    itunes_id TEXT
 );
 
 CREATE INDEX idx_lookup ON lyrics(artist, title, album);
+CREATE INDEX IF NOT EXISTS idx_isrc ON lyrics(isrc);
+CREATE INDEX IF NOT EXISTS idx_spotify_id ON lyrics(spotify_id);
 ```
 
 ### Storage Efficiency
@@ -218,11 +228,10 @@ src/
 │   ├── providers/      # Integration with LRCLIB & Musixmatch APIs
 │   ├── database.rs     # SQLite caching engine & Zstd compression
 │   ├── parse.rs        # LRC, Richsync, and line Subtitle parsers
-│   ├── similarity.rs   # Fuzzy string matching logic
 │   └── types.rs        # Lyric data models & Error types
 ├── mpris/              # MPRIS D-Bus interfaces
 │   ├── events.rs       # D-Bus player signals
-│   ├── metadata.rs     # Metadata extraction
+│   ├── metadata.rs     # Metadata extraction (incl. local file ISRC via lofty)
 │   └── playback.rs     # Player controls & position retrieval
 ├── ui/                 # Frontend interfaces
 │   ├── modern.rs       # Modern Ratatui-based TUI

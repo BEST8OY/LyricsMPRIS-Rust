@@ -24,3 +24,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 zstd = "0.13"
+lofty = "0.24"
