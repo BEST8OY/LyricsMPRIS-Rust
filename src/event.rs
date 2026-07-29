@@ -145,11 +145,15 @@ async fn store_lyrics_in_cache(
     meta: &TrackMetadata,
     raw: Option<String>,
     format: crate::lyrics::database::LyricsFormat,
-    isrc: Option<&str>,
-    spotify_id: Option<&str>,
-    itunes_id: Option<&str>,
+    provider_isrc: Option<&str>,
+    provider_spotify_id: Option<&str>,
+    provider_itunes_id: Option<&str>,
 ) {
     if let Some(raw_text) = raw {
+        let isrc = provider_isrc.or(meta.isrc.as_deref());
+        let spotify_id = provider_spotify_id.or(meta.spotify_id.as_deref());
+        let itunes_id = provider_itunes_id.or(meta.itunes_id.as_deref());
+
         crate::lyrics::database::store_in_database(
             &meta.artist,
             &meta.title,
@@ -177,15 +181,15 @@ async fn try_lrclib(meta: &TrackMetadata, state: &mut StateBundle) -> FetchResul
     )
     .await
     {
-        Ok((lines, raw, _ids)) if !lines.is_empty() => {
+        Ok((lines, raw, ids)) if !lines.is_empty() => {
             state.update_lyrics(lines, meta, None, Some(Provider::Lrclib));
             store_lyrics_in_cache(
                 meta,
                 raw,
                 crate::lyrics::database::LyricsFormat::Lrclib,
-                None,
-                None,
-                None,
+                ids.track_isrc.as_deref(),
+                ids.track_spotify_id.as_deref(),
+                ids.track_itunes_id.as_deref(),
             )
             .await;
             FetchResult::Success

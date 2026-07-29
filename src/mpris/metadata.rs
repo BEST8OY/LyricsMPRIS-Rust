@@ -4,7 +4,9 @@ use crate::mpris::connection::{MprisError, get_dbus_conn};
 use lofty::file::TaggedFileExt;
 use lofty::prelude::ItemKey;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::task::block_in_place;
 use zbus::{proxy, zvariant};
 use zvariant::{OwnedValue, Type};
 
@@ -58,9 +60,9 @@ struct MprisMetadata {
 fn get_isrc_from_file(file_url: &str) -> Option<String> {
     let path = file_url.strip_prefix("file://")?;
     let decoded = urlencoding::decode(path).ok()?;
-    let path_str = decoded.as_ref();
+    let path_buf = PathBuf::from(decoded.as_ref());
 
-    let tagged_file = lofty::read_from_path(path_str).ok()?;
+    let tagged_file = block_in_place(move || lofty::read_from_path(path_buf)).ok()?;
     for tag in tagged_file.tags() {
         for item in tag.items() {
             if matches!(item.key(), ItemKey::Isrc) {
@@ -76,15 +78,47 @@ fn get_isrc_from_file(file_url: &str) -> Option<String> {
     None
 }
 
+fn normalize_spotify_id(id: &str) -> Option<String> {
+    let id = id.trim();
+    if id.len() != 22 {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+fn normalize_spotify_url(url: &str) -> Option<String> {
+    let prefix = "https://open.spotify.com/track/";
+    if let Some(idx) = url.find(prefix) {
+        let id_part = &url[idx + prefix.len()..];
+        let id_part = id_part.split('?').next().unwrap_or("");
+        return normalize_spotify_id(id_part);
+    }
+    None
+}
+
+fn normalize_spotify_trackid(trackid: &str) -> Option<String> {
+    if let Some(id) = trackid.rsplit('/').next().filter(|id| !id.is_empty()) {
+        return normalize_spotify_id(id);
+    }
+    if let Some(idx) = trackid.find("spotify:track:") {
+        let id = &trackid[idx + "spotify:track:".len()..];
+        return normalize_spotify_id(id);
+    }
+    None
+}
+
 /// Try to get ISRC from the local audio file.
 ///
 /// Returns the ISRC code string if found in the file's metadata, or None.
 fn isrc_from_metadata(url: Option<&str>) -> Option<String> {
     let file_url = url?;
-    if !file_url.starts_with("file://") {
-        return None;
+    if let Some(stripped) = file_url.strip_prefix("file://") {
+        return get_isrc_from_file(stripped);
     }
-    get_isrc_from_file(file_url)
+    if file_url.starts_with('/') {
+        return get_isrc_from_file(file_url);
+    }
+    None
 }
 
 impl From<MprisMetadata> for TrackMetadata {
@@ -107,29 +141,8 @@ impl From<MprisMetadata> for TrackMetadata {
         let spotify_id = md
             .url
             .as_ref()
-            .and_then(|u| {
-                if let Some(idx) = u.find("https://open.spotify.com/track/") {
-                    let id = &u[idx + "https://open.spotify.com/track/".len()..];
-                    if !id.is_empty() {
-                        return Some(id.to_string());
-                    }
-                }
-                None
-            })
-            .or_else(|| {
-                md.trackid.as_ref().and_then(|trackid| {
-                    trackid
-                        .rsplit('/')
-                        .next()
-                        .filter(|id| !id.is_empty())
-                        .map(|id| id.to_string())
-                        .or_else(|| {
-                            trackid
-                                .find("spotify:track:")
-                                .map(|idx| trackid[idx + "spotify:track:".len()..].to_string())
-                        })
-                })
-            });
+.and_then(|u| normalize_spotify_url(u))
+        .or_else(|| md.trackid.as_ref().and_then(|trackid| normalize_spotify_trackid(trackid)));
 
         let isrc = if isrc_enabled() {
             isrc_from_metadata(md.url.as_deref())
@@ -203,29 +216,8 @@ pub fn extract_metadata(map: &HashMap<String, OwnedValue>) -> TrackMetadata {
     // then fall back to mpris:trackid (/com/spotify/track/ID or spotify:track:ID).
     let spotify_id = url
         .as_ref()
-        .and_then(|u| {
-            if let Some(idx) = u.find("https://open.spotify.com/track/") {
-                let id = &u[idx + "https://open.spotify.com/track/".len()..];
-                if !id.is_empty() {
-                    return Some(id.to_string());
-                }
-            }
-            None
-        })
-        .or_else(|| {
-            get_string("mpris:trackid").and_then(|trackid| {
-                trackid
-                    .rsplit('/')
-                    .next()
-                    .filter(|id| !id.is_empty())
-                    .map(|id| id.to_string())
-                    .or_else(|| {
-                        trackid
-                            .find("spotify:track:")
-                            .map(|idx| trackid[idx + "spotify:track:".len()..].to_string())
-                    })
-            })
-        });
+        .and_then(|u| normalize_spotify_url(u))
+        .or_else(|| get_string("mpris:trackid").and_then(|trackid| normalize_spotify_trackid(&trackid)));
 
     let isrc = if isrc_enabled() {
         isrc_from_metadata(url.as_deref())

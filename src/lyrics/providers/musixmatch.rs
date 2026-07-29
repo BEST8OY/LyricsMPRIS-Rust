@@ -68,6 +68,29 @@ fn get_root_status_code(json: &Value) -> Option<i64> {
         .and_then(|v| v.as_i64())
 }
 
+fn extract_string_or_int(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(String::from)
+        .or_else(|| value.as_i64().map(|i| i.to_string()))
+}
+
+fn extract_first_string_from_array(value: &Value) -> Option<String> {
+    value
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|v| extract_string_or_int(v))
+}
+
+fn extract_first_string_from_nested_array(value: &Value) -> Option<String> {
+    value
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_array())
+        .and_then(|inner| inner.first())
+        .and_then(|v| extract_string_or_int(v))
+}
+
 /// Returns true if the status code indicates a token/auth/quota/rate-limit error.
 fn is_token_error_code(code: i64) -> bool {
     matches!(code, 401 | 402 | 403 | 429)
@@ -94,14 +117,11 @@ fn is_success(macro_calls: &Value, endpoint: &str) -> bool {
 fn extract_track_ids_from_json(track: &Value) -> TrackMatchInfo {
     let itunes_id = track
         .get("track_itunes_id")
-        .and_then(|v| v.as_str().map(String::from))
+        .and_then(|v| extract_string_or_int(v))
         .or_else(|| {
             track
                 .get("commontrack_itunes_ids")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|v| v.as_i64())
-                .map(|id| id.to_string())
+                .and_then(|v| extract_first_string_from_array(v))
         });
 
     let isrc = track
@@ -110,12 +130,10 @@ fn extract_track_ids_from_json(track: &Value) -> TrackMatchInfo {
         .or_else(|| {
             track
                 .get("commontrack_isrcs")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|v| v.as_array())
-                .and_then(|inner| inner.first())
-                .and_then(|v| v.as_str())
-                .map(String::from)
+                .and_then(|v| {
+                    extract_first_string_from_array(v)
+                        .or_else(|| extract_first_string_from_nested_array(v))
+                })
         });
 
     let spotify_id = track
@@ -124,10 +142,7 @@ fn extract_track_ids_from_json(track: &Value) -> TrackMatchInfo {
         .or_else(|| {
             track
                 .get("commontrack_spotify_ids")
-                .and_then(|v| v.as_array())
-                .and_then(|arr| arr.first())
-                .and_then(|v| v.as_str())
-                .map(String::from)
+                .and_then(|v| extract_first_string_from_array(v))
         });
 
     TrackMatchInfo {
