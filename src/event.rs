@@ -332,10 +332,7 @@ async fn try_database(meta: &TrackMetadata, state: &mut StateBundle) -> bool {
     };
 
     match db_result {
-        Ok((lines, raw, ids)) if !lines.is_empty() => {
-            let has_ids = ids.track_isrc.is_some()
-                || ids.track_spotify_id.is_some()
-                || ids.track_itunes_id.is_some();
+        Ok((lines, raw, _ids)) if !lines.is_empty() => {
             let provider = detect_provider_from_raw(&raw);
             let line_count = lines.len();
             state.update_lyrics(lines, meta, None, provider);
@@ -344,20 +341,10 @@ async fn try_database(meta: &TrackMetadata, state: &mut StateBundle) -> bool {
                 title = %meta.title,
                 artist = %meta.artist,
                 lines = line_count,
-                has_ids,
                 "Database cache hit"
             );
 
-            if !has_ids {
-                tracing::debug!(
-                    title = %meta.title,
-                    artist = %meta.artist,
-                    "Cache entry has no track IDs, re-fetching from providers"
-                );
-                false
-            } else {
-                true
-            }
+            true
         }
         Ok(_) => {
             tracing::debug!(

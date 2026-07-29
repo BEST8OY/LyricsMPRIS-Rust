@@ -172,10 +172,7 @@ async fn create_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
-    // Migrate existing tables: add missing columns if they don't exist
-    ensure_column_exists(pool, "isrc", "ALTER TABLE lyrics ADD COLUMN isrc TEXT").await?;
-    ensure_column_exists(pool, "spotify_id", "ALTER TABLE lyrics ADD COLUMN spotify_id TEXT").await?;
-    ensure_column_exists(pool, "itunes_id", "ALTER TABLE lyrics ADD COLUMN itunes_id TEXT").await?;
+    // Assume current schema; do not perform runtime migrations for legacy compatibility
 
     // Create index for fast lookups by artist/title/album
     sqlx::query(
@@ -215,21 +212,7 @@ async fn create_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-async fn ensure_column_exists(
-    pool: &SqlitePool,
-    column_name: &str,
-    ddl: &str,
-) -> Result<(), sqlx::Error> {
-    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('lyrics')")
-        .fetch_all(pool)
-        .await?;
-
-    if !columns.iter().any(|c| c.eq_ignore_ascii_case(column_name)) {
-        sqlx::query(ddl).execute(pool).await?;
-    }
-
-    Ok(())
-}
+// `ensure_column_exists` removed: the application no longer performs runtime schema migrations.
 
 /// Opens or creates a SQLite database connection pool.
 async fn open_database(path: &Path) -> Result<SqlitePool, sqlx::Error> {
@@ -563,59 +546,12 @@ async fn process_db_row(
         }
     };
 
-    if result.is_some() {
-        backfill_track_ids(
-            pool,
-            artist_norm,
-            title_norm,
-            album_norm,
-            isrc,
-            spotify_id,
-            itunes_id,
-            &entry,
-        )
-        .await;
-    }
+    // No backfilling of track IDs for legacy rows; accept parsed entry as-is
 
     result
 }
 
-async fn backfill_track_ids(
-    pool: &SqlitePool,
-    artist_norm: &str,
-    title_norm: &str,
-    album_norm: &str,
-    isrc: Option<&str>,
-    spotify_id: Option<&str>,
-    itunes_id: Option<&str>,
-    entry: &LyricsEntry,
-) {
-    let has_new_isrc = isrc.is_some() && entry.isrc.is_none();
-    let has_new_spotify = spotify_id.is_some() && entry.spotify_id.is_none();
-    let has_new_itunes = itunes_id.is_some() && entry.itunes_id.is_none();
-
-    if !(has_new_isrc || has_new_spotify || has_new_itunes) {
-        return;
-    }
-
-    let _ = sqlx::query(
-        r#"
-        UPDATE lyrics SET
-            isrc = COALESCE(?, isrc),
-            spotify_id = COALESCE(?, spotify_id),
-            itunes_id = COALESCE(?, itunes_id)
-        WHERE artist = ? AND title = ? AND album = ?
-        "#,
-    )
-    .bind(isrc.map(normalize_isrc).as_deref())
-    .bind(spotify_id)
-    .bind(itunes_id)
-    .bind(artist_norm)
-    .bind(title_norm)
-    .bind(album_norm)
-    .execute(pool)
-    .await;
-}
+// backfill_track_ids removed: no runtime mutation of existing DB rows
 
 /// Stores lyrics in the database.
 ///
