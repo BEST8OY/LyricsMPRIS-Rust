@@ -356,7 +356,25 @@ pub async fn fetch_from_database(
     let title_norm = normalize(title);
     let album_norm = normalize(album);
 
-    // Try lookup by artist/title/album first
+    // Try lookup by ISRC first (most reliable unique identifier)
+    if let Some(id) = isrc {
+        let id_norm = normalize(id);
+        let row = sqlx::query(
+            r#"
+            SELECT duration, format, raw_lyrics, isrc, spotify_id, itunes_id
+            FROM lyrics
+            WHERE isrc = ?
+            LIMIT 1
+            "#,
+        )
+        .bind(&id_norm)
+        .fetch_optional(pool)
+        .await
+        .ok()??;
+        return process_db_row(&row, duration, &artist_norm, &title_norm, &album_norm, pool).await;
+    }
+
+    // Fallback: try lookup by artist/title/album
     let row = sqlx::query(
         r#"
         SELECT duration, format, raw_lyrics, isrc, spotify_id, itunes_id
@@ -377,24 +395,7 @@ pub async fn fetch_from_database(
         return result;
     }
 
-    // Fallback: try lookup by track identifiers
-    if let Some(id) = isrc {
-        let id_norm = normalize(id);
-        let row = sqlx::query(
-            r#"
-            SELECT duration, format, raw_lyrics, isrc, spotify_id, itunes_id
-            FROM lyrics
-            WHERE isrc = ?
-            LIMIT 1
-            "#,
-        )
-        .bind(&id_norm)
-        .fetch_optional(pool)
-        .await
-        .ok()??;
-        return process_db_row(&row, duration, &artist_norm, &title_norm, &album_norm, pool).await;
-    }
-
+    // Fallback: try lookup by Spotify ID
     if let Some(id) = spotify_id {
         let id_norm = normalize(id);
         let row = sqlx::query(
@@ -412,6 +413,7 @@ pub async fn fetch_from_database(
         return process_db_row(&row, duration, &artist_norm, &title_norm, &album_norm, pool).await;
     }
 
+    // Fallback: try lookup by iTunes ID
     if let Some(id) = itunes_id {
         let id_norm = normalize(id);
         let row = sqlx::query(
