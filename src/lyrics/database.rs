@@ -164,11 +164,11 @@ async fn create_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
-    // Create index for fast lookups by artist/title/album
+    // Create index for fast lookups by artist/title/album/duration
     sqlx::query(
         r#"
-        CREATE INDEX IF NOT EXISTS idx_lookup 
-        ON lyrics(artist, title, album)
+        CREATE INDEX IF NOT EXISTS idx_lookup
+        ON lyrics(artist, title, album, duration)
         "#,
     )
     .execute(pool)
@@ -374,18 +374,19 @@ pub async fn fetch_from_database(
         return process_db_row(&row, duration, &artist_norm, &title_norm, &album_norm, pool).await;
     }
 
-    // Fallback: try lookup by artist/title/album
+    // Fallback: try lookup by artist/title/album + duration
     let row = sqlx::query(
         r#"
         SELECT duration, format, raw_lyrics, isrc, spotify_id, itunes_id
         FROM lyrics
-        WHERE artist = ? AND title = ? AND album = ?
+        WHERE artist = ? AND title = ? AND album = ? AND duration = ?
         LIMIT 1
         "#,
     )
     .bind(&artist_norm)
     .bind(&title_norm)
     .bind(&album_norm)
+    .bind(duration)
     .fetch_optional(pool)
     .await
     .ok()??;

@@ -197,7 +197,7 @@ CREATE INDEX IF NOT EXISTS idx_spotify_id ON lyrics(spotify_id);
 When fetching lyrics, the database uses the following priority order:
 
 1. **ISRC** — exact match on ISRC code (most reliable unique identifier)
-2. **Artist + Title + Album** — fallback if no ISRC match
+2. **Artist + Title + Album + Duration** — fallback if no ISRC match
 3. **Spotify ID** — fallback via stored Spotify track ID
 4. **iTunes ID** — fallback via stored iTunes track ID
 
