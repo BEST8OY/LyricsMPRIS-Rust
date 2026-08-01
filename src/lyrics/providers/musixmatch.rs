@@ -6,10 +6,57 @@ use std::sync::Mutex;
 
 use crate::lyrics::types::{LyricLine, LyricsError, ProviderResult, TrackMatchInfo, http_client};
 
-/// Round-robin token manager for multiple Musixmatch usertokens
+const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Electron/1.7.6 Safari/537.36";
+
+/// Requests a fresh anonymous Musixmatch user token directly from the API (`token.get`).
+pub async fn fetch_fresh_musixmatch_token(client: &Client) -> Result<String, LyricsError> {
+    let url = "https://apic-desktop.musixmatch.com/ws/1.1/token.get?app_id=web-desktop-app-v1.0";
+    let resp = client
+        .get(url)
+        .header("User-Agent", DEFAULT_USER_AGENT)
+        .header("Cookie", "x-mxm-token-guid=")
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Err(LyricsError::Api(format!(
+            "Failed to get Musixmatch token: HTTP {}",
+            resp.status()
+        )));
+    }
+
+    let json: Value = resp.json().await?;
+    let code = get_root_status_code(&json).unwrap_or(0);
+    if code != 200 {
+        return Err(LyricsError::Api(format!(
+            "Musixmatch token.get status {}",
+            code
+        )));
+    }
+
+    let token = json
+        .pointer("/message/body/user_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    match token {
+        Some(t) => {
+            tracing::debug!(token_prefix = %&t[..t.len().min(8)], "Obtained fresh Musixmatch user token");
+            Ok(t)
+        }
+        None => Err(LyricsError::Api(
+            "Missing user_token in Musixmatch token.get response".to_string(),
+        )),
+    }
+}
+
+/// Round-robin token manager for multiple Musixmatch usertokens,
+/// with automatic dynamic fallback via token.get API.
 struct TokenManager {
     tokens: Vec<String>,
     current_index: usize,
+    cached_dynamic_token: Option<String>,
 }
 
 impl TokenManager {
@@ -28,12 +75,17 @@ impl TokenManager {
         TokenManager {
             tokens,
             current_index: 0,
+            cached_dynamic_token: None,
         }
     }
 
-    /// Get the next token in round-robin fashion.
-    /// Returns None if no tokens are configured.
-    fn next_token(&mut self) -> Option<String> {
+    /// Returns available configured env tokens count.
+    fn env_token_count(&self) -> usize {
+        self.tokens.len()
+    }
+
+    /// Get the next env token in round-robin fashion if available.
+    fn next_env_token(&mut self) -> Option<String> {
         if self.tokens.is_empty() {
             return None;
         }
@@ -42,14 +94,19 @@ impl TokenManager {
         self.current_index = (self.current_index + 1) % self.tokens.len();
         Some(token)
     }
+
+    /// Get cached dynamic token if present.
+    fn get_dynamic_token(&self) -> Option<String> {
+        self.cached_dynamic_token.clone()
+    }
+
+    /// Update cached dynamic token.
+    fn set_dynamic_token(&mut self, token: String) {
+        self.cached_dynamic_token = Some(token);
+    }
 }
 
 static TOKEN_MANAGER: Lazy<Mutex<TokenManager>> = Lazy::new(|| Mutex::new(TokenManager::new()));
-
-/// Get the next token from the round-robin manager
-fn get_next_token() -> Option<String> {
-    TOKEN_MANAGER.lock().ok()?.next_token()
-}
 
 /// Outcome of a single token's fetch attempt.
 #[derive(Debug)]
@@ -69,17 +126,23 @@ fn get_root_status_code(json: &Value) -> Option<i64> {
 }
 
 fn extract_string_or_int(value: &Value) -> Option<String> {
-    value
+    let s = value
         .as_str()
         .map(String::from)
-        .or_else(|| value.as_i64().map(|i| i.to_string()))
+        .or_else(|| value.as_i64().map(|i| i.to_string()))?;
+    let trimmed = s.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn extract_first_string_from_array(value: &Value) -> Option<String> {
     value
         .as_array()
         .and_then(|arr| arr.first())
-        .and_then(|v| extract_string_or_int(v))
+        .and_then(extract_string_or_int)
 }
 
 fn extract_first_string_from_nested_array(value: &Value) -> Option<String> {
@@ -88,7 +151,7 @@ fn extract_first_string_from_nested_array(value: &Value) -> Option<String> {
         .and_then(|arr| arr.first())
         .and_then(|v| v.as_array())
         .and_then(|inner| inner.first())
-        .and_then(|v| extract_string_or_int(v))
+        .and_then(extract_string_or_int)
 }
 
 /// Returns true if the status code indicates a token/auth/quota/rate-limit error.
@@ -117,32 +180,30 @@ fn is_success(macro_calls: &Value, endpoint: &str) -> bool {
 fn extract_track_ids_from_json(track: &Value) -> TrackMatchInfo {
     let itunes_id = track
         .get("track_itunes_id")
-        .and_then(|v| extract_string_or_int(v))
+        .and_then(extract_string_or_int)
         .or_else(|| {
             track
                 .get("commontrack_itunes_ids")
-                .and_then(|v| extract_first_string_from_array(v))
+                .and_then(extract_first_string_from_array)
         });
 
     let isrc = track
         .get("track_isrc")
-        .and_then(|v| v.as_str().map(String::from))
+        .and_then(extract_string_or_int)
         .or_else(|| {
-            track
-                .get("commontrack_isrcs")
-                .and_then(|v| {
-                    extract_first_string_from_array(v)
-                        .or_else(|| extract_first_string_from_nested_array(v))
-                })
+            track.get("commontrack_isrcs").and_then(|v| {
+                extract_first_string_from_array(v)
+                    .or_else(|| extract_first_string_from_nested_array(v))
+            })
         });
 
     let spotify_id = track
         .get("track_spotify_id")
-        .and_then(|v| v.as_str().map(String::from))
+        .and_then(extract_string_or_int)
         .or_else(|| {
             track
                 .get("commontrack_spotify_ids")
-                .and_then(|v| extract_first_string_from_array(v))
+                .and_then(extract_first_string_from_array)
         });
 
     TrackMatchInfo {
@@ -179,6 +240,7 @@ async fn try_macro_for_lyrics(
 
     let macro_resp = client
         .get(&macro_url)
+        .header("User-Agent", DEFAULT_USER_AGENT)
         .header("Cookie", "x-mxm-token-guid=")
         .send()
         .await?;
@@ -239,6 +301,7 @@ async fn try_macro_for_lyrics(
 }
 
 /// Fetch lyrics with a single token.
+#[allow(clippy::too_many_arguments)]
 async fn fetch_lyrics_with_token(
     client: &Client,
     token: &str,
@@ -325,6 +388,7 @@ async fn fetch_lyrics_with_token(
     let matcher_url = matcher_base.to_string() + &matcher_params.join("&");
     let matcher_resp = client
         .get(&matcher_url)
+        .header("User-Agent", DEFAULT_USER_AGENT)
         .header("Cookie", "x-mxm-token-guid=")
         .send()
         .await?;
@@ -405,11 +469,14 @@ async fn fetch_lyrics_with_token(
     Ok(FetchOutcome::TrackNotFound)
 }
 
-/// Fetch lyrics using Musixmatch desktop
-/// Fetch lyrics using Musixmatch desktop "usertoken" (apic-desktop.musixmatch.com).
+/// Fetch lyrics using Musixmatch desktop usertoken (apic-desktop.musixmatch.com).
 ///
-/// Supports multiple usertokens (comma-separated in MUSIXMATCH_USERTOKEN env var)
-/// and uses them in a round-robin fashion.
+/// Multi-tier token strategy:
+/// 1. Tries user-configured tokens from `MUSIXMATCH_USERTOKEN` env var in round-robin fashion.
+/// 2. If no env tokens are configured or all return token errors, automatically fetches
+///    an anonymous user token via `token.get`.
+/// 3. If a token error (401/402/403/429) occurs on the dynamic token, automatically
+///    requests a fresh token and retries once transparently.
 pub async fn fetch_lyrics_from_musixmatch_usertoken(
     artist: &str,
     title: &str,
@@ -419,69 +486,139 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
     track_isrc: Option<&str>,
     track_itunes_id: Option<&str>,
 ) -> ProviderResult {
-    let total_tokens = {
+    let client = http_client();
+    let env_token_count = {
         let manager = TOKEN_MANAGER.lock().ok();
-        manager.map(|m| m.tokens.len()).unwrap_or(0)
+        manager.map(|m| m.env_token_count()).unwrap_or(0)
     };
 
-    if total_tokens == 0 {
-        return Ok((Vec::new(), None, TrackMatchInfo::default()));
-    }
+    // 1. Try env tokens in round-robin fashion if configured
+    if env_token_count > 0 {
+        let mut attempts = 0;
+        while attempts < env_token_count {
+            let token = {
+                let mut manager = TOKEN_MANAGER.lock().ok();
+                manager.as_mut().and_then(|m| m.next_env_token())
+            };
+            let Some(token) = token else { break };
 
-    let client = http_client();
-    let mut attempts = 0;
-
-    while attempts < total_tokens {
-        let token = match get_next_token() {
-            Some(t) => t,
-            None => break,
-        };
-
-        attempts += 1;
-
-        match fetch_lyrics_with_token(
-            client,
-            &token,
-            artist,
-            title,
-            album,
-            duration,
-            track_spotify_id,
-            track_isrc,
-            track_itunes_id,
-        )
-        .await
-        {
-            Ok(FetchOutcome::Success(parsed, raw, ids)) => {
-                return Ok((parsed, raw, ids));
-            }
-            Ok(FetchOutcome::TrackNotFound) => {
-                // The track genuinely doesn't exist or doesn't have lyrics, no need to retry on other tokens
-                return Ok((Vec::new(), None, TrackMatchInfo::default()));
-            }
-            Ok(FetchOutcome::TokenError(reason)) => {
-                tracing::warn!(
-                    attempt = attempts,
-                    total = total_tokens,
-                    reason = %reason,
-                    "Musixmatch token error, attempting fallback to next token in round-robin"
-                );
-                continue;
-            }
-            Err(e) => {
-                // If it's a network error, treat it as a transient error and fallback
-                tracing::warn!(
-                    attempt = attempts,
-                    total = total_tokens,
-                    error = %e,
-                    "Musixmatch request failed, attempting fallback to next token in round-robin"
-                );
-                continue;
+            attempts += 1;
+            match fetch_lyrics_with_token(
+                client,
+                &token,
+                artist,
+                title,
+                album,
+                duration,
+                track_spotify_id,
+                track_isrc,
+                track_itunes_id,
+            )
+            .await
+            {
+                Ok(FetchOutcome::Success(parsed, raw, ids)) => {
+                    return Ok((parsed, raw, ids));
+                }
+                Ok(FetchOutcome::TrackNotFound) => {
+                    return Ok((Vec::new(), None, TrackMatchInfo::default()));
+                }
+                Ok(FetchOutcome::TokenError(reason)) => {
+                    tracing::warn!(
+                        attempt = attempts,
+                        total = env_token_count,
+                        reason = %reason,
+                        "Musixmatch env token error, attempting fallback to next token"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        attempt = attempts,
+                        total = env_token_count,
+                        error = %e,
+                        "Musixmatch request failed with env token, trying next token"
+                    );
+                }
             }
         }
     }
 
-    Ok((Vec::new(), None, TrackMatchInfo::default()))
+    // 2. Fallback to dynamic token (via token.get API)
+    let dynamic_token = {
+        let cached = TOKEN_MANAGER
+            .lock()
+            .ok()
+            .and_then(|m| m.get_dynamic_token());
+        match cached {
+            Some(t) => t,
+            None => match fetch_fresh_musixmatch_token(client).await {
+                Ok(fresh) => {
+                    if let Ok(mut m) = TOKEN_MANAGER.lock() {
+                        m.set_dynamic_token(fresh.clone());
+                    }
+                    fresh
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to auto-fetch dynamic Musixmatch token");
+                    return Ok((Vec::new(), None, TrackMatchInfo::default()));
+                }
+            },
+        }
+    };
+
+    match fetch_lyrics_with_token(
+        client,
+        &dynamic_token,
+        artist,
+        title,
+        album,
+        duration,
+        track_spotify_id,
+        track_isrc,
+        track_itunes_id,
+    )
+    .await
+    {
+        Ok(FetchOutcome::Success(parsed, raw, ids)) => Ok((parsed, raw, ids)),
+        Ok(FetchOutcome::TrackNotFound) => Ok((Vec::new(), None, TrackMatchInfo::default())),
+        Ok(FetchOutcome::TokenError(reason)) => {
+            tracing::warn!(
+                reason = %reason,
+                "Dynamic Musixmatch token error, requesting fresh token and retrying"
+            );
+            // 3. Renew dynamic token and retry once
+            match fetch_fresh_musixmatch_token(client).await {
+                Ok(fresh) => {
+                    if let Ok(mut m) = TOKEN_MANAGER.lock() {
+                        m.set_dynamic_token(fresh.clone());
+                    }
+                    match fetch_lyrics_with_token(
+                        client,
+                        &fresh,
+                        artist,
+                        title,
+                        album,
+                        duration,
+                        track_spotify_id,
+                        track_isrc,
+                        track_itunes_id,
+                    )
+                    .await
+                    {
+                        Ok(FetchOutcome::Success(parsed, raw, ids)) => Ok((parsed, raw, ids)),
+                        _ => Ok((Vec::new(), None, TrackMatchInfo::default())),
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to renew dynamic Musixmatch token");
+                    Ok((Vec::new(), None, TrackMatchInfo::default()))
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Musixmatch request failed with dynamic token");
+            Ok((Vec::new(), None, TrackMatchInfo::default()))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -497,22 +634,31 @@ mod tests {
                 "token3".to_string(),
             ],
             current_index: 0,
+            cached_dynamic_token: None,
         };
 
-        assert_eq!(tm.next_token(), Some("token1".to_string()));
-        assert_eq!(tm.next_token(), Some("token2".to_string()));
-        assert_eq!(tm.next_token(), Some("token3".to_string()));
-        assert_eq!(tm.next_token(), Some("token1".to_string())); // Wraps around
+        assert_eq!(tm.next_env_token(), Some("token1".to_string()));
+        assert_eq!(tm.next_env_token(), Some("token2".to_string()));
+        assert_eq!(tm.next_env_token(), Some("token3".to_string()));
+        assert_eq!(tm.next_env_token(), Some("token1".to_string())); // Wraps around
     }
 
     #[test]
-    fn test_token_manager_empty() {
+    fn test_token_manager_dynamic_caching() {
         let mut tm = TokenManager {
             tokens: Vec::new(),
             current_index: 0,
+            cached_dynamic_token: None,
         };
 
-        assert_eq!(tm.next_token(), None);
+        assert_eq!(tm.next_env_token(), None);
+        assert_eq!(tm.get_dynamic_token(), None);
+
+        tm.set_dynamic_token("fresh_dynamic_token_123".to_string());
+        assert_eq!(
+            tm.get_dynamic_token(),
+            Some("fresh_dynamic_token_123".to_string())
+        );
     }
 
     #[test]

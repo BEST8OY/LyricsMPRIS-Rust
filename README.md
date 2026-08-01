@@ -3,11 +3,11 @@
 A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that integrates seamlessly with MPRIS-compatible media players.
 
 [![Language](https://img.shields.io/badge/Language-Rust-orange.svg?style=flat-sq&logo=rust)](https://www.rust-lang.org/)
+[![Edition](https://img.shields.io/badge/Edition-2024-red.svg?style=flat-sq)](https://doc.rust-lang.org/edition-guide/rust-2024/)
 [![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg?style=flat-sq&logo=linux)](https://kernel.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-sq)](LICENSE)
-[![Build Status](https://img.shields.io/badge/Build-Passing-brightgreen.svg?style=flat-sq)]()
 
-`LyricsMPRIS-Rust` monitors your active media player in real-time using D-Bus, fetches synchronized lyrics automatically, and renders them beautifully in a modern Terminal User Interface (TUI). It also features a scriptable **Pipe Mode** for custom desktop widgets, standard **LRC file parsing**, and a highly optimized **local SQLite database** with Zstd compression for instant offline lookups.
+`LyricsMPRIS-Rust` monitors your active media player in real-time using D-Bus, fetches synchronized lyrics automatically, and renders them beautifully in a modern Terminal User Interface (TUI) with word-level karaoke support. It also features a scriptable **Pipe Mode** for status bar integration, **ISRC tag reading** from local audio files, and an optimized **local SQLite database** with Zstd compression for instant offline lookups.
 
 ![LyricMPRIS-Rust](https://github.com/user-attachments/assets/501f224e-6c40-46cd-ac66-cd9ae4f927cf)
 
@@ -19,9 +19,9 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 2. [🚀 Installation](#-installation)
 3. [💻 Basic Usage](#-basic-usage)
 4. [⚙️ Configuration](#-configuration)
-5. [🎤 Musixmatch Token Rotation](#-musixmatch-token-rotation)
-6. [⌨️ Keyboard Shortcuts](#%EF%B8%8F-keyboard-shortcuts)
-7. [💾 SQLite Database Cache](#-sqlite-database-cache)
+5. [🎤 Musixmatch Token Management](#-musixmatch-token-management)
+6. [💾 SQLite Database Cache](#-sqlite-database-cache)
+7. [⌨️ Keyboard Shortcuts](#%EF%B8%8F-keyboard-shortcuts)
 8. [🔌 Desktop Integration](#-desktop-integration)
 9. [🏗️ Project Architecture](#%EF%B8%8F-project-architecture)
 10. [🐛 Troubleshooting & Debugging](#-troubleshooting--debugging)
@@ -31,30 +31,35 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 
 ## 🌟 Key Features
 
-### 🎨 Rendering Backend Options
-*   **Modern TUI**: A beautiful terminal view featuring centered lyrics, smooth auto-scrolling, customizable visibility limits, and active line tracking.
-*   **Manual Scroll**: Interact with historical or upcoming lyrics by scrolling using the arrow keys when playback is paused.
-*   **Streamlined Pipe Mode**: Outputs raw lyrics to standard output (`stdout`) in real-time, making it trivial to pipe into status bars, notification systems, or external scripts.
+### 🎨 Modern TUI & Pipe Mode
+* **Ratatui Terminal UI**: Centered lyrics display with smooth auto-scrolling, word-by-word karaoke highlighting, and active line tracking.
+* **Manual Scroll**: Browse past or upcoming lyrics using arrow keys (`j`/`k`) when playback is paused.
+* **Streamlined Pipe Mode**: Outputs current lyric line to `stdout` in real-time, making it effortless to pipe into Polybar, Waybar, i3blocks, or custom scripts.
 
 ### 📚 Multiple Lyrics Providers
-*   **LRCLIB**: Automatically fetches community-sourced, line-synced lyrics (`LRC` format).
-*   **Musixmatch**: Fetches official subtitles with support for word-level timing (Richsync JSON) and line-level timing.
-*   **Local SQLite Cache**: Saves fetched lyrics locally so subsequent plays load in sub-milliseconds without firing redundant API queries.
+* **LRCLIB**: Fetches community-sourced, line-synced lyrics (`LRC` format).
+* **Musixmatch**: Official desktop API integration supporting both word-level timing (**Richsync**) and line-level timing (**Subtitles**).
 
-### 🛡️ Robust Token Manager
-*   **Round-Robin Rotation**: Distributes queries across multiple Musixmatch user tokens to bypass rate limits.
-*   **Automatic Fallback Retry**: If a token fails due to a rate limit (`429`) or unauthorized/expired status (`401`/`403`), the application automatically attempts to resolve your request with the next configured token.
+### 🔑 3-Tier Automatic Musixmatch Token Engine
+* **Zero Configuration Needed**: Automatically fetches a fresh anonymous usertoken directly from Musixmatch API if no user token is provided.
+* **Token Rotation**: Supports multiple custom usertokens in `MUSIXMATCH_USERTOKEN` env var, rotated in round-robin order.
+* **Auto-Renewal & Retry**: If a token encounters a rate limit (`429`) or auth error (`401`/`403`), the engine invalidates it, fetches a new token, and retries the request transparently.
+
+### 🏷️ Local File ISRC Extraction
+* Reads local audio file metadata (FLAC, MP3, M4A, OGG) via `lofty` when `--isrc` is enabled to perform pinpoint ISRC lookups.
+
+### 💾 Optimized SQLite Persistence
+* Stores raw lyrics compressed with **zstd** level 3.
+* Multi-identifier indexing (ISRC, Spotify ID, iTunes ID, Artist/Title/Album) ensures instant offline hits without redundant network calls.
 
 ---
 
 ## 🚀 Installation
 
 ### Prerequisites
-Make sure your Linux environment has:
-- **Rust Toolchain** (1.70+): Install via [rustup.rs](https://rustup.rs)
-- **D-Bus** development libraries (usually pre-installed on most modern Linux desktop systems)
-- **playerctld** (recommended for tracking the active MPRIS target player)
-- **lofty**-compatible audio files (FLAC, MP3, MP4, OGG — for `--isrc` mode)
+- **Linux** desktop environment with **D-Bus** session daemon.
+- **Rust Toolchain** (1.70+): Install via [rustup.rs](https://rustup.rs).
+- **playerctld** *(recommended)*: Tracks active MPRIS players automatically.
 
 ### Build from Source
 ```bash
@@ -62,33 +67,37 @@ Make sure your Linux environment has:
 git clone https://github.com/BEST8OY/LyricsMPRIS-Rust.git
 cd LyricsMPRIS-Rust
 
-# Build and optimize for release
+# Build release binary
 cargo build --release
 ```
-The optimized executable binary will be available at `./target/release/lyricsmpris`.
+
+The optimized executable binary will be created at `./target/release/lyricsmpris`.
 
 ---
 
 ## 💻 Basic Usage
 
 ```bash
-# Run the application with default settings
+# Launch with default settings (LRCLIB + Musixmatch)
 ./target/release/lyricsmpris
 
-# Run with local database caching enabled
+# Enable local SQLite database caching
 ./target/release/lyricsmpris --database ~/.local/share/lyricsmpris/cache.db
 
-# Enable ISRC-based track matching (reads ISRC from local audio files)
+# Enable ISRC extraction from local audio files
 ./target/release/lyricsmpris --isrc
 
-# Disable word-level karaoke highlight mode
-./target/release/lyricsmpris --no-karaoke
-
-# Run in compact TUI mode (limits visible lines to 3)
+# Limit TUI visible lyric lines (compact view)
 ./target/release/lyricsmpris --visible-lines 3
 
-# Pipe lyrics to stdout for scripting/bar integration
+# Disable word-level karaoke highlights (line-only mode)
+./target/release/lyricsmpris --no-karaoke
+
+# Run in Pipe mode for Polybar / Waybar stdout integration
 ./target/release/lyricsmpris --pipe
+
+# Target specific players or block noisy apps
+./target/release/lyricsmpris --target spotify,mpv --block firefox,chromium
 ```
 
 ---
@@ -97,80 +106,72 @@ The optimized executable binary will be available at `./target/release/lyricsmpr
 
 ### Command Line Arguments
 
-| Command-line Argument | Description | Example |
+| Argument | Description | Example |
 | :--- | :--- | :--- |
-| `-d`, `--database <PATH>` | Path to SQLite local cache file | `--database ~/.cache/lyrics.db` |
-| `-p`, `--providers <LIST>` | Comma-separated list to prioritize providers | `--providers musixmatch,lrclib` |
-| `-v`, `--visible-lines <NUM>` | Limits visible TUI lyric lines (compact view) | `--visible-lines 3` |
-| `--no-karaoke` | Disables word-by-word highlighted playback | `--no-karaoke` |
-| `--pipe` | Launches in CLI pipe mode instead of TUI | `--pipe` |
-| `-b`, `--block <LIST>` | Comma-separated player names to ignore | `--block chromium,firefox` |
-| `--target <LIST>` | Listen only to specific MPRIS services | `--target spotify,mpv` |
-| `--isrc` | Enable ISRC-based track matching (reads from local file metadata) | `--isrc` |
+| `-d`, `--database <PATH>` | Enable SQLite cache at specified file path | `--database ~/.cache/lyrics.db` |
+| `-p`, `--providers <LIST>` | Comma-separated provider priority order | `--providers musixmatch,lrclib` |
+| `-v`, `--visible-lines <NUM>`| Limit maximum visible lyric lines in TUI | `--visible-lines 3` |
+| `--isrc` | Extract ISRC from local audio files via `lofty` | `--isrc` |
+| `--no-karaoke` | Disable per-word karaoke highlighting | `--no-karaoke` |
+| `--pipe` | Output lyrics to `stdout` (no TUI) | `--pipe` |
+| `-b`, `--block <LIST>` | Ignore specific MPRIS service names | `--block firefox,chromium` |
+| `--target <LIST>` | Target specific MPRIS service names | `--target spotify,mpv` |
 
 ### Environment Variables
-Configure default parameters and authentication credentials in your shell startup file (e.g., `~/.bashrc` or `~/.zshrc`):
+
+Configure default options via environment variables in `~/.bashrc` or `~/.zshrc`:
 
 ```bash
-# Prioritize and enable providers (default is lrclib,musixmatch)
-export LYRIC_PROVIDERS="lrclib,musixmatch"
+# Provider preference (default: lrclib,musixmatch)
+export LYRIC_PROVIDERS="musixmatch,lrclib"
 
-# Configure Musixmatch User Tokens (supports single or comma-separated lists)
+# Musixmatch custom usertokens (comma-separated for round-robin rotation)
 export MUSIXMATCH_USERTOKEN="token_alpha,token_beta,token_gamma"
 
-# Logging configuration (uses the tracing framework)
-# Levels: error, warn, info, debug, trace
+# Logging filter (tracing subscriber)
 export RUST_LOG=info
 ```
 
 ---
 
-## 🎤 Musixmatch Token Rotation
+## 🎤 Musixmatch Token Management
 
-The Musixmatch provider utilizes a client-side usertoken. To minimize rate limit errors and scale requests, `LyricsMPRIS-Rust` supports multiple user tokens.
+`LyricsMPRIS-Rust` uses a **3-tier token engine** for Musixmatch:
 
-### How to Retrieve a Musixmatch Token
-1. Open the [Musixmatch Curators Settings](https://curators.musixmatch.com/settings) and log in.
-2. Scroll to the bottom of the page and click **"Copy debug info"**.
-3. Paste the contents in a text editor and copy the `UserToken` value.
-4. Set it as `MUSIXMATCH_USERTOKEN`.
-
-### Rotation and Fallback Algorithm
-```bash
-# Add multiple tokens separated by commas
-export MUSIXMATCH_USERTOKEN="token1,token2,token3"
 ```
-The internal token manager works in a round-robin rotation:
-1. **First request** queries using `token1`.
-2. **Second request** queries using `token2`.
-3. If `token2` hits a rate limit (`429`) or is invalid (`401`/`403`), the engine automatically falls back to `token3` to satisfy the current request seamlessly.
-4. If a track is genuinely not found (returns `200 OK` but empty lyrics), the app halts searching immediately, avoiding redundant API calls.
+┌──────────────────────────────────────────────────────────────────┐
+│  Tier 1: Explicit User Tokens                                    │
+│  - Environment variable: MUSIXMATCH_USERTOKEN                    │
+│  - Uses round-robin rotation across multiple tokens              │
+└────────────────────────────────┬─────────────────────────────────┘
+                                 │ If unconfigured or all pool tokens fail (401/402/403/429)
+                                 ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  Tier 2: Automatic Token Provisioning (`token.get`)              │
+│  - Automatically requests a fresh user token directly from API    │
+│  - No manual setup or API keys required                          │
+└────────────────────────────────┬─────────────────────────────────┘
+                                 │ If dynamic token expires during request
+                                 ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  Tier 3: Automatic Token Renewal & Retry                         │
+│  - Auto-fetches a new token on 401 / 402 / 403 / 429 status      │
+│  - Transparently retries the current track query                 │
+└──────────────────────────────────────────────────────────────────┘
+```
 
----
-
-## ⌨️ Keyboard Shortcuts
-
-Interact with the modern TUI backend using these keys:
-
-| Key | Action |
-| :---: | :--- |
-| `k` | Toggle Karaoke Highlight Mode |
-| `↑` / `k` | Scroll up by one line (when player is paused) |
-| `↓` / `j` | Scroll down by one line (when player is paused) |
-| `q` / `Esc` | Safely exit the application |
-
-> [!NOTE]
-> Scrolling is only enabled while playback is paused. Once playback resumes, the interface snaps back to follow the active playing position.
+> **Manual Token (Optional)**: If you wish to provide your own Musixmatch usertoken, set `MUSIXMATCH_USERTOKEN="your_token"`. However, manual configuration is **completely optional** because Tier 2 automatically handles token creation for you!
 
 ---
 
 ## 💾 SQLite Database Cache
 
-Enable the local database cache to prevent redundant API queries, ensure lightning-fast retrieval, and enable offline usage.
+Enabling `--database <PATH>` activates persistent local caching to minimize network usage and provide instant offline access.
 
-### Schema Details
+### Database Schema
+
 ```sql
-CREATE TABLE lyrics (
+CREATE TABLE IF NOT EXISTS lyrics (
     artist TEXT NOT NULL,
     title TEXT NOT NULL,
     album TEXT NOT NULL,
@@ -179,35 +180,52 @@ CREATE TABLE lyrics (
     raw_lyrics BLOB NOT NULL,
     isrc TEXT,
     spotify_id TEXT,
-    itunes_id TEXT
+    itunes_id TEXT,
+    PRIMARY KEY (artist, title, album)
 );
 
-CREATE INDEX idx_lookup ON lyrics(artist, title, album);
+CREATE INDEX IF NOT EXISTS idx_lookup ON lyrics(artist, title, album);
 CREATE INDEX IF NOT EXISTS idx_isrc ON lyrics(isrc);
 CREATE INDEX IF NOT EXISTS idx_spotify_id ON lyrics(spotify_id);
+CREATE INDEX IF NOT EXISTS idx_itunes_id ON lyrics(itunes_id);
 ```
 
-### Storage Efficiency
-- **Compression**: The raw lyrics data is compressed using the **Zstd** format before storing in the `raw_lyrics` BLOB to save disk space.
-- **Normalization**: Fields `artist`, `title`, and `album` are normalized (lowercase and trimmed) to make matching case-insensitive.
-- **Speed**: Indexed database queries offer sub-millisecond retrieval.
+### Lookup Resolution Priority
 
-### Lookup Priority
+When looking up a track in the cache, queries execute in the following order:
 
-When fetching lyrics, the database uses the following priority order:
+1. **ISRC Match** (`WHERE isrc = ?`) — Most accurate unique track identifier.
+2. **Normalized Metadata Match** (`WHERE artist = ? AND title = ? AND album = ?`) — Case-insensitive fallback.
+3. **Spotify ID Match** (`WHERE spotify_id = ?`) — Fallback via Spotify track ID.
+4. **iTunes ID Match** (`WHERE itunes_id = ?`) — Fallback via iTunes track ID.
 
-1. **ISRC** — exact match on ISRC code (most reliable unique identifier)
-2. **Artist + Title + Album + Duration** — fallback if no ISRC match
-3. **Spotify ID** — fallback via stored Spotify track ID
-4. **iTunes ID** — fallback via stored iTunes track ID
+### Compression & Validation
+- **Zstd Level 3**: Raw lyrics payloads (LRC text / Richsync JSON) are compressed before storage to save space.
+- **Duration Tolerance**: Cached entries validate playback duration within a 5% tolerance window; invalid or outdated entries are purged automatically.
+
+---
+
+## ⌨️ Keyboard Shortcuts
+
+Control the modern TUI backend with these keys:
+
+| Key | Action |
+| :---: | :--- |
+| `k` | Toggle Karaoke Highlight Mode |
+| `↑` / `k` | Scroll up one line (when player is paused) |
+| `↓` / `j` | Scroll down one line (when player is paused) |
+| `q` / `Esc` | Quit `LyricsMPRIS-Rust` |
+
+> [!NOTE]
+> Manual line scrolling is active only when playback is **paused**. Once playback resumes, the TUI automatically locks back to the current playing position.
 
 ---
 
 ## 🔌 Desktop Integration
 
-Pipe mode streams current lyrics directly to standard output, making it easy to create widgets for panels like Polybar, Waybar, or i3blocks.
+Pipe mode (`--pipe`) outputs plain text lyric lines to `stdout`, making it easy to display current lyrics on desktop panels.
 
-### Polybar Configuration Example
+### Polybar Integration
 ```ini
 [module/lyrics]
 type = custom/script
@@ -217,7 +235,7 @@ format-prefix = "🎵 "
 format-prefix-foreground = #8abeb7
 ```
 
-### Waybar Configuration Example
+### Waybar Integration
 ```json
 "custom/lyrics": {
     "format": "🎵 {}",
@@ -233,44 +251,61 @@ format-prefix-foreground = #8abeb7
 
 ```
 src/
-├── lyrics/             # Core lyrics module
-│   ├── providers/      # Integration with LRCLIB & Musixmatch APIs
-│   ├── database.rs     # SQLite caching engine & Zstd compression
-│   ├── parse.rs        # LRC, Richsync, and line Subtitle parsers
-│   └── types.rs        # Lyric data models & Error types
-├── mpris/              # MPRIS D-Bus interfaces
-│   ├── events.rs       # D-Bus player signals
-│   ├── metadata.rs     # Metadata extraction (incl. local file ISRC via lofty)
-│   └── playback.rs     # Player controls & position retrieval
-├── ui/                 # Frontend interfaces
-│   ├── modern.rs       # Modern Ratatui-based TUI
-│   └── pipe.rs         # Stdout pipe mode
-├── event.rs            # Main event loop and coordinator
-├── pool.rs             # Thread/process state supervisor
-└── state.rs            # Atomic state bundles
+├── main.rs           # Entry point, CLI argument parsing (clap), tokio runtime
+├── event.rs          # Event coordinator (track changes, seeks, provider dispatch)
+├── pool.rs           # Event loop supervisor (wires D-Bus → state → UI)
+├── state.rs          # StateBundle, PlayerState, LyricState, Update snapshot
+├── timer.rs          # PlaybackTimer (monotonic position estimation)
+├── text_utils.rs     # Text wrapping utility
+├── lyrics/
+│   ├── providers/    # lrclib.rs, musixmatch.rs (API integrations & token manager)
+│   ├── database.rs   # SQLite cache engine with sqlx + Zstd compression
+│   ├── parse.rs      # LRC, Richsync, subtitle parsers
+│   ├── similarity.rs # Fuzzy song matching
+│   └── types.rs      # LyricLine, TrackMatchInfo, error models
+├── mpris/
+│   ├── connection.rs # D-Bus session singleton
+│   ├── events.rs     # D-Bus signal listener (PropertiesChanged)
+│   ├── metadata.rs   # MPRIS track metadata extraction & local file ISRC (lofty)
+│   └── playback.rs   # Playback position & status querying
+└── ui/
+    ├── modern.rs     # Modern Ratatui TUI renderer
+    ├── pipe.rs       # Stdout pipe mode renderer
+    └── ...           # Helpers (styles, progression, wrapping cache)
 ```
 
 ---
 
 ## 🐛 Troubleshooting & Debugging
 
-If you encounter issues or no lyrics are displayed:
-1. **Enable Debug Mode**: Launch the application with `RUST_LOG=debug` to view detailed trace information:
+1. **No Lyrics Displayed / Debugging**:
+   Run with `RUST_LOG=debug` to view detailed D-Bus events and API logs on `stderr`:
    ```bash
    RUST_LOG=debug lyricsmpris
    ```
-2. **Check Player Metadata**: Make sure your target media player correctly registers on MPRIS and exports title and artist metadata.
-3. **Verify Token Validity**: Test your Musixmatch user tokens manually if you consistently receive warning logs.
+2. **Player Not Detected**:
+   Verify your media player supports MPRIS via D-Bus:
+   ```bash
+   playerctl -l
+   ```
+   Installing `playerctld` ensures `lyricsmpris` tracks your active player reliably.
 
 ---
 
 ## 🤝 Contributing
 
-We welcome community contributions!
-1. Fork this repository.
-2. Create your feature branch (`git checkout -b feature/amazing-feature`).
-3. Ensure formatting is correct (`cargo fmt --check`) and lints pass (`cargo clippy`).
-4. Commit your changes and open a Pull Request.
+Contributions are welcome!
+
+```bash
+# Check code formatting
+cargo fmt --check
+
+# Run linter checks
+cargo clippy
+
+# Run unit test suite
+cargo test
+```
 
 ---
 

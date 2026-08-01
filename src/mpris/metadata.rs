@@ -54,23 +54,29 @@ struct MprisMetadata {
     url: Option<String>,
 }
 
-/// Try to read ISRC from a local audio file using lofty.
+/// Try to read ISRC from a local audio file path or URL using lofty.
 ///
 /// Returns the ISRC code string if found, or None.
-fn get_isrc_from_file(file_url: &str) -> Option<String> {
-    let path = file_url.strip_prefix("file://")?;
-    let decoded = urlencoding::decode(path).ok()?;
+fn get_isrc_from_file(raw_path: &str) -> Option<String> {
+    let path_str = raw_path.strip_prefix("file://").unwrap_or(raw_path);
+    let decoded = urlencoding::decode(path_str).ok()?;
     let path_buf = PathBuf::from(decoded.as_ref());
 
-    let tagged_file = block_in_place(move || lofty::read_from_path(path_buf)).ok()?;
+    let read_tags = || lofty::read_from_path(path_buf).ok();
+    let tagged_file = if tokio::runtime::Handle::try_current().is_ok() {
+        block_in_place(read_tags)?
+    } else {
+        read_tags()?
+    };
+
     for tag in tagged_file.tags() {
         for item in tag.items() {
-            if matches!(item.key(), ItemKey::Isrc) {
-                if let Some(value) = item.value().text() {
-                    let trimmed = value.trim().to_string();
-                    if !trimmed.is_empty() {
-                        return Some(trimmed);
-                    }
+            if matches!(item.key(), ItemKey::Isrc)
+                && let Some(value) = item.value().text()
+            {
+                let trimmed = value.trim().to_string();
+                if !trimmed.is_empty() {
+                    return Some(trimmed);
                 }
             }
         }
@@ -97,12 +103,15 @@ fn normalize_spotify_url(url: &str) -> Option<String> {
 }
 
 fn normalize_spotify_trackid(trackid: &str) -> Option<String> {
-    if let Some(id) = trackid.rsplit('/').next().filter(|id| !id.is_empty()) {
-        return normalize_spotify_id(id);
+    if let Some(idx) = trackid.find("spotify:track:")
+        && let Some(norm) = normalize_spotify_id(&trackid[idx + "spotify:track:".len()..])
+    {
+        return Some(norm);
     }
-    if let Some(idx) = trackid.find("spotify:track:") {
-        let id = &trackid[idx + "spotify:track:".len()..];
-        return normalize_spotify_id(id);
+    if let Some(id) = trackid.rsplit('/').next().filter(|id| !id.is_empty())
+        && let Some(norm) = normalize_spotify_id(id)
+    {
+        return Some(norm);
     }
     None
 }
@@ -112,10 +121,7 @@ fn normalize_spotify_trackid(trackid: &str) -> Option<String> {
 /// Returns the ISRC code string if found in the file's metadata, or None.
 fn isrc_from_metadata(url: Option<&str>) -> Option<String> {
     let file_url = url?;
-    if let Some(stripped) = file_url.strip_prefix("file://") {
-        return get_isrc_from_file(stripped);
-    }
-    if file_url.starts_with('/') {
+    if file_url.starts_with("file://") || file_url.starts_with('/') {
         return get_isrc_from_file(file_url);
     }
     None
@@ -141,8 +147,12 @@ impl From<MprisMetadata> for TrackMetadata {
         let spotify_id = md
             .url
             .as_ref()
-.and_then(|u| normalize_spotify_url(u))
-        .or_else(|| md.trackid.as_ref().and_then(|trackid| normalize_spotify_trackid(trackid)));
+            .and_then(|u| normalize_spotify_url(u))
+            .or_else(|| {
+                md.trackid
+                    .as_ref()
+                    .and_then(|trackid| normalize_spotify_trackid(trackid))
+            });
 
         let isrc = if isrc_enabled() {
             isrc_from_metadata(md.url.as_deref())
@@ -217,7 +227,9 @@ pub fn extract_metadata(map: &HashMap<String, OwnedValue>) -> TrackMetadata {
     let spotify_id = url
         .as_ref()
         .and_then(|u| normalize_spotify_url(u))
-        .or_else(|| get_string("mpris:trackid").and_then(|trackid| normalize_spotify_trackid(&trackid)));
+        .or_else(|| {
+            get_string("mpris:trackid").and_then(|trackid| normalize_spotify_trackid(&trackid))
+        });
 
     let isrc = if isrc_enabled() {
         isrc_from_metadata(url.as_deref())
@@ -285,5 +297,36 @@ mod tests {
         assert_eq!(track.artist, "Artist 1");
         assert_eq!(track.album, "Test Album");
         assert_eq!(track.length, Some(180.0));
+    }
+
+    #[test]
+    fn test_spotify_url_and_trackid_normalization() {
+        assert_eq!(
+            normalize_spotify_url("https://open.spotify.com/track/5FVd6KXrgO9B3JPmC8OPst?si=123"),
+            Some("5FVd6KXrgO9B3JPmC8OPst".to_string())
+        );
+        assert_eq!(
+            normalize_spotify_trackid("spotify:track:5FVd6KXrgO9B3JPmC8OPst"),
+            Some("5FVd6KXrgO9B3JPmC8OPst".to_string())
+        );
+        assert_eq!(
+            normalize_spotify_trackid("/com/spotify/track/5FVd6KXrgO9B3JPmC8OPst"),
+            Some("5FVd6KXrgO9B3JPmC8OPst".to_string())
+        );
+        assert_eq!(normalize_spotify_id("too_short"), None);
+    }
+
+    #[test]
+    fn test_isrc_from_metadata_nonexistent_file() {
+        set_isrc_enabled(true);
+        assert_eq!(
+            isrc_from_metadata(Some("file:///nonexistent/path/to/song.mp3")),
+            None
+        );
+        assert_eq!(
+            isrc_from_metadata(Some("https://example.com/song.mp3")),
+            None
+        );
+        set_isrc_enabled(false);
     }
 }

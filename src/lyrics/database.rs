@@ -126,12 +126,22 @@ fn normalize(s: &str) -> String {
     s.trim().to_lowercase()
 }
 
-fn normalize_isrc(s: &str) -> String {
-    s.trim().to_uppercase()
+fn normalize_isrc(s: &str) -> Option<String> {
+    let trimmed = s.trim().to_uppercase();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
-fn normalize_track_id(s: &str) -> String {
-    s.trim().to_string()
+fn normalize_track_id(s: &str) -> Option<String> {
+    let trimmed = s.trim().to_string();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn compress_raw_lyrics(raw: &str) -> Result<Vec<u8>, std::io::Error> {
@@ -165,7 +175,8 @@ async fn create_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             raw_lyrics BLOB NOT NULL,
             isrc TEXT,
             spotify_id TEXT,
-            itunes_id TEXT
+            itunes_id TEXT,
+            PRIMARY KEY (artist, title, album)
         )
         "#,
     )
@@ -211,8 +222,6 @@ async fn create_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
     Ok(())
 }
-
-// `ensure_column_exists` removed: the application no longer performs runtime schema migrations.
 
 /// Opens or creates a SQLite database connection pool.
 async fn open_database(path: &Path) -> Result<SqlitePool, sqlx::Error> {
@@ -321,7 +330,7 @@ pub async fn initialize(path: PathBuf) {
 ///
 /// Uses indexed SQL query for fast lookup with minimal memory usage.
 /// Falls back to lookup by track identifiers (ISRC, Spotify ID, iTunes ID)
-/// when the primary artist/title/album lookup succeeds but returns no results.
+/// when primary lookups fail.
 ///
 /// # Returns
 ///
@@ -344,9 +353,8 @@ pub async fn fetch_from_database(
     let album_norm = normalize(album);
 
     // Try lookup by ISRC first (most reliable unique identifier)
-    if let Some(id) = isrc {
-        let id_norm = normalize_isrc(id);
-        if let Ok(Some(row)) = sqlx::query(
+    if let Some(id_norm) = isrc.and_then(normalize_isrc)
+        && let Ok(Some(row)) = sqlx::query(
             r#"
             SELECT duration, format, raw_lyrics, isrc, spotify_id, itunes_id
             FROM lyrics
@@ -357,20 +365,10 @@ pub async fn fetch_from_database(
         .bind(&id_norm)
         .fetch_optional(pool)
         .await
-        {
-            return process_db_row(
-                &row,
-                duration,
-                &artist_norm,
-                &title_norm,
-                &album_norm,
-                pool,
-                isrc,
-                spotify_id,
-                itunes_id,
-            )
-            .await;
-        }
+        && let Some(result) =
+            process_db_row(&row, duration, &artist_norm, &title_norm, &album_norm, pool).await
+    {
+        return Some(result);
     }
 
     // Fallback: try lookup by artist/title/album
@@ -387,28 +385,15 @@ pub async fn fetch_from_database(
     .bind(&album_norm)
     .fetch_optional(pool)
     .await
+        && let Some(result) =
+            process_db_row(&row, duration, &artist_norm, &title_norm, &album_norm, pool).await
     {
-        if let Some(result) = process_db_row(
-            &row,
-            duration,
-            &artist_norm,
-            &title_norm,
-            &album_norm,
-            pool,
-            isrc,
-            spotify_id,
-            itunes_id,
-        )
-        .await
-        {
-            return Some(result);
-        }
+        return Some(result);
     }
 
     // Fallback: try lookup by Spotify ID
-    if let Some(id) = spotify_id {
-        let id_norm = normalize_track_id(id);
-        if let Ok(Some(row)) = sqlx::query(
+    if let Some(id_norm) = spotify_id.and_then(normalize_track_id)
+        && let Ok(Some(row)) = sqlx::query(
             r#"
             SELECT duration, format, raw_lyrics, isrc, spotify_id, itunes_id
             FROM lyrics
@@ -419,28 +404,15 @@ pub async fn fetch_from_database(
         .bind(&id_norm)
         .fetch_optional(pool)
         .await
-        {
-            return Some(
-                process_db_row(
-                    &row,
-                    duration,
-                    &artist_norm,
-                    &title_norm,
-                    &album_norm,
-                    pool,
-                    isrc,
-                    spotify_id,
-                    itunes_id,
-                )
-                .await?,
-            );
-        }
+        && let Some(result) =
+            process_db_row(&row, duration, &artist_norm, &title_norm, &album_norm, pool).await
+    {
+        return Some(result);
     }
 
     // Fallback: try lookup by iTunes ID
-    if let Some(id) = itunes_id {
-        let id_norm = normalize_track_id(id);
-        if let Ok(Some(row)) = sqlx::query(
+    if let Some(id_norm) = itunes_id.and_then(normalize_track_id)
+        && let Ok(Some(row)) = sqlx::query(
             r#"
             SELECT duration, format, raw_lyrics, isrc, spotify_id, itunes_id
             FROM lyrics
@@ -451,25 +423,50 @@ pub async fn fetch_from_database(
         .bind(&id_norm)
         .fetch_optional(pool)
         .await
-        {
-            return Some(
-                process_db_row(
-                    &row,
-                    duration,
-                    &artist_norm,
-                    &title_norm,
-                    &album_norm,
-                    pool,
-                    isrc,
-                    spotify_id,
-                    itunes_id,
-                )
-                .await?,
-            );
-        }
+        && let Some(result) =
+            process_db_row(&row, duration, &artist_norm, &title_norm, &album_norm, pool).await
+    {
+        return Some(result);
     }
 
     None
+}
+
+/// Helper: deletes a cached row from the database using row values or fallback values.
+async fn delete_cached_row(
+    pool: &SqlitePool,
+    row: &sqlx::sqlite::SqliteRow,
+    artist_norm: &str,
+    title_norm: &str,
+    album_norm: &str,
+) {
+    let row_isrc: Option<String> = row.try_get("isrc").ok().flatten();
+    let row_spotify_id: Option<String> = row.try_get("spotify_id").ok().flatten();
+    let row_itunes_id: Option<String> = row.try_get("itunes_id").ok().flatten();
+
+    if let Some(isrc) = row_isrc.as_deref().and_then(normalize_isrc) {
+        let _ = sqlx::query("DELETE FROM lyrics WHERE isrc = ?")
+            .bind(isrc)
+            .execute(pool)
+            .await;
+    } else if let Some(spotify_id) = row_spotify_id.as_deref().and_then(normalize_track_id) {
+        let _ = sqlx::query("DELETE FROM lyrics WHERE spotify_id = ?")
+            .bind(spotify_id)
+            .execute(pool)
+            .await;
+    } else if let Some(itunes_id) = row_itunes_id.as_deref().and_then(normalize_track_id) {
+        let _ = sqlx::query("DELETE FROM lyrics WHERE itunes_id = ?")
+            .bind(itunes_id)
+            .execute(pool)
+            .await;
+    } else {
+        let _ = sqlx::query("DELETE FROM lyrics WHERE artist = ? AND title = ? AND album = ?")
+            .bind(artist_norm)
+            .bind(title_norm)
+            .bind(album_norm)
+            .execute(pool)
+            .await;
+    }
 }
 
 /// Processes a database row into a ProviderResult.
@@ -481,84 +478,86 @@ async fn process_db_row(
     title_norm: &str,
     album_norm: &str,
     pool: &SqlitePool,
-    isrc: Option<&str>,
-    spotify_id: Option<&str>,
-    itunes_id: Option<&str>,
 ) -> Option<ProviderResult> {
-    let raw_lyrics_blob: Vec<u8> = row.try_get("raw_lyrics").ok()?;
-    let raw_lyrics = decompress_raw_lyrics(raw_lyrics_blob)?;
-
-    let format = LyricsFormat::from_str(row.get("format"))?;
-
-    let entry = LyricsEntry {
-        duration: row.get("duration"),
-        format,
-        raw_lyrics,
-        isrc: row.get("isrc"),
-        spotify_id: row.get("spotify_id"),
-        itunes_id: row.get("itunes_id"),
+    let raw_lyrics_blob: Vec<u8> = match row.try_get("raw_lyrics") {
+        Ok(blob) => blob,
+        Err(_) => {
+            delete_cached_row(pool, row, artist_norm, title_norm, album_norm).await;
+            return None;
+        }
     };
 
-    // Optional helper: delete the cached row by the most specific available identifier.
-    async fn delete_cached_entry(
-        pool: &SqlitePool,
-        entry: &LyricsEntry,
-        artist_norm: &str,
-        title_norm: &str,
-        album_norm: &str,
-    ) {
-        let query = if let Some(isrc) = entry.isrc.as_deref() {
-            sqlx::query("DELETE FROM lyrics WHERE isrc = ?").bind(normalize_isrc(isrc))
-        } else if let Some(spotify_id) = entry.spotify_id.as_deref() {
-            sqlx::query("DELETE FROM lyrics WHERE spotify_id = ?").bind(normalize_track_id(spotify_id))
-        } else if let Some(itunes_id) = entry.itunes_id.as_deref() {
-            sqlx::query("DELETE FROM lyrics WHERE itunes_id = ?").bind(normalize_track_id(itunes_id))
-        } else {
-            sqlx::query(
-                "DELETE FROM lyrics WHERE artist = ? AND title = ? AND album = ?",
-            )
-            .bind(artist_norm)
-            .bind(title_norm)
-            .bind(album_norm)
-        };
+    let raw_lyrics = match decompress_raw_lyrics(raw_lyrics_blob) {
+        Some(text) => text,
+        None => {
+            tracing::warn!(
+                artist = %artist_norm,
+                title = %title_norm,
+                "Failed to decompress cached lyrics blob; deleting cache entry"
+            );
+            delete_cached_row(pool, row, artist_norm, title_norm, album_norm).await;
+            return None;
+        }
+    };
 
-        let _ = query.execute(pool).await;
-    }
+    let format_str: String = match row.try_get("format") {
+        Ok(fmt) => fmt,
+        Err(_) => {
+            delete_cached_row(pool, row, artist_norm, title_norm, album_norm).await;
+            return None;
+        }
+    };
+
+    let format = match LyricsFormat::from_str(&format_str) {
+        Some(fmt) => fmt,
+        None => {
+            tracing::warn!(
+                artist = %artist_norm,
+                title = %title_norm,
+                "Invalid lyrics format in database; deleting cache entry"
+            );
+            delete_cached_row(pool, row, artist_norm, title_norm, album_norm).await;
+            return None;
+        }
+    };
+
+    let entry = LyricsEntry {
+        duration: row.try_get("duration").ok(),
+        format,
+        raw_lyrics,
+        isrc: row.try_get("isrc").ok().flatten(),
+        spotify_id: row.try_get("spotify_id").ok().flatten(),
+        itunes_id: row.try_get("itunes_id").ok().flatten(),
+    };
 
     // Optional: validate duration match if both are present.
     if let (Some(query_duration), Some(entry_duration)) = (duration, entry.duration) {
         let tolerance = query_duration * 0.05;
         if (query_duration - entry_duration).abs() > tolerance {
-            delete_cached_entry(pool, &entry, artist_norm, title_norm, album_norm).await;
+            delete_cached_row(pool, row, artist_norm, title_norm, album_norm).await;
             return None;
         }
     }
 
-    let result = match parse_stored_lyrics(&entry) {
+    match parse_stored_lyrics(&entry) {
         Ok(ok) => Some(Ok(ok)),
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 "Failed to parse cached lyrics; deleting cache entry"
             );
-            delete_cached_entry(pool, &entry, artist_norm, title_norm, album_norm).await;
+            delete_cached_row(pool, row, artist_norm, title_norm, album_norm).await;
             None
         }
-    };
-
-    // No backfilling of track IDs for legacy rows; accept parsed entry as-is
-
-    result
+    }
 }
-
-// backfill_track_ids removed: no runtime mutation of existing DB rows
 
 /// Stores lyrics in the database.
 ///
-/// Uses SQL DELETE + INSERT to replace existing entries.
 /// Minimal memory usage - only the new entry is in memory briefly.
 ///
 /// This should be called after successfully fetching lyrics from a provider.
+#[allow(clippy::too_many_arguments)]
 pub async fn store_in_database(
     artist: &str,
     title: &str,
@@ -579,7 +578,7 @@ pub async fn store_in_database(
     let title_norm = normalize(title);
     let album_norm = normalize(album);
 
-    // Insert or replace existing entry (single query instead of DELETE + INSERT)
+    // Insert or replace existing entry
     let raw_lyrics_blob = match compress_raw_lyrics(&raw_lyrics) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -592,9 +591,9 @@ pub async fn store_in_database(
             return;
         }
     };
-    let normalized_isrc = isrc.map(normalize_isrc);
-    let normalized_spotify_id = spotify_id.map(normalize_track_id);
-    let normalized_itunes_id = itunes_id.map(normalize_track_id);
+    let normalized_isrc = isrc.and_then(normalize_isrc);
+    let normalized_spotify_id = spotify_id.and_then(normalize_track_id);
+    let normalized_itunes_id = itunes_id.and_then(normalize_track_id);
 
     let result = sqlx::query(
         r#"
@@ -621,5 +620,121 @@ pub async fn store_in_database(
             error = %e,
             "Failed to store lyrics in database"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_database_crud_and_lookups() {
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+
+        create_schema(&pool).await.unwrap();
+
+        let lrc_content = "[00:10.00]Test lyric line 1\n[00:20.00]Test lyric line 2";
+        let blob = compress_raw_lyrics(lrc_content).unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO lyrics (artist, title, album, duration, format, raw_lyrics, isrc, spotify_id, itunes_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind("test artist")
+        .bind("test title")
+        .bind("test album")
+        .bind(180.0)
+        .bind("lrclib")
+        .bind(&blob)
+        .bind("USUM71234567")
+        .bind("5FVd6KXrgO9B3JPmC8OPst")
+        .bind("123456789")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Query by artist/title/album
+        let row = sqlx::query(
+            "SELECT duration, format, raw_lyrics, isrc, spotify_id, itunes_id FROM lyrics WHERE artist = ? AND title = ? AND album = ?"
+        )
+        .bind("test artist")
+        .bind("test title")
+        .bind("test album")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let res = process_db_row(
+            &row,
+            Some(180.0),
+            "test artist",
+            "test title",
+            "test album",
+            &pool,
+        )
+        .await;
+        assert!(res.is_some());
+        let (lines, raw, ids) = res.unwrap().unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(raw, Some(lrc_content.to_string()));
+        assert_eq!(ids.track_isrc, Some("USUM71234567".to_string()));
+        assert_eq!(
+            ids.track_spotify_id,
+            Some("5FVd6KXrgO9B3JPmC8OPst".to_string())
+        );
+        assert_eq!(ids.track_itunes_id, Some("123456789".to_string()));
+
+        // Query by ISRC
+        let isrc_row = sqlx::query(
+            "SELECT duration, format, raw_lyrics, isrc, spotify_id, itunes_id FROM lyrics WHERE isrc = ?"
+        )
+        .bind("USUM71234567")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let isrc_res = process_db_row(
+            &isrc_row,
+            Some(180.0),
+            "diff artist",
+            "diff title",
+            "diff album",
+            &pool,
+        )
+        .await;
+        assert!(isrc_res.is_some());
+
+        // Test duration tolerance rejection
+        let row_mismatch = sqlx::query(
+            "SELECT duration, format, raw_lyrics, isrc, spotify_id, itunes_id FROM lyrics WHERE artist = ? AND title = ? AND album = ?"
+        )
+        .bind("test artist")
+        .bind("test title")
+        .bind("test album")
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(row_mismatch.is_some());
+        let res_mismatch = process_db_row(
+            &row_mismatch.unwrap(),
+            Some(300.0),
+            "test artist",
+            "test title",
+            "test album",
+            &pool,
+        )
+        .await;
+        assert!(res_mismatch.is_none());
+
+        // Confirm deleted due to duration mismatch
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM lyrics")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 0);
     }
 }
