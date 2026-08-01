@@ -1,76 +1,54 @@
 # AGENTS.md
 
-Rust CLI app for synchronized lyrics display via MPRIS (Linux D-Bus). Single crate, no workspace.
+Rust CLI app for synchronized lyrics display via MPRIS (Linux D-Bus). Single binary crate, no workspace.
 
 ## Build & Verify
 
+Execute the standard verification pipeline after making changes:
+
 ```bash
-cargo build --release          # Release binary at target/release/lyricsmpris
-cargo test                     # Unit tests (inline #[cfg(test)] modules)
-cargo clippy                   # Lints
-cargo fmt --check              # Formatting check
+cargo fmt --check && cargo clippy && cargo test
 ```
 
-No separate test runner, CI config, or Makefile exists. Tests are embedded in source files.
+- **Build release**: `cargo build --release` (binary at `target/release/lyricsmpris`)
+- **Single test run**: `cargo test -- <test_name_filter>` (e.g., `cargo test -- test_database_crud`)
+- No Makefile, CI runner, or external database setup required. Inline tests use in-memory SQLite and local mocks.
 
-## Architecture
+## Architecture & Data Flow
 
 ```
-src/
-├── main.rs           # Entry point, CLI parsing (clap), tokio runtime
-├── event.rs          # Event processing (track changes, seeks, playback updates)
-├── pool.rs           # Event loop orchestrator (wires D-Bus → state → UI)
-├── state.rs          # StateBundle, PlayerState, LyricState, Update snapshot
-├── timer.rs          # PlaybackTimer (monotonic position estimation)
-├── text_utils.rs     # Text wrapping utility
-├── lyrics/
-│   ├── providers/    # lrclib.rs, musixmatch.rs (API integrations)
-│   ├── database.rs   # SQLite cache with sqlx + zstd compression
-│   ├── parse.rs      # LRC, Richsync, subtitle parsers
-│   ├── similarity.rs # Fuzzy matching
-│   └── types.rs      # LyricLine, error types
-├── mpris/
-│   ├── connection.rs # D-Bus session singleton, playerctld proxy
-│   ├── events.rs     # D-Bus signal listener (PropertiesChanged)
-│   ├── metadata.rs   # Track metadata extraction from D-Bus
-│   └── playback.rs   # Playback position/status queries
-└── ui/
-    ├── modern.rs     # Ratatui TUI (auto-scroll, karaoke, manual scroll)
-    ├── pipe.rs       # Stdout pipe mode for bar integration
-    └── ...           # Helper modules (styles, progression, util)
+D-Bus signals / MPRIS polling
+      │
+      ▼
+src/mpris/ (events.rs, metadata.rs, connection.rs)
+      │  (extracts TrackMetadata + local ISRC via lofty if --isrc)
+      ▼
+src/pool.rs (event loop orchestrator)
+      │
+      ▼
+src/event.rs (lyrics lookup pipeline)
+      ├─▶ SQLite DB cache (src/lyrics/database.rs)
+      └─▶ External providers (src/lyrics/providers/: lrclib, musixmatch)
+      │
+      ▼
+src/state.rs (StateBundle -> Update snapshot broadcast)
+      │
+      ▼
+src/ui/ (modern.rs Ratatui TUI or pipe.rs stdout)
 ```
 
-**Data flow**: D-Bus events → `pool.rs` event loop → `state.rs` StateBundle → UI update channel → `ui/` renders.
+## Key Components & Conventions
 
-## Key Dependencies
-
-- `zbus` v5 — D-Bus (tokio feature)
-- `ratatui` + `crossterm` — TUI rendering
-- `sqlx` — SQLite async (runtime-tokio)
-- `zstd` — Compression for cached lyrics blobs
-- `clap` v4 — CLI argument parsing (derive mode)
-- `tokio` — Async runtime (full features)
-
-## Conventions
-
-- **Rust edition 2024** (`edition = "2024"` in Cargo.toml). Requires Rust 1.70+.
-- Logging goes to **stderr** via `tracing` + `tracing-subscriber` (env-filter). Off by default; set `RUST_LOG=debug` to enable.
-- State uses immutable `Update` snapshots (Arc-wrapped lyrics) broadcast to observers. Don't mutate `Update` directly.
-- D-Bus connection is a global singleton (`OnceCell<Arc<Connection>>`).
-- Musixmatch tokens rotate round-robin with automatic fallback on 429/401/403.
-- Provider priority: configurable via `--providers` CLI flag or `LYRIC_PROVIDERS` env var. Default: `lrclib,musixmatch`.
-- SQLite cache keys on `(artist, title, album)` — all normalized lowercase. Raw lyrics stored as zstd-compressed blobs.
-
-## Testing
-
-Tests are inline `#[cfg(test)]` modules in: `state.rs`, `timer.rs`, `lyrics/providers/musixmatch.rs`, `mpris/playback.rs`, `mpris/metadata.rs`.
-
-Run with `cargo test`. No external services required for unit tests (they use mocked/local data).
-
-## Gotchas
-
-- No `rustfmt.toml` or `clippy.toml` — uses Rust defaults.
-- No CI workflows (`.github/` is empty).
-- `playerctld` is a recommended runtime dependency for tracking the active MPRIS player. Without it, the app uses a fallback discovery path.
-- The `--database` flag enables SQLite caching; without it, no persistence occurs.
-- `--pipe` mode writes lyrics to stdout — keep stderr for logs to avoid polluting output.
+- **Rust Edition 2024** (`edition = "2024"` in Cargo.toml). Enables Edition 2024 let chains (`if let ... && let ...`).
+- **Musixmatch Token Engine (`src/lyrics/providers/musixmatch.rs`)**:
+  - Tier 1: Round-robin pool from `MUSIXMATCH_USERTOKEN` env var.
+  - Tier 2: Auto-fetches anonymous token via `token.get` API if Tier 1 is unconfigured or exhausted.
+  - Tier 3: Auto-purges invalid tokens on 401/402/403/429 responses, requests a fresh token, and retries once transparently.
+- **Database Engine (`src/lyrics/database.rs`)**:
+  - SQLite pool with `PRIMARY KEY (artist, title, album)`.
+  - Raw lyrics stored as zstd-compressed blobs.
+  - Lookup priority: ISRC (`WHERE isrc = ?`) → `(artist, title, album)` → Spotify ID → iTunes ID.
+  - Duration matching: Clamped within 5% tolerance window; invalid/mismatched entries automatically purged.
+- **ISRC Extraction (`src/mpris/metadata.rs`)**:
+  - `--isrc` inspects `file://` or path in `xesam:url` using `lofty` to extract ISRC tags. Uses `block_in_place` conditionally inside Tokio runtime.
+- **Logging**: Goes exclusively to `stderr` via `tracing` + `tracing-subscriber`. Enable with `RUST_LOG=debug`. Keep `stdout` clean for `--pipe` mode.
