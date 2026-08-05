@@ -53,7 +53,20 @@ impl PipeState {
 
             // Don't print first line immediately - wait for it to become active
         } else if has_lyrics && upd.index != self.last_line_idx {
-            self.print_current_line(&upd);
+            // Detect backward seek: new index is None or less than last printed.
+            // Emit an empty line to clear the stale lyric in pipe consumers
+            // (e.g. Polybar, Waybar) before the song reaches its first lyric again.
+            let seeked_back = match (upd.index, self.last_line_idx) {
+                (None, Some(_)) => true,
+                (Some(new), Some(old)) => new < old,
+                _ => false,
+            };
+            if seeked_back {
+                println!();
+                self.last_line_idx = upd.index;
+            } else {
+                self.print_current_line(&upd);
+            }
         }
 
         // Store update for local position estimation

@@ -503,6 +503,12 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
             let Some(token) = token else { break };
 
             attempts += 1;
+            tracing::debug!(
+                attempt = attempts,
+                total = env_token_count,
+                token_prefix = %&token[..token.len().min(8)],
+                "Musixmatch: using env usertoken (Tier 1)"
+            );
             match fetch_lyrics_with_token(
                 client,
                 &token,
@@ -549,9 +555,19 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
             .ok()
             .and_then(|m| m.get_dynamic_token());
         match cached {
-            Some(t) => t,
+            Some(t) => {
+                tracing::debug!(
+                    token_prefix = %&t[..t.len().min(8)],
+                    "Musixmatch: using cached guest token (Tier 2)"
+                );
+                t
+            }
             None => match fetch_fresh_musixmatch_token(client).await {
                 Ok(fresh) => {
+                    tracing::debug!(
+                        token_prefix = %&fresh[..fresh.len().min(8)],
+                        "Musixmatch: fetched fresh guest token (Tier 2)"
+                    );
                     if let Ok(mut m) = TOKEN_MANAGER.lock() {
                         m.set_dynamic_token(fresh.clone());
                     }

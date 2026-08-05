@@ -11,6 +11,7 @@ use crate::mpris::metadata::{get_metadata, set_isrc_enabled};
 use crate::mpris::playback::get_position;
 use clap::Parser;
 use std::error::Error;
+use std::fs::OpenOptions;
 use tracing_subscriber::EnvFilter;
 // polling removed; no Duration needed here
 
@@ -146,15 +147,41 @@ async fn start_ui(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    // Initialize tracing with environment filter
-    // Logs are OFF by default. Users can enable with RUST_LOG environment variable.
-    // When enabled, logs go to stderr to avoid polluting stdout (used for pipe mode and TUI)
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .with_target(true)
-        .with_thread_ids(false)
-        .with_writer(std::io::stderr)
-        .init();
+    // Initialize tracing with environment filter.
+    // Logs are OFF by default; enable with RUST_LOG=debug (or any level).
+    //
+    // In --pipe mode: logs go to stderr (safe; no TUI active).
+    // In TUI mode:    logs go to a file to avoid corrupting the Ratatui
+    //                 alternate screen. Default path: /tmp/lyricsmpris.log.
+    //                 Override with RUST_LOG_FILE=/path/to/file.
+    //
+    // To watch logs live while the TUI runs:
+    //   RUST_LOG=debug lyricsmpris &
+    //   tail -f /tmp/lyricsmpris.log
+    let pipe_mode = std::env::args().any(|a| a == "--pipe");
+    if pipe_mode {
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .with_target(true)
+            .with_thread_ids(false)
+            .with_writer(std::io::stderr)
+            .init();
+    } else {
+        let log_path =
+            std::env::var("RUST_LOG_FILE").unwrap_or_else(|_| "/tmp/lyricsmpris.log".to_string());
+        let log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .expect("Failed to open log file");
+        tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .with_target(true)
+            .with_thread_ids(false)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(log_file))
+            .init();
+    }
 
     let mut cfg = Config::parse();
     providers_from_env_if_empty(&mut cfg);

@@ -128,8 +128,11 @@ export LYRIC_PROVIDERS="musixmatch,lrclib"
 # Musixmatch custom usertokens (comma-separated for round-robin rotation)
 export MUSIXMATCH_USERTOKEN="token_alpha,token_beta,token_gamma"
 
-# Logging filter (tracing subscriber)
+# Logging level (tracing subscriber); off by default
 export RUST_LOG=info
+
+# Log file path for TUI mode (default: /tmp/lyricsmpris.log)
+export RUST_LOG_FILE=~/.local/share/lyricsmpris/debug.log
 ```
 
 ---
@@ -279,10 +282,22 @@ src/
 ## 🐛 Troubleshooting & Debugging
 
 1. **No Lyrics Displayed / Debugging**:
-   Run with `RUST_LOG=debug` to view detailed D-Bus events and API logs on `stderr`:
-   ```bash
-   RUST_LOG=debug lyricsmpris
-   ```
+   Enable `RUST_LOG=debug` to get detailed D-Bus events and API logs.
+
+   - **TUI mode**: logs are written to a file (default `/tmp/lyricsmpris.log`) to avoid corrupting the terminal UI. Watch them in a second terminal:
+     ```bash
+     RUST_LOG=debug ./lyricsmpris
+     tail -f /tmp/lyricsmpris.log
+     ```
+     Override the log path with `RUST_LOG_FILE`:
+     ```bash
+     RUST_LOG=debug RUST_LOG_FILE=~/lyricsmpris.log ./lyricsmpris
+     ```
+   - **Pipe mode**: logs go to `stderr` as usual:
+     ```bash
+     RUST_LOG=debug ./lyricsmpris --pipe 2>&1 | grep musixmatch
+     ```
+
 2. **Player Not Detected**:
    Verify your media player supports MPRIS via D-Bus:
    ```bash
