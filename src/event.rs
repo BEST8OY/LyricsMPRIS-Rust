@@ -570,24 +570,34 @@ async fn handle_mpris_event(
         return;
     }
 
-    // For seek events, ignore them within 0.5 seconds after lyrics load
+    // For seek events, filter initialization Seeked signals.
+    //
+    // When a track starts, Spotify sends a Seeked signal whose position is
+    // nearly identical to the current playback position (a "position echo").
+    // We ignore it only when BOTH conditions hold:
+    //   1. It arrived within 0.5s of lyrics being loaded (start-of-track window)
+    //   2. The seek position is within 2.0s of our current estimate
+    //      (i.e. not a real user seek that moves position significantly)
+    //
+    // A real user seek during this window — e.g. immediately jumping to 60s —
+    // will have a large position delta and will be processed normally.
     if !is_full_update {
-        // After lyrics are loaded, we fetch a fresh position from D-Bus.
-        // Seeked events that arrive shortly after (within 0.5 seconds) are likely
-        // stale events from track start that arrived during lyrics fetch.
-        // After 0.5 seconds, user seeks should be processed normally.
         if state.player_state.title == meta.title
             && state.player_state.artist == meta.artist
             && state.has_lyrics()
             && let Some(loaded_at) = state.lyrics_loaded_at
         {
-            let elapsed = loaded_at.elapsed();
-            if elapsed.as_secs_f64() < 0.5 {
+            let elapsed = loaded_at.elapsed().as_secs_f64();
+            let current_position = state.player_state.estimate_position();
+            let position_delta = (position - current_position).abs();
+
+            if elapsed < 0.5 && position_delta < 2.0 {
                 tracing::debug!(
                     seek_position = position,
-                    current_position = state.player_state.estimate_position(),
-                    time_since_load = elapsed.as_secs_f64(),
-                    "Ignoring Seeked event within 0.5s of lyrics load"
+                    current_position,
+                    position_delta,
+                    time_since_load = elapsed,
+                    "Ignoring initialization Seeked echo"
                 );
                 return;
             }

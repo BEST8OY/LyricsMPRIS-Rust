@@ -198,12 +198,23 @@ impl PlayerState {
     /// * `playing` - True if the player is playing, false if paused
     /// * `position` - Current playback position in seconds
     pub fn update_playback_dbus(&mut self, playing: bool, position: f64) {
+        let timer_position = self.estimate_position();
         self.set_position(position);
 
         if playing {
             self.start_playing();
+            tracing::debug!(
+                timer_pos = timer_position,
+                mpris_pos = position,
+                "Playback resumed"
+            );
         } else {
             self.pause();
+            tracing::debug!(
+                timer_pos = timer_position,
+                mpris_pos = position,
+                "Playback paused"
+            );
         }
     }
 
