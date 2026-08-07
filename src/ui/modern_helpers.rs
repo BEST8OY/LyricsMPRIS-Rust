@@ -172,7 +172,7 @@ fn collect_before_spans<'a>(
     current_index: usize,
     wrapped_blocks: &[Vec<String>],
     mut lines_needed: usize,
-    style: ratatui::style::Style,
+    styles: &'a LyricStyles,
 ) -> Vec<Line<'a>> {
     let mut result = Vec::new();
 
@@ -180,6 +180,8 @@ fn collect_before_spans<'a>(
     let mut i = current_index;
     while i > 0 && lines_needed > 0 {
         i -= 1;
+        let dist = current_index - i;
+        let style = styles.get_line_style_by_distance(dist, true);
         let block = &wrapped_blocks[i];
         let take = block.len().min(lines_needed);
         let start = block.len() - take;
@@ -202,11 +204,13 @@ fn collect_after_spans<'a>(
     current_index: usize,
     wrapped_blocks: &[Vec<String>],
     mut lines_needed: usize,
-    style: ratatui::style::Style,
+    styles: &'a LyricStyles,
 ) -> Vec<Line<'a>> {
     let mut result = Vec::new();
     let mut j = current_index + 1;
     while j < wrapped_blocks.len() && lines_needed > 0 {
+        let dist = j - current_index;
+        let style = styles.get_line_style_by_distance(dist, false);
         let block = &wrapped_blocks[j];
         let take = block.len().min(lines_needed);
         for line in block.iter().take(take) {
@@ -224,15 +228,20 @@ fn collect_before_blocks<'a>(
     current_index: usize,
     wrapped_blocks: &[Vec<String>],
     blocks_needed: usize,
-    style: ratatui::style::Style,
+    styles: &'a LyricStyles,
 ) -> Vec<Line<'a>> {
     let mut result = Vec::new();
     let start_index = current_index.saturating_sub(blocks_needed);
 
-    for block in wrapped_blocks.iter().take(current_index).skip(start_index) {
+    for block_idx in (start_index..current_index).rev() {
+        let dist = current_index - block_idx;
+        let style = styles.get_line_style_by_distance(dist, true);
+        let block = &wrapped_blocks[block_idx];
+        let mut block_lines = Vec::new();
         for line in block {
-            result.push(Line::from(Span::styled(line.clone(), style)));
+            block_lines.push(Line::from(Span::styled(line.clone(), style)));
         }
+        result.splice(0..0, block_lines);
     }
 
     result
@@ -244,16 +253,19 @@ fn collect_after_blocks<'a>(
     current_index: usize,
     wrapped_blocks: &[Vec<String>],
     blocks_needed: usize,
-    style: ratatui::style::Style,
+    styles: &'a LyricStyles,
 ) -> Vec<Line<'a>> {
     let mut result = Vec::new();
     let end_index = (current_index + 1 + blocks_needed).min(wrapped_blocks.len());
 
-    for block in wrapped_blocks
+    for (block_idx, block) in wrapped_blocks
         .iter()
+        .enumerate()
         .take(end_index)
         .skip(current_index + 1)
     {
+        let dist = block_idx - current_index;
+        let style = styles.get_line_style_by_distance(dist, false);
         for line in block {
             result.push(Line::from(Span::styled(line.clone(), style)));
         }
@@ -380,15 +392,15 @@ pub fn gather_visible_lines<'a>(
     };
 
     let before = if max_visible_lines.is_some() {
-        collect_before_blocks(effective_index, wrapped_blocks, lines_before, styles.before)
+        collect_before_blocks(effective_index, wrapped_blocks, lines_before, styles)
     } else {
-        collect_before_spans(effective_index, wrapped_blocks, lines_before, styles.before)
+        collect_before_spans(effective_index, wrapped_blocks, lines_before, styles)
     };
 
     let after = if max_visible_lines.is_some() {
-        collect_after_blocks(effective_index, wrapped_blocks, lines_after, styles.after)
+        collect_after_blocks(effective_index, wrapped_blocks, lines_after, styles)
     } else {
-        collect_after_spans(effective_index, wrapped_blocks, lines_after, styles.after)
+        collect_after_spans(effective_index, wrapped_blocks, lines_after, styles)
     };
 
     VisibleLines {

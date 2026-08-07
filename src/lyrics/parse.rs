@@ -217,33 +217,62 @@ fn parse_character_array(
     line_start: f64,
     line_end: f64,
 ) -> Option<Vec<crate::lyrics::types::WordTiming>> {
-    let word_timings: Vec<crate::lyrics::types::WordTiming> = char_arr
-        .iter()
-        .enumerate()
-        .filter_map(|(i, elem)| {
-            let text = elem.get("c").and_then(|v| v.as_str()).unwrap_or("");
+    let mut word_timings: Vec<crate::lyrics::types::WordTiming> = Vec::new();
 
-            // Skip whitespace-only entries
-            if text.trim().is_empty() {
-                return None;
+    for (i, elem) in char_arr.iter().enumerate() {
+        let text = elem.get("c").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Skip whitespace-only entries
+        if text.trim().is_empty() {
+            continue;
+        }
+
+        let start_offset = elem.get("o").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let start = line_start + start_offset;
+
+        // Determine raw end offset from the immediate next element in char_arr (e.g. trailing space)
+        let immediate_next_offset = char_arr
+            .get(i + 1)
+            .and_then(|next| next.get("o").and_then(|v| v.as_f64()));
+
+        // Determine start offset of the next non-whitespace word
+        let next_word_offset = char_arr
+            .iter()
+            .skip(i + 1)
+            .find(|next| {
+                next.get("c")
+                    .and_then(|v| v.as_str())
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false)
+            })
+            .and_then(|next| next.get("o").and_then(|v| v.as_f64()));
+
+        let end = match (immediate_next_offset, next_word_offset) {
+            (Some(imm), Some(next_w)) => {
+                let imm_time = line_start + imm;
+                let next_w_time = line_start + next_w;
+                // If inter-word pause is short (<= 0.4s), bridge word end to next word start for smooth rendering
+                if next_w_time - imm_time <= 0.4 {
+                    next_w_time
+                } else {
+                    imm_time
+                }
             }
+            (Some(imm), None) => line_start + imm,
+            (None, Some(next_w)) => line_start + next_w,
+            (None, None) => line_end,
+        };
 
-            let start_offset = elem.get("o").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            let start = line_start + start_offset;
+        // Enforce a minimum display duration of 40ms for fast words
+        const MIN_WORD_DURATION: f64 = 0.040;
+        let final_end = if end <= start {
+            line_end.max(start + MIN_WORD_DURATION)
+        } else {
+            end.max(start + MIN_WORD_DURATION)
+        };
 
-            // Calculate end time from next element or use line end
-            let end = char_arr
-                .get(i + 1)
-                .and_then(|next| next.get("o").and_then(|v| v.as_f64()))
-                .map(|offset| line_start + offset)
-                .unwrap_or(line_end);
-
-            // Validate timing
-            let final_end = if end <= start { line_end } else { end };
-
-            Some(create_word_timing(start, final_end, text))
-        })
-        .collect();
+        word_timings.push(create_word_timing(start, final_end, text));
+    }
 
     if word_timings.is_empty() {
         None
@@ -281,5 +310,126 @@ fn create_word_timing(start: f64, end: f64, text: &str) -> crate::lyrics::types:
         text: text.to_string(),
         grapheme_boundaries,
         grapheme_times,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fast_richsync_parsing_and_bridging() {
+        let fast_richsync = r#"[
+            {
+                "ts": 119.38,
+                "te": 120.355,
+                "l": [
+                    {"c": "And", "o": 0},
+                    {"c": " ", "o": 0.068},
+                    {"c": "the", "o": 0.137},
+                    {"c": " ", "o": 0.154},
+                    {"c": "kids", "o": 0.171},
+                    {"c": " ", "o": 0.187},
+                    {"c": "in", "o": 0.195},
+                    {"c": " ", "o": 0.203},
+                    {"c": "the", "o": 0.254},
+                    {"c": " ", "o": 0.371},
+                    {"c": "dark", "o": 0.405},
+                    {"c": " ", "o": 0.421},
+                    {"c": "that", "o": 0.438},
+                    {"c": " ", "o": 0.522},
+                    {"c": "were", "o": 0.538},
+                    {"c": " ", "o": 0.623},
+                    {"c": "doomed", "o": 0.64},
+                    {"c": " ", "o": 0.774},
+                    {"c": "from", "o": 0.79},
+                    {"c": " ", "o": 0.859},
+                    {"c": "the", "o": 0.875},
+                    {"c": " ", "o": 0.891},
+                    {"c": "start", "o": 0.907}
+                ],
+                "x": "And the kids in the dark that were doomed from the start"
+            }
+        ]"#;
+
+        let parsed = parse_richsync_body(fast_richsync).expect("Should parse fast richsync body");
+        assert_eq!(parsed.len(), 1);
+
+        let line = &parsed[0];
+        let words = line.words.as_ref().expect("Should have words timing");
+        assert_eq!(words.len(), 12);
+
+        // Verify minimum word duration enforcement
+        for word in words {
+            let duration = word.end - word.start;
+            assert!(
+                duration >= 0.039,
+                "Word '{}' duration {}s should be >= 0.040s",
+                word.text,
+                duration
+            );
+        }
+
+        // Verify bridging between 'And' and 'the'
+        let and_word = &words[0];
+        let the_word = &words[1];
+        assert_eq!(and_word.text, "And");
+        assert_eq!(the_word.text, "the");
+        assert!(
+            (and_word.end - the_word.start).abs() < 1e-4,
+            "End of 'And' ({}) should bridge directly to start of 'the' ({})",
+            and_word.end,
+            the_word.start
+        );
+    }
+
+    #[test]
+    fn test_additional_fast_lines_parsing_and_bridging() {
+        let fast_richsync_batch = r#"[
+            {"ts":120.96,"te":122.015,"l":[{"c":"The","o":0},{"c":" ","o":0.073},{"c":"child","o":0.146},{"c":" ","o":0.179},{"c":"in","o":0.187},{"c":" ","o":0.196},{"c":"the","o":0.213},{"c":" ","o":0.246},{"c":"basement,","o":0.413},{"c":" ","o":0.58},{"c":"face","o":0.596},{"c":" ","o":0.713},{"c":"to","o":0.73},{"c":" ","o":0.747},{"c":"the","o":0.765},{"c":" ","o":0.8159},{"c":"pavement","o":0.832}],"x":"The child in the basement, face to the pavement"},
+            {"ts":122.79,"te":123.744,"l":[{"c":"Oh,","o":0},{"c":" ","o":0.016},{"c":"what","o":0.033},{"c":" ","o":0.066},{"c":"a","o":0.074},{"c":" ","o":0.083},{"c":"statement,","o":0.116},{"c":" ","o":0.534},{"c":"love","o":0.551},{"c":" ","o":0.684},{"c":"is","o":0.701},{"c":" ","o":0.751},{"c":"embracement","o":0.835}],"x":"Oh, what a statement, love is embracement"},
+            {"ts":124.27,"te":125.07,"l":[{"c":"Love","o":0},{"c":" ","o":0.138},{"c":"is","o":0.145},{"c":" ","o":0.153},{"c":"a","o":0.162},{"c":" ","o":0.171},{"c":"constant,","o":0.196},{"c":" ","o":0.222},{"c":"love","o":0.239},{"c":" ","o":0.321},{"c":"is","o":0.338},{"c":" ","o":0.406},{"c":"a","o":0.413},{"c":" ","o":0.421},{"c":"basis","o":0.472}],"x":"Love is a constant, love is a basis"},
+            {"ts":125.65,"te":127.966,"l":[{"c":"He","o":0},{"c":" ","o":0.053},{"c":"cannot","o":0.106},{"c":" ","o":0.159},{"c":"be,","o":0.177},{"c":" ","o":0.195},{"c":"she","o":0.224},{"c":" ","o":0.308},{"c":"cannot","o":0.359},{"c":" ","o":0.611},{"c":"be,","o":0.626},{"c":" ","o":0.895},{"c":"they","o":0.911},{"c":" ","o":1.213},{"c":"cannot","o":1.314},{"c":" ","o":1.466},{"c":"be","o":1.49},{"c":" ","o":1.5149},{"c":"changed","o":1.549}],"x":"He cannot be, she cannot be, they cannot be changed"}
+        ]"#;
+
+        let parsed = parse_richsync_body(fast_richsync_batch)
+            .expect("Should parse fast batch richsync body");
+        assert_eq!(parsed.len(), 4);
+
+        for line in &parsed {
+            let words = line
+                .words
+                .as_ref()
+                .expect("Each line should have word timing data");
+            assert!(!words.is_empty());
+
+            // Validate duration and bridging constraints on every word in each fast line
+            for i in 0..words.len() {
+                let word = &words[i];
+                let duration = word.end - word.start;
+                assert!(
+                    duration >= 0.039,
+                    "Line '{}' -> Word '{}' duration {}s should be >= 0.040s",
+                    line.text,
+                    word.text,
+                    duration
+                );
+
+                if i + 1 < words.len() {
+                    let next_word = &words[i + 1];
+                    // Verify bridging when next word starts close by (< 0.4s)
+                    if next_word.start - word.start <= 0.4 {
+                        assert!(
+                            word.end >= next_word.start - 1e-4,
+                            "Word '{}' end ({}) should bridge to next word '{}' start ({})",
+                            word.text,
+                            word.end,
+                            next_word.text,
+                            next_word.start
+                        );
+                    }
+                }
+            }
+        }
     }
 }

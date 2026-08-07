@@ -111,7 +111,8 @@ fn update_best_delay(best: &mut Option<f64>, boundary: f64, position: f64) {
 
 /// Create a tokio sleep with the given delay in seconds.
 fn create_sleep(delay_secs: f64) -> Pin<Box<Sleep>> {
-    let delay = delay_secs.max(0.0);
+    // Clamp minimum sleep delay to 12ms to match terminal frame timing & avoid OS timer thrashing
+    let delay = delay_secs.max(0.012);
     let when = tokio::time::Instant::now() + Duration::from_secs_f64(delay);
     Box::pin(tokio::time::sleep_until(when))
 }

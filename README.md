@@ -205,6 +205,7 @@ When looking up a track in the cache, queries execute in the following order:
 ### Compression & Validation
 - **Zstd Level 3**: Raw lyrics payloads (LRC text / Richsync JSON) are compressed before storage to save space.
 - **Duration Tolerance**: Cached entries validate playback duration within a 5% tolerance window; invalid or outdated entries are purged automatically.
+- **Atomic Format Upgrades**: Uses `INSERT OR REPLACE` on `PRIMARY KEY (artist, title, album)` so fresh provider fetches automatically overwrite legacy cache rows (e.g., upgrading standard line-synced LRC text to word-level Musixmatch Richsync JSON).
 
 ---
 
