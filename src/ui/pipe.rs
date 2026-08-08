@@ -51,20 +51,16 @@ impl PipeState {
             self.handle_track_change();
             self.last_track_id = Some(track_id);
 
-            // Don't print first line immediately - wait for it to become active
+            if has_lyrics && upd.index.is_some() {
+                self.print_current_line(&upd);
+            }
         } else if has_lyrics && upd.index != self.last_line_idx {
-            // Detect backward seek: new index is None or less than last printed.
-            // Emit an empty line to clear the stale lyric in pipe consumers
-            // (e.g. Polybar, Waybar) before the song reaches its first lyric again.
-            let seeked_back = match (upd.index, self.last_line_idx) {
-                (None, Some(_)) => true,
-                (Some(new), Some(old)) => new < old,
-                _ => false,
-            };
-            if seeked_back {
+            if upd.index.is_none() {
+                // Seeked back before first lyric line: clear pipe consumer (e.g. Polybar, Waybar)
                 println!();
-                self.last_line_idx = upd.index;
+                self.last_line_idx = None;
             } else {
+                // Seeked to a valid lyric line (forward or backward): print current line immediately
                 self.print_current_line(&upd);
             }
         }
@@ -165,4 +161,78 @@ pub async fn display_lyrics_pipe(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_pipe_state_seek_before_first_line_and_middle_of_line() {
+        let mut pipe_state = PipeState::new();
+
+        let lines = vec![
+            crate::lyrics::LyricLine {
+                time: 10.0,
+                text: "Line 1".to_string(),
+                words: None,
+            },
+            crate::lyrics::LyricLine {
+                time: 50.0,
+                text: "Line 2".to_string(),
+                words: None,
+            },
+        ];
+
+        let update_60s = crate::state::Update {
+            lines: Arc::new(lines.clone()),
+            index: Some(1),
+            position: 60.0,
+            playing: true,
+            version: 1,
+            err: None,
+            provider: None,
+            title: "Title".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+        };
+
+        pipe_state.update_from_mpris(update_60s);
+        assert_eq!(pipe_state.last_line_idx, Some(1));
+
+        // Seek to 2s (before first line, index = None)
+        let update_2s = crate::state::Update {
+            lines: Arc::new(lines.clone()),
+            index: None,
+            position: 2.0,
+            playing: true,
+            version: 2,
+            err: None,
+            provider: None,
+            title: "Title".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+        };
+
+        pipe_state.update_from_mpris(update_2s);
+        assert_eq!(pipe_state.last_line_idx, None);
+
+        // Seek to 25s (middle of Line 1, index = Some(0))
+        let update_25s = crate::state::Update {
+            lines: Arc::new(lines),
+            index: Some(0),
+            position: 25.0,
+            playing: true,
+            version: 3,
+            err: None,
+            provider: None,
+            title: "Title".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+        };
+
+        pipe_state.update_from_mpris(update_25s);
+        assert_eq!(pipe_state.last_line_idx, Some(0));
+    }
 }

@@ -559,7 +559,7 @@ impl StateBundle {
         self.increment_version();
     }
 
-    /// Updates the active lyric line index based on playback position.
+    /// Updates active lyric line index based on playback position.
     ///
     /// Increments version and returns `true` if the index changed.
     ///
@@ -575,6 +575,35 @@ impl StateBundle {
         }
 
         changed
+    }
+
+    /// Updates playback state (playing/paused) and position anchor with seek detection.
+    ///
+    /// Detects position jumps (|observed_pos - estimated_pos| > 0.5s) and increments `version`
+    /// so that change detection automatically notifies subscribers of seek events (even if line index does not change).
+    ///
+    /// # Returns
+    /// Returns `(playing_changed, index_changed, position_jumped)`.
+    pub fn update_playback_and_position(
+        &mut self,
+        playing: bool,
+        position: f64,
+    ) -> (bool, bool, bool) {
+        let prev_playing = self.player_state.playing;
+        let prev_position = self.player_state.estimate_position();
+
+        self.player_state.update_playback_dbus(playing, position);
+
+        let current_position = self.player_state.estimate_position();
+        let changed_index = self.update_index(current_position);
+        let playing_changed = prev_playing != self.player_state.playing;
+        let position_jumped = (current_position - prev_position).abs() > 0.5;
+
+        if playing_changed || position_jumped {
+            self.increment_version();
+        }
+
+        (playing_changed, changed_index, position_jumped)
     }
 
     /// Increments the version counter, wrapping on overflow.

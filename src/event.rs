@@ -604,8 +604,8 @@ async fn handle_mpris_event(
         }
 
         // Legitimate seek event - update position immediately
-        state.player_state.set_position(position);
-        state.update_index(position);
+        let playing = state.player_state.playing;
+        state.update_playback_and_position(playing, position);
         send_update(state, update_tx, true).await;
         return;
     }
@@ -694,30 +694,22 @@ async fn handle_new_track(ctx: NewTrackContext<'_>) {
 /// Updates are sent only if:
 /// - Playing state changed (play ↔ pause)
 /// - Active lyric line changed
+/// - Position seek occurred
 async fn handle_state_update(
     position: f64,
     playback_status: Option<String>,
     state: &mut StateBundle,
     update_tx: &mpsc::Sender<Update>,
 ) {
-    let prev_playing = state.player_state.playing;
+    let playing = playback_status
+        .map(|s| s == "Playing")
+        .unwrap_or(state.player_state.playing);
 
-    // Update playback state
-    if let Some(status) = playback_status {
-        let playing = status == "Playing";
-        state.player_state.update_playback_dbus(playing, position);
-    } else {
-        state.player_state.set_position(position);
-    }
+    let (playing_changed, changed_index, position_jumped) =
+        state.update_playback_and_position(playing, position);
 
-    // Update lyric index based on current position
-    let current_position = state.player_state.estimate_position();
-    let changed_index = state.update_index(current_position);
-
-    // Send update if meaningful change occurred
-    let playing_changed = prev_playing != state.player_state.playing;
-    if playing_changed || changed_index {
-        send_update(state, update_tx, false).await;
+    if playing_changed || changed_index || position_jumped {
+        send_update(state, update_tx, position_jumped).await;
     }
 }
 
@@ -729,4 +721,39 @@ async fn get_playback_status(service: &str) -> Option<String> {
         .await
         .ok()
         .filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_handle_state_update_seek_jump() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut state = StateBundle::new();
+
+        let lines = vec![
+            crate::lyrics::LyricLine {
+                time: 10.0,
+                text: "Line 1".to_string(),
+                words: None,
+            },
+            crate::lyrics::LyricLine {
+                time: 50.0,
+                text: "Line 2".to_string(),
+                words: None,
+            },
+        ];
+        state.lyric_state.update_lines(lines);
+        state.player_state.update_playback_dbus(true, 45.0);
+        state.update_index(45.0);
+        state.mark_state_sent();
+
+        // Perform backward seek into middle of Line 1 (time 20.0s)
+        handle_state_update(20.0, Some("Playing".to_string()), &mut state, &tx).await;
+
+        let update = rx.recv().await.expect("Seek update should be received");
+        assert_eq!(update.index, Some(0));
+        assert!((update.position - 20.0).abs() < 0.5);
+    }
 }
