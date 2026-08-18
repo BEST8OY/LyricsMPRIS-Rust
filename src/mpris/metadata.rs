@@ -318,6 +318,14 @@ mod tests {
 
     #[test]
     fn test_isrc_from_metadata_nonexistent_file() {
+        struct IsrcGuard(bool);
+        impl Drop for IsrcGuard {
+            fn drop(&mut self) {
+                set_isrc_enabled(self.0);
+            }
+        }
+        let _guard = IsrcGuard(isrc_enabled());
+
         set_isrc_enabled(true);
         assert_eq!(
             isrc_from_metadata(Some("file:///nonexistent/path/to/song.mp3")),
@@ -327,6 +335,5 @@ mod tests {
             isrc_from_metadata(Some("https://example.com/song.mp3")),
             None
         );
-        set_isrc_enabled(false);
     }
 }

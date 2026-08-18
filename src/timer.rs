@@ -226,15 +226,6 @@ impl PlaybackTimer {
             base
         }
     }
-    /// Returns the current anchor position (without time progression).
-    ///
-    /// This is the last position set via [`set_position`](Self::set_position)
-    /// or [`reset`](Self::reset).
-    #[must_use]
-    #[allow(dead_code)]
-    pub const fn anchor_position(&self) -> f64 {
-        self.anchor_position
-    }
 }
 
 /// Sanitizes a position value to ensure it's valid for playback tracking.
@@ -342,12 +333,5 @@ mod tests {
         // Infinity should be sanitized to 0.0
         timer.set_position(f64::INFINITY);
         assert_eq!(timer.estimate(false), 0.0);
-    }
-
-    #[test]
-    fn test_timer_anchor_position() {
-        let mut timer = PlaybackTimer::default();
-        timer.set_position(42.0);
-        assert_eq!(timer.anchor_position(), 42.0);
     }
 }
