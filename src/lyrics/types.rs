@@ -14,9 +14,9 @@ static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
 /// Track identifiers extracted from or provided for a lyrics lookup.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TrackMatchInfo {
-    pub track_isrc: Option<String>,
-    pub track_spotify_id: Option<String>,
-    pub track_itunes_id: Option<String>,
+    pub track_isrcs: Vec<String>,
+    pub track_spotify_ids: Vec<String>,
+    pub track_itunes_ids: Vec<String>,
 }
 
 /// Provider result: parsed lines plus optional raw lyrics string (LRC format or JSON)

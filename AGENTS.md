@@ -48,7 +48,7 @@ src/ui/ (modern.rs Ratatui TUI or pipe.rs stdout)
   - SQLite pool with `PRIMARY KEY (artist, title, album)`.
   - Raw lyrics stored as zstd-compressed blobs.
   - Lookup priority: ISRC (`WHERE isrc = ?`) → `(artist, title, album)` → Spotify ID → iTunes ID.
-  - Duration matching: Clamped within 5% tolerance window; invalid/mismatched entries automatically purged.
+  - Duration matching: Clamped within 2.0s tolerance window; invalid/mismatched entries automatically purged.
 - **ISRC Extraction (`src/mpris/metadata.rs`)**:
   - `--isrc` inspects `file://` or path in `xesam:url` using `lofty` to extract ISRC tags. Uses `block_in_place` conditionally inside Tokio runtime.
 - **Logging**: Goes exclusively to `stderr` via `tracing` + `tracing-subscriber`. Enable with `RUST_LOG=debug`. Keep `stdout` clean for `--pipe` mode.
