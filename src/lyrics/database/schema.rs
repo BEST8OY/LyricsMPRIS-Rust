@@ -1,5 +1,6 @@
 //! Database schema definition, types, and connection setup.
 
+use crate::lyrics::types::TrackMatchInfo;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 use std::str::FromStr;
@@ -42,165 +43,83 @@ impl LyricsFormat {
 
 /// Database entry for a single track's lyrics (from SQL query).
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct LyricsEntry {
+    pub id: i64,
+    pub artist: String,
+    pub title: String,
+    pub album: String,
     pub duration: Option<f64>,
     pub format: LyricsFormat,
     pub raw_lyrics: String,
-    pub isrc: Option<String>,
-    pub spotify_id: Option<String>,
-    pub itunes_id: Option<String>,
+    pub track_ids: TrackMatchInfo,
 }
 
 /// Creates the database schema and indexes if they don't exist.
 pub(crate) async fn create_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query("PRAGMA foreign_keys = ON;")
+        .execute(pool)
+        .await?;
+
+    // Drop legacy junction tables if upgrading from older versions
+    sqlx::query("DROP TABLE IF EXISTS track_isrcs;")
+        .execute(pool)
+        .await?;
+    sqlx::query("DROP TABLE IF EXISTS track_spotify_ids;")
+        .execute(pool)
+        .await?;
+    sqlx::query("DROP TABLE IF EXISTS track_itunes_ids;")
+        .execute(pool)
+        .await?;
+
+    // Main lyrics table with integer primary key and unique track composite constraint
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS lyrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             artist TEXT NOT NULL,
             title TEXT NOT NULL,
             album TEXT NOT NULL,
             duration REAL,
             format TEXT NOT NULL,
             raw_lyrics BLOB NOT NULL,
-            isrc TEXT,
-            spotify_id TEXT,
-            itunes_id TEXT,
-            PRIMARY KEY (artist, title, album)
+            UNIQUE (artist, title, album)
         )
         "#,
     )
     .execute(pool)
     .await?;
 
-    // Create index for fast lookups by artist/title/album
+    // Index for fast lookups by artist/title/album
     sqlx::query(
         r#"
-        CREATE INDEX IF NOT EXISTS idx_lookup
+        CREATE INDEX IF NOT EXISTS idx_lyrics_lookup
         ON lyrics(artist, title, album)
         "#,
     )
     .execute(pool)
     .await?;
 
-    // Create indexes for track identifier lookups
+    // Unified clustered identifier table (WITHOUT ROWID) mapping (kind, value) -> track_id
     sqlx::query(
         r#"
-        CREATE INDEX IF NOT EXISTS idx_isrc ON lyrics(isrc)
+        CREATE TABLE IF NOT EXISTS track_identifiers (
+            kind TEXT NOT NULL,
+            value TEXT NOT NULL,
+            track_id INTEGER NOT NULL REFERENCES lyrics(id) ON DELETE CASCADE,
+            ordering INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (kind, value, track_id)
+        ) WITHOUT ROWID
         "#,
     )
     .execute(pool)
     .await?;
 
-    // Create table for multi-ISRC indexing
+    // Secondary index for fast lookups and cascades by track_id
     sqlx::query(
         r#"
-        CREATE TABLE IF NOT EXISTS track_isrcs (
-            artist TEXT NOT NULL,
-            title TEXT NOT NULL,
-            album TEXT NOT NULL,
-            isrc TEXT NOT NULL,
-            PRIMARY KEY (artist, title, album, isrc)
-        )
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE INDEX IF NOT EXISTS idx_track_isrcs_isrc ON track_isrcs(isrc)
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    // Backfill existing ISRCs from lyrics into track_isrcs table if any exist
-    sqlx::query(
-        r#"
-        INSERT OR IGNORE INTO track_isrcs (artist, title, album, isrc)
-        SELECT artist, title, album, isrc FROM lyrics WHERE isrc IS NOT NULL AND isrc != ''
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    // Create table for multi-Spotify ID indexing
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS track_spotify_ids (
-            artist TEXT NOT NULL,
-            title TEXT NOT NULL,
-            album TEXT NOT NULL,
-            spotify_id TEXT NOT NULL,
-            PRIMARY KEY (artist, title, album, spotify_id)
-        )
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE INDEX IF NOT EXISTS idx_track_spotify_ids_spotify_id ON track_spotify_ids(spotify_id)
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    // Backfill existing spotify_ids from lyrics into track_spotify_ids table if any exist
-    sqlx::query(
-        r#"
-        INSERT OR IGNORE INTO track_spotify_ids (artist, title, album, spotify_id)
-        SELECT artist, title, album, spotify_id FROM lyrics WHERE spotify_id IS NOT NULL AND spotify_id != ''
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    // Create table for multi-iTunes ID indexing
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS track_itunes_ids (
-            artist TEXT NOT NULL,
-            title TEXT NOT NULL,
-            album TEXT NOT NULL,
-            itunes_id TEXT NOT NULL,
-            PRIMARY KEY (artist, title, album, itunes_id)
-        )
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE INDEX IF NOT EXISTS idx_track_itunes_ids_itunes_id ON track_itunes_ids(itunes_id)
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    // Backfill existing itunes_ids from lyrics into track_itunes_ids table if any exist
-    sqlx::query(
-        r#"
-        INSERT OR IGNORE INTO track_itunes_ids (artist, title, album, itunes_id)
-        SELECT artist, title, album, itunes_id FROM lyrics WHERE itunes_id IS NOT NULL AND itunes_id != ''
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE INDEX IF NOT EXISTS idx_spotify_id ON lyrics(spotify_id)
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    sqlx::query(
-        r#"
-        CREATE INDEX IF NOT EXISTS idx_itunes_id ON lyrics(itunes_id)
+        CREATE INDEX IF NOT EXISTS idx_track_identifiers_track_id
+        ON track_identifiers(track_id)
         "#,
     )
     .execute(pool)
@@ -219,6 +138,7 @@ pub(crate) async fn open_database(path: &Path) -> Result<SqlitePool, sqlx::Error
     // Configure SQLite connection
     let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
         .create_if_missing(true)
+        .foreign_keys(true)
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal); // Write-Ahead Logging for better concurrency
 
     // Create connection pool (max 5 connections)

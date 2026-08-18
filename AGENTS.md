@@ -44,10 +44,11 @@ src/ui/ (modern.rs Ratatui TUI or pipe.rs stdout)
   - Tier 1: Round-robin pool from `MUSIXMATCH_USERTOKEN` env var.
   - Tier 2: Auto-fetches anonymous token via `token.get` API if Tier 1 is unconfigured or exhausted.
   - Tier 3: Auto-purges invalid tokens on 401/402/403/429 responses, requests a fresh token, and retries once transparently.
-- **Database Engine (`src/lyrics/database.rs`)**:
-  - SQLite pool with `PRIMARY KEY (artist, title, album)`.
+- **Database Engine (`src/lyrics/database/`)**:
+  - SQLite pool with `lyrics (id INTEGER PRIMARY KEY)` and `UNIQUE(artist, title, album)`.
+  - Unified `track_identifiers (kind, value, track_id)` clustered table (`WITHOUT ROWID`) with cascading foreign keys.
   - Raw lyrics stored as zstd-compressed blobs.
-  - Lookup priority: ISRC (`WHERE isrc = ?`) → `(artist, title, album)` → Spotify ID → iTunes ID.
+  - Lookup priority: ISRC (`track_identifiers`) → `(artist, title, album)` → Spotify ID → iTunes ID.
   - Duration matching: Clamped within 2.0s tolerance window; invalid/mismatched entries automatically purged.
 - **ISRC Extraction (`src/mpris/metadata.rs`)**:
   - `--isrc` inspects `file://` or path in `xesam:url` using `lofty` to extract ISRC tags. Uses `block_in_place` conditionally inside Tokio runtime.

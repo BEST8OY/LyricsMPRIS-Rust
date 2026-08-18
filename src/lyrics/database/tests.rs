@@ -1,4 +1,4 @@
-//! Integration and unit tests for database CRUD operations and identifier indexing.
+//! Integration and unit tests for database CRUD operations and unified identifier indexing.
 
 use super::ops::{fetch_from_database_inner, store_in_database_inner};
 use super::schema::{LyricsFormat, create_schema};
@@ -52,12 +52,10 @@ async fn test_database_crud_and_lookups() {
     let (lines, raw, ids) = res_key.unwrap().unwrap();
     assert_eq!(lines.len(), 2);
     assert_eq!(raw, Some(lrc_content.to_string()));
-    assert_eq!(ids.track_isrcs, vec!["USUM71234567".to_string()]);
-    assert_eq!(
-        ids.track_spotify_ids,
-        vec!["5FVd6KXrgO9B3JPmC8OPst".to_string()]
-    );
-    assert_eq!(ids.track_itunes_ids, vec!["123456789".to_string()]);
+    // Assert all associated IDs are correctly recovered
+    assert_eq!(ids.track_isrcs, isrcs);
+    assert_eq!(ids.track_spotify_ids, spotify_ids);
+    assert_eq!(ids.track_itunes_ids, itunes_ids);
 
     // 3. Fetch by primary ISRC (with unknown artist/title)
     let res_isrc = fetch_from_database_inner(
@@ -171,28 +169,16 @@ async fn test_database_crud_and_lookups() {
     .await;
     assert!(res_mismatch.is_none());
 
-    // 11. Confirm row and all associated ISRCs, Spotify IDs, and iTunes IDs were deleted due to duration mismatch
+    // 11. Confirm row in lyrics AND all associated identifiers in track_identifiers were deleted due to duration mismatch
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM lyrics")
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(count.0, 0);
 
-    let isrc_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM track_isrcs")
+    let identifier_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM track_identifiers")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(isrc_count.0, 0);
-
-    let spotify_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM track_spotify_ids")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(spotify_count.0, 0);
-
-    let itunes_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM track_itunes_ids")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(itunes_count.0, 0);
+    assert_eq!(identifier_count.0, 0);
 }
