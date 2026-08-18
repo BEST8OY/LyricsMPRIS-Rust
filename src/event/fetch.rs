@@ -39,13 +39,6 @@ pub(crate) async fn store_lyrics_in_cache(
     provider_itunes_ids: &[String],
 ) {
     if let Some(raw_text) = raw {
-        let mut isrcs = provider_isrcs.to_vec();
-        if let Some(meta_isrc) = &meta.isrc
-            && !isrcs.iter().any(|s| s.eq_ignore_ascii_case(meta_isrc))
-        {
-            isrcs.push(meta_isrc.clone());
-        }
-
         let mut spotify_ids = provider_spotify_ids.to_vec();
         if let Some(meta_sid) = &meta.spotify_id
             && !spotify_ids.iter().any(|s| s.eq_ignore_ascii_case(meta_sid))
@@ -69,7 +62,7 @@ pub(crate) async fn store_lyrics_in_cache(
             meta.length,
             format,
             raw_text,
-            &isrcs,
+            provider_isrcs,
             &spotify_ids,
             &itunes_ids,
         )
