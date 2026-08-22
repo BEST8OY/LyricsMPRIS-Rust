@@ -65,7 +65,7 @@ pub async fn fetch_from_database(
     isrc: Option<&str>,
     spotify_id: Option<&str>,
     itunes_id: Option<&str>,
-) -> Option<ProviderResult> {
+) -> Option<(ProviderResult, LyricsFormat)> {
     let pool = DB_POOL.get()?;
     ops::fetch_from_database_inner(
         pool, artist, title, album, duration, isrc, spotify_id, itunes_id,

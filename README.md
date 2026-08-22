@@ -173,39 +173,54 @@ Enabling `--database <PATH>` activates persistent local caching to minimize netw
 
 ### Database Schema
 
+The SQLite caching engine uses a 3-table normalized relational layout:
+
 ```sql
+-- Canonical lyrics table (one row per unique recording / lyrics payload)
 CREATE TABLE IF NOT EXISTS lyrics (
+    id INTEGER PRIMARY KEY,
+    artist TEXT NOT NULL,
+    title TEXT NOT NULL,
+    duration REAL,
+    format TEXT NOT NULL,
+    raw_lyrics BLOB NOT NULL
+);
+
+-- Multi-album alias table mapping (artist, title, album) -> canonical lyrics_id
+CREATE TABLE IF NOT EXISTS track_aliases (
     artist TEXT NOT NULL,
     title TEXT NOT NULL,
     album TEXT NOT NULL,
-    duration REAL,
-    format TEXT NOT NULL,
-    raw_lyrics BLOB NOT NULL,
-    isrc TEXT,
-    spotify_id TEXT,
-    itunes_id TEXT,
+    lyrics_id INTEGER NOT NULL REFERENCES lyrics(id) ON DELETE CASCADE,
     PRIMARY KEY (artist, title, album)
-);
+) WITHOUT ROWID;
 
-CREATE INDEX IF NOT EXISTS idx_lookup ON lyrics(artist, title, album);
-CREATE INDEX IF NOT EXISTS idx_isrc ON lyrics(isrc);
-CREATE INDEX IF NOT EXISTS idx_spotify_id ON lyrics(spotify_id);
-CREATE INDEX IF NOT EXISTS idx_itunes_id ON lyrics(itunes_id);
+-- Unified identifier table mapping (kind, value) -> unique canonical lyrics_id
+CREATE TABLE IF NOT EXISTS track_identifiers (
+    kind TEXT NOT NULL,
+    value TEXT NOT NULL,
+    lyrics_id INTEGER NOT NULL REFERENCES lyrics(id) ON DELETE CASCADE,
+    ordering INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (kind, value)
+) WITHOUT ROWID;
 ```
 
 ### Lookup Resolution Priority
 
 When looking up a track in the cache, queries execute in the following order:
 
-1. **ISRC Match** (`WHERE isrc = ?`) — Most accurate unique track identifier.
-2. **Normalized Metadata Match** (`WHERE artist = ? AND title = ? AND album = ?`) — Case-insensitive fallback.
-3. **Spotify ID Match** (`WHERE spotify_id = ?`) — Fallback via Spotify track ID.
-4. **iTunes ID Match** (`WHERE itunes_id = ?`) — Fallback via iTunes track ID.
+1. **ISRC Match** (`track_identifiers` where `kind = 'isrc'`) — Authoritative unique track identifier (punctuation-agnostic normalization).
+2. **Exact Track Alias Match** (`track_aliases` where `artist = ? AND title = ? AND album = ?`) — Case-insensitive multi-album mapping.
+3. **Spotify ID Match** (`track_identifiers` where `kind = 'spotify'`) — Fallback via Spotify track ID.
+4. **iTunes ID Match** (`track_identifiers` where `kind = 'itunes'`) — Fallback via iTunes track ID.
+5. **Fuzzy Track Match** (`track_aliases` where `artist = ? AND title = ?`) — Resolves matches across compilations or remastered album tags.
 
-### Compression & Validation
-- **Zstd Level 3**: Raw lyrics payloads (LRC text / Richsync JSON) are compressed before storage to save space.
-- **Duration Tolerance**: Cached entries validate playback duration within a 5% tolerance window; invalid or outdated entries are purged automatically.
-- **Atomic Format Upgrades**: Uses `INSERT OR REPLACE` on `PRIMARY KEY (artist, title, album)` so fresh provider fetches automatically overwrite legacy cache rows (e.g., upgrading standard line-synced LRC text to word-level Musixmatch Richsync JSON).
+### Compression, Fidelity & Concurrency
+
+- **Zstd Compression**: Raw lyrics payloads are stored as zstd-compressed blobs.
+- **Duration Tolerance**: Clamped within a 2.0s tolerance window; duration-mismatched entries are retained (multi-version matching for live vs. studio recordings); only corrupt or unparseable payloads are purged.
+- **Format Fidelity Ranking**: Richsync (word-level, rank 3) > Subtitles (line-level, rank 2) > LRCLIB (LRC, rank 1). Incoming lower-fidelity fetches never downgrade higher-fidelity cached lyrics.
+- **Writer Concurrency**: Uses WAL journal mode with `BEGIN IMMEDIATE` and a busy timeout to serialize concurrent database transactions without lock contention.
 
 ---
 
@@ -256,16 +271,15 @@ format-prefix-foreground = #8abeb7
 ```
 src/
 ├── main.rs           # Entry point, CLI argument parsing (clap), tokio runtime
-├── event.rs          # Event coordinator (track changes, seeks, provider dispatch)
+├── event/            # Event coordinator (fetch pipeline, MPRIS handlers)
 ├── pool.rs           # Event loop supervisor (wires D-Bus → state → UI)
 ├── state.rs          # StateBundle, PlayerState, LyricState, Update snapshot
 ├── timer.rs          # PlaybackTimer (monotonic position estimation)
 ├── text_utils.rs     # Text wrapping utility
 ├── lyrics/
 │   ├── providers/    # lrclib.rs, musixmatch.rs (API integrations & token manager)
-│   ├── database.rs   # SQLite cache engine with sqlx + Zstd compression
+│   ├── database/     # SQLite cache engine with sqlx + Zstd compression
 │   ├── parse.rs      # LRC, Richsync, subtitle parsers
-│   ├── similarity.rs # Fuzzy song matching
 │   └── types.rs      # LyricLine, TrackMatchInfo, error models
 ├── mpris/
 │   ├── connection.rs # D-Bus session singleton

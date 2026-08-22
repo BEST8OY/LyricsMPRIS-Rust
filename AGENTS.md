@@ -45,11 +45,11 @@ src/ui/ (modern.rs Ratatui TUI or pipe.rs stdout)
   - Tier 2: Auto-fetches anonymous token via `token.get` API if Tier 1 is unconfigured or exhausted.
   - Tier 3: Auto-purges invalid tokens on 401/402/403/429 responses, requests a fresh token, and retries once transparently.
 - **Database Engine (`src/lyrics/database/`)**:
-  - SQLite pool with `lyrics (id INTEGER PRIMARY KEY)` and `UNIQUE(artist, title, album)`.
-  - Unified `track_identifiers (kind, value, track_id)` clustered table (`WITHOUT ROWID`) with cascading foreign keys.
-  - Raw lyrics stored as zstd-compressed blobs.
-  - Lookup priority: ISRC (`track_identifiers`) → `(artist, title, album)` → Spotify ID → iTunes ID.
-  - Duration matching: Clamped within 2.0s tolerance window; invalid/mismatched entries automatically purged.
+  - SQLite pool with `lyrics (id INTEGER PRIMARY KEY)`, multi-album alias table `track_aliases (artist, title, album, lyrics_id)` (`WITHOUT ROWID`), and unified `track_identifiers (kind, value, lyrics_id)` clustered table (`WITHOUT ROWID`) with cascading foreign keys.
+  - Raw lyrics stored as zstd-compressed blobs with explicit `LyricsFormat` (`Richsync`, `Subtitles`, `Lrclib`).
+  - Lookup priority: ISRC (`track_identifiers`) → `track_aliases (artist, title, album)` → Spotify ID → iTunes ID → fuzzy `(artist, title)` across any album.
+  - Duration matching: Clamped within 2.0s tolerance window; duration-mismatched entries are retained (multi-version matching); only corrupt/unparseable entries are purged.
+  - Format fidelity ranking: Richsync (3) > Subtitles (2) > Lrclib (1); incoming lower-fidelity formats never downgrade cached higher-fidelity lyrics.
 - **ISRC Extraction (`src/mpris/metadata.rs`)**:
   - `--isrc` inspects `file://` or path in `xesam:url` using `lofty` to extract ISRC tags. Uses `block_in_place` conditionally inside Tokio runtime.
 - **Logging**: Goes exclusively to `stderr` via `tracing` + `tracing-subscriber`. Enable with `RUST_LOG=debug`. Keep `stdout` clean for `--pipe` mode.

@@ -111,6 +111,15 @@ pub(crate) fn provider_to_db_format(provider: Provider) -> crate::lyrics::databa
     }
 }
 
+/// Maps a database LyricsFormat to the corresponding Provider enum.
+pub(crate) fn db_format_to_provider(format: crate::lyrics::database::LyricsFormat) -> Provider {
+    match format {
+        crate::lyrics::database::LyricsFormat::Lrclib => Provider::Lrclib,
+        crate::lyrics::database::LyricsFormat::Richsync => Provider::MusixmatchRichsync,
+        crate::lyrics::database::LyricsFormat::Subtitles => Provider::MusixmatchSubtitles,
+    }
+}
+
 /// Fetches lyrics from Musixmatch.
 pub(crate) async fn try_musixmatch(meta: &TrackMetadata, state: &mut StateBundle) -> FetchResult {
     match crate::lyrics::fetch_lyrics_from_musixmatch_usertoken(
@@ -125,7 +134,7 @@ pub(crate) async fn try_musixmatch(meta: &TrackMetadata, state: &mut StateBundle
     .await
     {
         Ok((lines, raw, ids)) if !lines.is_empty() => {
-            let provider = determine_musixmatch_provider(&lines, &raw);
+            let provider = determine_musixmatch_provider(&lines);
             state.update_lyrics(lines, meta, None, Some(provider));
 
             let format = provider_to_db_format(provider);
@@ -148,44 +157,17 @@ pub(crate) async fn try_musixmatch(meta: &TrackMetadata, state: &mut StateBundle
 }
 
 /// Determines which Musixmatch format was returned.
-pub(crate) fn determine_musixmatch_provider(
-    lines: &[crate::lyrics::LyricLine],
-    raw: &Option<String>,
-) -> Provider {
-    let has_words = lines.iter().any(|l| l.words.is_some());
-    let is_richsync = raw
-        .as_deref()
-        .is_some_and(|r| r.starts_with(";;richsync=1"));
-
-    if has_words || is_richsync {
+pub(crate) fn determine_musixmatch_provider(lines: &[crate::lyrics::LyricLine]) -> Provider {
+    if lines.iter().any(|l| l.words.is_some()) {
         Provider::MusixmatchRichsync
     } else {
         Provider::MusixmatchSubtitles
     }
 }
 
-/// Determines provider type from raw lyrics format.
-pub(crate) fn detect_provider_from_raw(raw: &Option<String>) -> Option<Provider> {
-    raw.as_deref().map(|text| {
-        let trimmed = text.trim_start();
-        if trimmed.starts_with("[{") {
-            if trimmed.contains("\"ts\":")
-                || trimmed.contains("\"l\":[")
-                || trimmed.contains("\"words\":[")
-            {
-                Provider::MusixmatchRichsync
-            } else {
-                Provider::MusixmatchSubtitles
-            }
-        } else {
-            Provider::Lrclib
-        }
-    })
-}
-
 /// Attempts to fetch lyrics from the database cache.
 pub(crate) async fn try_database(meta: &TrackMetadata, state: &mut StateBundle) -> bool {
-    let Some(db_result) = crate::lyrics::database::fetch_from_database(
+    let Some((db_result, format)) = crate::lyrics::database::fetch_from_database(
         &meta.artist,
         &meta.title,
         &meta.album,
@@ -200,10 +182,10 @@ pub(crate) async fn try_database(meta: &TrackMetadata, state: &mut StateBundle) 
     };
 
     match db_result {
-        Ok((lines, raw, _ids)) if !lines.is_empty() => {
-            let provider = detect_provider_from_raw(&raw);
+        Ok((lines, _raw, _ids)) if !lines.is_empty() => {
+            let provider = db_format_to_provider(format);
             let line_count = lines.len();
-            state.update_lyrics(lines, meta, None, provider);
+            state.update_lyrics(lines, meta, None, Some(provider));
 
             tracing::debug!(
                 title = %meta.title,

@@ -49,7 +49,7 @@ pub struct Config {
     /// If empty, the LYRIC_PROVIDERS env var will be used as a fallback.
     #[arg(long, value_delimiter = ',')]
     pub providers: Vec<String>,
-    /// Path to local lyrics database JSON file for caching
+    /// Path to SQLite lyrics cache database
     #[arg(long = "database")]
     pub database: Option<String>,
     /// Cached current player service for efficient D-Bus queries

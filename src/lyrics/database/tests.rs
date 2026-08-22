@@ -49,7 +49,9 @@ async fn test_database_crud_and_lookups() {
     )
     .await;
     assert!(res_key.is_some());
-    let (lines, raw, ids) = res_key.unwrap().unwrap();
+    let (res_prov, format) = res_key.unwrap();
+    let (lines, raw, ids) = res_prov.unwrap();
+    assert_eq!(format, LyricsFormat::Lrclib);
     assert_eq!(lines.len(), 2);
     assert_eq!(raw, Some(lrc_content.to_string()));
     assert_eq!(ids.track_isrcs, isrcs);
@@ -362,7 +364,8 @@ async fn test_database_duration_differentiation() {
     )
     .await;
     assert!(res_studio.is_some());
-    let (lines, _, _) = res_studio.unwrap().unwrap();
+    let (res, _) = res_studio.unwrap();
+    let (lines, _, _) = res.unwrap();
     assert_eq!(lines[0].text, "Studio line");
 
     // Fetching live duration returns live lyrics
@@ -378,7 +381,8 @@ async fn test_database_duration_differentiation() {
     )
     .await;
     assert!(res_live.is_some());
-    let (lines, _, _) = res_live.unwrap().unwrap();
+    let (res, _) = res_live.unwrap();
+    let (lines, _, _) = res.unwrap();
     assert_eq!(lines[0].text, "Live line");
 }
 
@@ -428,4 +432,318 @@ async fn test_database_cascade_delete() {
     assert_eq!(count_lyrics.0, 0);
     assert_eq!(count_aliases.0, 0);
     assert_eq!(count_ids.0, 0);
+}
+
+#[tokio::test]
+async fn test_database_store_duration_guard_and_identifier_stealing() {
+    let pool = SqlitePoolOptions::new()
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+
+    create_schema(&pool).await.unwrap();
+
+    // 1. Store studio version: 180s with shared ISRC
+    store_in_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Studio Album",
+        Some(180.0),
+        LyricsFormat::Lrclib,
+        "[00:10.00]Studio line".to_string(),
+        &["USUM71234567".to_string()],
+        &["spotify_track_123".to_string()],
+        &[],
+    )
+    .await;
+
+    // 2. Store live version: 300s with same ISRC and same Spotify ID
+    store_in_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Live Album",
+        Some(300.0),
+        LyricsFormat::Lrclib,
+        "[00:10.00]Live line".to_string(),
+        &["USUM71234567".to_string()],
+        &["spotify_track_123".to_string()],
+        &[],
+    )
+    .await;
+
+    // Verify 2 distinct canonical rows were created
+    let lyrics_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM lyrics")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(lyrics_count.0, 2);
+
+    // Verify 2 aliases exist
+    let alias_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM track_aliases")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(alias_count.0, 2);
+
+    // Verify identifiers now point to live version (stolen)
+    let live_id: (i64,) = sqlx::query_as("SELECT id FROM lyrics WHERE duration = 300.0")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let isrc_owner: (i64,) = sqlx::query_as(
+        "SELECT lyrics_id FROM track_identifiers WHERE kind = 'isrc' AND value = 'USUM71234567'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(isrc_owner.0, live_id.0);
+
+    // 3. Query studio version at 180s:
+    // ISRC matches live_id, but duration mismatch -> falls through to track_aliases (Studio Album) -> returns studio lyrics
+    let res_studio = fetch_from_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Studio Album",
+        Some(180.0),
+        Some("USUM71234567"),
+        Some("spotify_track_123"),
+        None,
+    )
+    .await;
+    assert!(res_studio.is_some());
+    let (res, _) = res_studio.unwrap();
+    let (lines, _, _) = res.unwrap();
+    assert_eq!(lines[0].text, "Studio line");
+
+    // 4. Query live version at 300s:
+    // ISRC matches live_id and duration matches -> returns live lyrics
+    let res_live = fetch_from_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Live Album",
+        Some(300.0),
+        Some("USUM71234567"),
+        Some("spotify_track_123"),
+        None,
+    )
+    .await;
+    assert!(res_live.is_some());
+    let (res, _) = res_live.unwrap();
+    let (lines, _, _) = res.unwrap();
+    assert_eq!(lines[0].text, "Live line");
+}
+
+#[tokio::test]
+async fn test_database_format_downgrade_protection() {
+    let pool = SqlitePoolOptions::new()
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+
+    create_schema(&pool).await.unwrap();
+
+    let richsync_payload = r#"[{"ts":10.0,"x":"word","l":[{"c":"word","o":0}]}]"#;
+    let lrc_payload = "[00:10.00]word";
+
+    // 1. Store high-fidelity Richsync lyrics
+    store_in_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Original Album",
+        Some(200.0),
+        LyricsFormat::Richsync,
+        richsync_payload.to_string(),
+        &["ISRC_RICH_1".to_string()],
+        &[],
+        &[],
+    )
+    .await;
+
+    // 2. Store lower-fidelity Lrclib lyrics for same track (different album)
+    store_in_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Compilation Album",
+        Some(200.0),
+        LyricsFormat::Lrclib,
+        lrc_payload.to_string(),
+        &["ISRC_RICH_1".to_string()],
+        &[],
+        &[],
+    )
+    .await;
+
+    // Verify only 1 canonical row exists
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM lyrics")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 1);
+
+    // Verify format in database is STILL Richsync
+    let format_str: (String,) = sqlx::query_as("SELECT format FROM lyrics LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(format_str.0, "richsync");
+
+    // Verify both album aliases were registered
+    let alias_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM track_aliases")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(alias_count.0, 2);
+
+    // 3. Fetch via the new compilation album alias -> returns Richsync
+    let res_comp = fetch_from_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Compilation Album",
+        Some(200.0),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(res_comp.is_some());
+    let (res, format) = res_comp.unwrap();
+    assert_eq!(format, LyricsFormat::Richsync);
+    let (lines, _, _) = res.unwrap();
+    assert_eq!(lines[0].text, "word");
+    assert!(lines[0].words.is_some());
+}
+
+#[tokio::test]
+async fn test_database_unknown_format_does_not_delete() {
+    use super::compress::compress_raw_lyrics;
+
+    let pool = SqlitePoolOptions::new()
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+
+    create_schema(&pool).await.unwrap();
+
+    let compressed = compress_raw_lyrics("sample lyric text").unwrap();
+
+    // Hand-insert a row with an unknown format string 'future_format'
+    let insert_res: (i64,) = sqlx::query_as(
+        r#"
+        INSERT INTO lyrics (artist, title, duration, format, raw_lyrics)
+        VALUES ('future artist', 'future title', 150.0, 'future_format', ?)
+        RETURNING id
+        "#,
+    )
+    .bind(compressed)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let lyrics_id = insert_res.0;
+
+    sqlx::query(
+        "INSERT INTO track_aliases (artist, title, album, lyrics_id) VALUES ('future artist', 'future title', 'future album', ?)",
+    )
+    .bind(lyrics_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Fetch should return None because format is unknown
+    let res = fetch_from_database_inner(
+        &pool,
+        "future artist",
+        "future title",
+        "future album",
+        Some(150.0),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(res.is_none());
+
+    // Row MUST NOT have been deleted from lyrics table
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM lyrics")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 1);
+}
+
+#[tokio::test]
+async fn test_database_isrc_normalization() {
+    use super::compress::normalize_isrc;
+
+    // Unit checks for normalize_isrc
+    assert_eq!(
+        normalize_isrc("US-SUM-71-23456").as_deref(),
+        Some("USSUM7123456")
+    );
+    assert_eq!(
+        normalize_isrc("  us-um7-12-34567 ").as_deref(),
+        Some("USUM71234567")
+    );
+    assert_eq!(normalize_isrc(""), None);
+    assert_eq!(normalize_isrc("   ---   "), None);
+
+    let pool = SqlitePoolOptions::new()
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+
+    create_schema(&pool).await.unwrap();
+
+    // Store using hyphenated lowercase ISRC
+    store_in_database_inner(
+        &pool,
+        "Artist",
+        "Title",
+        "Album",
+        Some(180.0),
+        LyricsFormat::Lrclib,
+        "[00:10.00]Normalized line".to_string(),
+        &["us-um7-12-34567".to_string()],
+        &[],
+        &[],
+    )
+    .await;
+
+    // Fetch using clean uppercase ISRC
+    let res_clean = fetch_from_database_inner(
+        &pool,
+        "Different",
+        "Different",
+        "Different",
+        Some(180.0),
+        Some("USUM71234567"),
+        None,
+        None,
+    )
+    .await;
+    assert!(res_clean.is_some());
+    let (res, _) = res_clean.unwrap();
+    let (lines, _, _) = res.unwrap();
+    assert_eq!(lines[0].text, "Normalized line");
+
+    // Fetch using hyphenated uppercase ISRC
+    let res_hyphen = fetch_from_database_inner(
+        &pool,
+        "Different",
+        "Different",
+        "Different",
+        Some(180.0),
+        Some("US-UM7-12-34567"),
+        None,
+        None,
+    )
+    .await;
+    assert!(res_hyphen.is_some());
 }

@@ -8,11 +8,16 @@ pub(crate) fn normalize(s: &str) -> String {
 }
 
 pub(crate) fn normalize_isrc(s: &str) -> Option<String> {
-    let trimmed = s.trim().to_uppercase();
-    if trimmed.is_empty() {
+    let normalized: String = s
+        .trim()
+        .to_uppercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    if normalized.is_empty() {
         None
     } else {
-        Some(trimmed)
+        Some(normalized)
     }
 }
 

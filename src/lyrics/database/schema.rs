@@ -22,6 +22,15 @@ pub enum LyricsFormat {
 
 impl LyricsFormat {
     #[must_use]
+    pub const fn fidelity_rank(&self) -> u8 {
+        match self {
+            Self::Richsync => 3,
+            Self::Subtitles => 2,
+            Self::Lrclib => 1,
+        }
+    }
+
+    #[must_use]
     pub fn to_str(&self) -> &'static str {
         match self {
             Self::Lrclib => "lrclib",
@@ -48,7 +57,6 @@ pub struct LyricsEntry {
     pub id: i64,
     pub artist: String,
     pub title: String,
-    pub album: Option<String>,
     pub duration: Option<f64>,
     pub format: LyricsFormat,
     pub raw_lyrics: String,
@@ -65,7 +73,7 @@ pub(crate) async fn create_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> 
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS lyrics (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             artist TEXT NOT NULL,
             title TEXT NOT NULL,
             duration REAL,
@@ -139,11 +147,12 @@ pub(crate) async fn open_database(path: &Path) -> Result<SqlitePool, sqlx::Error
     let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
         .create_if_missing(true)
         .foreign_keys(true)
+        .busy_timeout(std::time::Duration::from_secs(5))
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal); // Write-Ahead Logging for better concurrency
 
-    // Create connection pool (max 5 connections)
+    // Create connection pool (max 2 connections)
     let pool = SqlitePoolOptions::new()
-        .max_connections(5)
+        .max_connections(2)
         .connect_with(options)
         .await?;
 
