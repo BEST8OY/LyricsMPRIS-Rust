@@ -48,7 +48,7 @@ pub struct LyricsEntry {
     pub id: i64,
     pub artist: String,
     pub title: String,
-    pub album: String,
+    pub album: Option<String>,
     pub duration: Option<f64>,
     pub format: LyricsFormat,
     pub raw_lyrics: String,
@@ -61,65 +61,65 @@ pub(crate) async fn create_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> 
         .execute(pool)
         .await?;
 
-    // Drop legacy junction tables if upgrading from older versions
-    sqlx::query("DROP TABLE IF EXISTS track_isrcs;")
-        .execute(pool)
-        .await?;
-    sqlx::query("DROP TABLE IF EXISTS track_spotify_ids;")
-        .execute(pool)
-        .await?;
-    sqlx::query("DROP TABLE IF EXISTS track_itunes_ids;")
-        .execute(pool)
-        .await?;
-
-    // Main lyrics table with integer primary key and unique track composite constraint
+    // Canonical lyrics table (one row per unique recording / lyrics payload)
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS lyrics (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             artist TEXT NOT NULL,
             title TEXT NOT NULL,
-            album TEXT NOT NULL,
             duration REAL,
             format TEXT NOT NULL,
-            raw_lyrics BLOB NOT NULL,
-            UNIQUE (artist, title, album)
+            raw_lyrics BLOB NOT NULL
         )
         "#,
     )
     .execute(pool)
     .await?;
 
-    // Index for fast lookups by artist/title/album
+    // Multi-album alias table mapping (artist, title, album) -> canonical lyrics_id
     sqlx::query(
         r#"
-        CREATE INDEX IF NOT EXISTS idx_lyrics_lookup
-        ON lyrics(artist, title, album)
-        "#,
-    )
-    .execute(pool)
-    .await?;
-
-    // Unified clustered identifier table (WITHOUT ROWID) mapping (kind, value) -> track_id
-    sqlx::query(
-        r#"
-        CREATE TABLE IF NOT EXISTS track_identifiers (
-            kind TEXT NOT NULL,
-            value TEXT NOT NULL,
-            track_id INTEGER NOT NULL REFERENCES lyrics(id) ON DELETE CASCADE,
-            ordering INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (kind, value, track_id)
+        CREATE TABLE IF NOT EXISTS track_aliases (
+            artist TEXT NOT NULL,
+            title TEXT NOT NULL,
+            album TEXT NOT NULL,
+            lyrics_id INTEGER NOT NULL REFERENCES lyrics(id) ON DELETE CASCADE,
+            PRIMARY KEY (artist, title, album)
         ) WITHOUT ROWID
         "#,
     )
     .execute(pool)
     .await?;
 
-    // Secondary index for fast lookups and cascades by track_id
     sqlx::query(
         r#"
-        CREATE INDEX IF NOT EXISTS idx_track_identifiers_track_id
-        ON track_identifiers(track_id)
+        CREATE INDEX IF NOT EXISTS idx_track_aliases_lyrics_id
+        ON track_aliases(lyrics_id)
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Unified identifier table mapping (kind, value) -> unique canonical lyrics_id
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS track_identifiers (
+            kind TEXT NOT NULL,
+            value TEXT NOT NULL,
+            lyrics_id INTEGER NOT NULL REFERENCES lyrics(id) ON DELETE CASCADE,
+            ordering INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (kind, value)
+        ) WITHOUT ROWID
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_track_identifiers_lyrics_id
+        ON track_identifiers(lyrics_id)
         "#,
     )
     .execute(pool)

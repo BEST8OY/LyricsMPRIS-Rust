@@ -48,16 +48,16 @@ pub(crate) fn parse_stored_lyrics(entry: &LyricsEntry) -> ProviderResult {
     }
 }
 
-/// Retrieves all associated track identifiers for a given track id in insertion order.
-pub(crate) async fn fetch_track_ids(pool: &SqlitePool, track_id: i64) -> TrackMatchInfo {
+/// Retrieves all associated track identifiers for a given lyrics id in insertion order.
+pub(crate) async fn fetch_track_ids(pool: &SqlitePool, lyrics_id: i64) -> TrackMatchInfo {
     let mut isrcs = Vec::new();
     let mut spotify_ids = Vec::new();
     let mut itunes_ids = Vec::new();
 
     if let Ok(rows) = sqlx::query(
-        "SELECT kind, value FROM track_identifiers WHERE track_id = ? ORDER BY ordering ASC",
+        "SELECT kind, value FROM track_identifiers WHERE lyrics_id = ? ORDER BY ordering ASC",
     )
-    .bind(track_id)
+    .bind(lyrics_id)
     .fetch_all(pool)
     .await
     {
@@ -80,6 +80,14 @@ pub(crate) async fn fetch_track_ids(pool: &SqlitePool, track_id: i64) -> TrackMa
     }
 }
 
+/// Helper function to check if query duration matches entry duration within tolerance.
+fn duration_matches(query_duration: Option<f64>, entry_duration: Option<f64>) -> bool {
+    match (query_duration, entry_duration) {
+        (Some(q), Some(e)) => (q - e).abs() <= DURATION_TOLERANCE_SECS,
+        _ => true,
+    }
+}
+
 /// Inner implementation of fetching lyrics with an explicit database pool reference.
 #[allow(clippy::too_many_arguments)]
 pub async fn fetch_from_database_inner(
@@ -96,9 +104,9 @@ pub async fn fetch_from_database_inner(
     if let Some(id_norm) = isrc.and_then(normalize_isrc)
         && let Ok(Some(row)) = sqlx::query(
             r#"
-            SELECT l.id, l.artist, l.title, l.album, l.duration, l.format, l.raw_lyrics
+            SELECT l.id, l.artist, l.title, l.duration, l.format, l.raw_lyrics
             FROM lyrics l
-            JOIN track_identifiers ti ON l.id = ti.track_id
+            JOIN track_identifiers ti ON l.id = ti.lyrics_id
             WHERE ti.kind = 'isrc' AND ti.value = ?
             LIMIT 1
             "#,
@@ -106,21 +114,26 @@ pub async fn fetch_from_database_inner(
         .bind(&id_norm)
         .fetch_optional(pool)
         .await
-        && let Some(result) = process_db_row(&row, duration, pool).await
     {
-        return Some(result);
+        let entry_dur: Option<f64> = row.try_get("duration").ok();
+        if duration_matches(duration, entry_dur)
+            && let Some(result) = process_db_row(&row, pool).await
+        {
+            return Some(result);
+        }
     }
 
-    // 2. Fallback: try lookup by composite key (artist / title / album)
+    // 2. Exact match on track_aliases (artist / title / album)
     let artist_norm = normalize(artist);
     let title_norm = normalize(title);
     let album_norm = normalize(album);
 
     if let Ok(Some(row)) = sqlx::query(
         r#"
-        SELECT id, artist, title, album, duration, format, raw_lyrics
-        FROM lyrics
-        WHERE artist = ? AND title = ? AND album = ?
+        SELECT l.id, l.artist, l.title, l.duration, l.format, l.raw_lyrics, ta.album
+        FROM lyrics l
+        JOIN track_aliases ta ON l.id = ta.lyrics_id
+        WHERE ta.artist = ? AND ta.title = ? AND ta.album = ?
         LIMIT 1
         "#,
     )
@@ -129,18 +142,22 @@ pub async fn fetch_from_database_inner(
     .bind(&album_norm)
     .fetch_optional(pool)
     .await
-        && let Some(result) = process_db_row(&row, duration, pool).await
     {
-        return Some(result);
+        let entry_dur: Option<f64> = row.try_get("duration").ok();
+        if duration_matches(duration, entry_dur)
+            && let Some(result) = process_db_row(&row, pool).await
+        {
+            return Some(result);
+        }
     }
 
     // 3. Fallback: try lookup by Spotify ID
     if let Some(id_norm) = spotify_id.and_then(normalize_track_id)
         && let Ok(Some(row)) = sqlx::query(
             r#"
-            SELECT l.id, l.artist, l.title, l.album, l.duration, l.format, l.raw_lyrics
+            SELECT l.id, l.artist, l.title, l.duration, l.format, l.raw_lyrics
             FROM lyrics l
-            JOIN track_identifiers ti ON l.id = ti.track_id
+            JOIN track_identifiers ti ON l.id = ti.lyrics_id
             WHERE ti.kind = 'spotify' AND ti.value = ?
             LIMIT 1
             "#,
@@ -148,18 +165,22 @@ pub async fn fetch_from_database_inner(
         .bind(&id_norm)
         .fetch_optional(pool)
         .await
-        && let Some(result) = process_db_row(&row, duration, pool).await
     {
-        return Some(result);
+        let entry_dur: Option<f64> = row.try_get("duration").ok();
+        if duration_matches(duration, entry_dur)
+            && let Some(result) = process_db_row(&row, pool).await
+        {
+            return Some(result);
+        }
     }
 
     // 4. Fallback: try lookup by iTunes ID
     if let Some(id_norm) = itunes_id.and_then(normalize_track_id)
         && let Ok(Some(row)) = sqlx::query(
             r#"
-            SELECT l.id, l.artist, l.title, l.album, l.duration, l.format, l.raw_lyrics
+            SELECT l.id, l.artist, l.title, l.duration, l.format, l.raw_lyrics
             FROM lyrics l
-            JOIN track_identifiers ti ON l.id = ti.track_id
+            JOIN track_identifiers ti ON l.id = ti.lyrics_id
             WHERE ti.kind = 'itunes' AND ti.value = ?
             LIMIT 1
             "#,
@@ -167,27 +188,70 @@ pub async fn fetch_from_database_inner(
         .bind(&id_norm)
         .fetch_optional(pool)
         .await
-        && let Some(result) = process_db_row(&row, duration, pool).await
     {
-        return Some(result);
+        let entry_dur: Option<f64> = row.try_get("duration").ok();
+        if duration_matches(duration, entry_dur)
+            && let Some(result) = process_db_row(&row, pool).await
+        {
+            return Some(result);
+        }
+    }
+
+    // 5. Fallback: try lookup by (artist, title) across any album in track_aliases
+    if !artist_norm.is_empty()
+        && !title_norm.is_empty()
+        && let Ok(rows) = sqlx::query(
+            r#"
+            SELECT DISTINCT l.id, l.artist, l.title, l.duration, l.format, l.raw_lyrics
+            FROM lyrics l
+            JOIN track_aliases ta ON l.id = ta.lyrics_id
+            WHERE ta.artist = ? AND ta.title = ?
+            LIMIT 5
+            "#,
+        )
+        .bind(&artist_norm)
+        .bind(&title_norm)
+        .fetch_all(pool)
+        .await
+    {
+        for row in rows {
+            let entry_dur: Option<f64> = row.try_get("duration").ok();
+            if duration_matches(duration, entry_dur)
+                && let Some(result) = process_db_row(&row, pool).await
+            {
+                // Register this album alias so subsequent lookups hit step 2 immediately
+                let target_id: i64 = row.try_get("id").unwrap_or_default();
+                if target_id > 0 && !album_norm.is_empty() {
+                    let _ = sqlx::query(
+                        "INSERT OR IGNORE INTO track_aliases (artist, title, album, lyrics_id) VALUES (?, ?, ?, ?)",
+                    )
+                    .bind(&artist_norm)
+                    .bind(&title_norm)
+                    .bind(&album_norm)
+                    .bind(target_id)
+                    .execute(pool)
+                    .await;
+                }
+                return Some(result);
+            }
+        }
     }
 
     None
 }
 
-/// Helper: deletes a cached row by integer ID (cascades to track_identifiers via foreign key).
-pub(crate) async fn delete_cached_row(pool: &SqlitePool, track_id: i64) {
+/// Helper: deletes a cached row by integer ID (cascades to track_identifiers and track_aliases via foreign key).
+pub(crate) async fn delete_cached_row(pool: &SqlitePool, lyrics_id: i64) {
     let _ = sqlx::query("DELETE FROM lyrics WHERE id = ?")
-        .bind(track_id)
+        .bind(lyrics_id)
         .execute(pool)
         .await;
 }
 
 /// Processes a database row into a ProviderResult.
-/// Handles decompression, format validation, duration matching, and identifier hydration.
+/// Handles decompression, format validation, and identifier hydration.
 pub(crate) async fn process_db_row(
     row: &sqlx::sqlite::SqliteRow,
-    duration: Option<f64>,
     pool: &SqlitePool,
 ) -> Option<ProviderResult> {
     let id: i64 = match row.try_get("id") {
@@ -196,7 +260,7 @@ pub(crate) async fn process_db_row(
     };
     let artist: String = row.try_get("artist").unwrap_or_default();
     let title: String = row.try_get("title").unwrap_or_default();
-    let album: String = row.try_get("album").unwrap_or_default();
+    let album: Option<String> = row.try_get("album").ok();
 
     let raw_lyrics_blob: Vec<u8> = match row.try_get("raw_lyrics") {
         Ok(blob) => blob,
@@ -241,15 +305,6 @@ pub(crate) async fn process_db_row(
     };
 
     let entry_duration: Option<f64> = row.try_get("duration").ok();
-
-    // Validate duration match if both are present.
-    if let (Some(query_duration), Some(entry_dur)) = (duration, entry_duration)
-        && (query_duration - entry_dur).abs() > DURATION_TOLERANCE_SECS
-    {
-        delete_cached_row(pool, id).await;
-        return None;
-    }
-
     let track_ids = fetch_track_ids(pool, id).await;
 
     let entry = LyricsEntry {
@@ -343,51 +398,198 @@ pub async fn store_in_database_inner(
         return;
     };
 
-    let row: Result<(i64,), sqlx::Error> = sqlx::query_as(
+    // Step 1: Find existing lyrics_id by authoritative identifier or alias + duration matching
+    let mut matched_lyrics_id: Option<i64> = None;
+
+    // 1a. Check ISRCs
+    for isrc in &normalized_isrcs {
+        if let Ok(Some((id,))) = sqlx::query_as::<_, (i64,)>(
+            "SELECT lyrics_id FROM track_identifiers WHERE kind = 'isrc' AND value = ? LIMIT 1",
+        )
+        .bind(isrc)
+        .fetch_optional(&mut *tx)
+        .await
+        {
+            matched_lyrics_id = Some(id);
+            break;
+        }
+    }
+
+    // 1b. Check Spotify IDs
+    if matched_lyrics_id.is_none() {
+        for sid in &normalized_spotify_ids {
+            if let Ok(Some((id,))) = sqlx::query_as::<_, (i64,)>(
+                "SELECT lyrics_id FROM track_identifiers WHERE kind = 'spotify' AND value = ? LIMIT 1",
+            )
+            .bind(sid)
+            .fetch_optional(&mut *tx)
+            .await
+            {
+                matched_lyrics_id = Some(id);
+                break;
+            }
+        }
+    }
+
+    // 1c. Check iTunes IDs
+    if matched_lyrics_id.is_none() {
+        for tid in &normalized_itunes_ids {
+            if let Ok(Some((id,))) = sqlx::query_as::<_, (i64,)>(
+                "SELECT lyrics_id FROM track_identifiers WHERE kind = 'itunes' AND value = ? LIMIT 1",
+            )
+            .bind(tid)
+            .fetch_optional(&mut *tx)
+            .await
+            {
+                matched_lyrics_id = Some(id);
+                break;
+            }
+        }
+    }
+
+    // 1d. Check exact alias (artist, title, album)
+    if matched_lyrics_id.is_none()
+        && let Ok(Some((id,))) = sqlx::query_as::<_, (i64,)>(
+            "SELECT lyrics_id FROM track_aliases WHERE artist = ? AND title = ? AND album = ? LIMIT 1",
+        )
+        .bind(&artist_norm)
+        .bind(&title_norm)
+        .bind(&album_norm)
+        .fetch_optional(&mut *tx)
+        .await
+    {
+        matched_lyrics_id = Some(id);
+    }
+
+    // 1e. Check (artist, title) across any album with duration tolerance
+    if matched_lyrics_id.is_none()
+        && !artist_norm.is_empty()
+        && !title_norm.is_empty()
+        && let Ok(rows) = sqlx::query(
+            r#"
+            SELECT DISTINCT l.id, l.duration
+            FROM lyrics l
+            JOIN track_aliases ta ON l.id = ta.lyrics_id
+            WHERE ta.artist = ? AND ta.title = ?
+            LIMIT 10
+            "#,
+        )
+        .bind(&artist_norm)
+        .bind(&title_norm)
+        .fetch_all(&mut *tx)
+        .await
+    {
+        for row in rows {
+            let entry_dur: Option<f64> = row.try_get("duration").ok();
+            if duration_matches(duration, entry_dur) {
+                let id: i64 = row.try_get("id").unwrap_or_default();
+                if id > 0 {
+                    matched_lyrics_id = Some(id);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Step 2: Update existing or insert new canonical lyrics row
+    // NOTE (Future Enhancement): Consider format-priority protection when updating existing entries.
+    // Higher-fidelity formats (e.g., `Richsync` with word-by-word timestamps) should not be downgraded
+    // to line-by-line formats (`Lrclib` or `Subtitles`) if a line-level provider matches an existing recording.
+    let target_lyrics_id = if let Some(existing_id) = matched_lyrics_id {
+        let update_res = sqlx::query(
+            r#"
+            UPDATE lyrics
+            SET duration = COALESCE(?, duration),
+                format = ?,
+                raw_lyrics = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(duration)
+        .bind(format.to_str())
+        .bind(raw_lyrics_blob)
+        .bind(existing_id)
+        .execute(&mut *tx)
+        .await;
+
+        if let Err(e) = update_res {
+            tracing::warn!(
+                artist = %artist,
+                title = %title,
+                error = %e,
+                "Failed to update canonical lyrics in database"
+            );
+            return;
+        }
+        existing_id
+    } else {
+        let insert_res: Result<(i64,), sqlx::Error> = sqlx::query_as(
+            r#"
+            INSERT INTO lyrics (artist, title, duration, format, raw_lyrics)
+            VALUES (?, ?, ?, ?, ?)
+            RETURNING id
+            "#,
+        )
+        .bind(&artist_norm)
+        .bind(&title_norm)
+        .bind(duration)
+        .bind(format.to_str())
+        .bind(raw_lyrics_blob)
+        .fetch_one(&mut *tx)
+        .await;
+
+        match insert_res {
+            Ok((id,)) => id,
+            Err(e) => {
+                tracing::warn!(
+                    artist = %artist,
+                    title = %title,
+                    error = %e,
+                    "Failed to insert canonical lyrics row in database"
+                );
+                return;
+            }
+        }
+    };
+
+    // Step 3: Upsert track_aliases mapping (artist, title, album) -> target_lyrics_id
+    let alias_res = sqlx::query(
         r#"
-        INSERT INTO lyrics (artist, title, album, duration, format, raw_lyrics)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO track_aliases (artist, title, album, lyrics_id)
+        VALUES (?, ?, ?, ?)
         ON CONFLICT(artist, title, album) DO UPDATE SET
-            duration = excluded.duration,
-            format = excluded.format,
-            raw_lyrics = excluded.raw_lyrics
-        RETURNING id
+            lyrics_id = excluded.lyrics_id
         "#,
     )
     .bind(&artist_norm)
     .bind(&title_norm)
     .bind(&album_norm)
-    .bind(duration)
-    .bind(format.to_str())
-    .bind(raw_lyrics_blob)
-    .fetch_one(&mut *tx)
+    .bind(target_lyrics_id)
+    .execute(&mut *tx)
     .await;
 
-    let track_id = match row {
-        Ok((id,)) => id,
-        Err(e) => {
-            tracing::warn!(
-                artist = %artist,
-                title = %title,
-                error = %e,
-                "Failed to insert/update lyrics row in database"
-            );
-            return;
-        }
-    };
+    if let Err(e) = alias_res {
+        tracing::warn!(
+            artist = %artist,
+            title = %title,
+            error = %e,
+            "Failed to upsert track alias in database"
+        );
+    }
 
-    // Delete existing ID mappings for this track and insert fresh ones
-    let _ = sqlx::query("DELETE FROM track_identifiers WHERE track_id = ?")
-        .bind(track_id)
-        .execute(&mut *tx)
-        .await;
-
+    // Step 4: Upsert track_identifiers with PRIMARY KEY (kind, value)
     for (idx, isrc) in normalized_isrcs.iter().enumerate() {
         let _ = sqlx::query(
-            "INSERT OR IGNORE INTO track_identifiers (kind, value, track_id, ordering) VALUES ('isrc', ?, ?, ?)",
+            r#"
+            INSERT INTO track_identifiers (kind, value, lyrics_id, ordering)
+            VALUES ('isrc', ?, ?, ?)
+            ON CONFLICT(kind, value) DO UPDATE SET
+                lyrics_id = excluded.lyrics_id,
+                ordering = excluded.ordering
+            "#,
         )
         .bind(isrc)
-        .bind(track_id)
+        .bind(target_lyrics_id)
         .bind(idx as i64)
         .execute(&mut *tx)
         .await;
@@ -395,10 +597,16 @@ pub async fn store_in_database_inner(
 
     for (idx, sid) in normalized_spotify_ids.iter().enumerate() {
         let _ = sqlx::query(
-            "INSERT OR IGNORE INTO track_identifiers (kind, value, track_id, ordering) VALUES ('spotify', ?, ?, ?)",
+            r#"
+            INSERT INTO track_identifiers (kind, value, lyrics_id, ordering)
+            VALUES ('spotify', ?, ?, ?)
+            ON CONFLICT(kind, value) DO UPDATE SET
+                lyrics_id = excluded.lyrics_id,
+                ordering = excluded.ordering
+            "#,
         )
         .bind(sid)
-        .bind(track_id)
+        .bind(target_lyrics_id)
         .bind(idx as i64)
         .execute(&mut *tx)
         .await;
@@ -406,10 +614,16 @@ pub async fn store_in_database_inner(
 
     for (idx, tid) in normalized_itunes_ids.iter().enumerate() {
         let _ = sqlx::query(
-            "INSERT OR IGNORE INTO track_identifiers (kind, value, track_id, ordering) VALUES ('itunes', ?, ?, ?)",
+            r#"
+            INSERT INTO track_identifiers (kind, value, lyrics_id, ordering)
+            VALUES ('itunes', ?, ?, ?)
+            ON CONFLICT(kind, value) DO UPDATE SET
+                lyrics_id = excluded.lyrics_id,
+                ordering = excluded.ordering
+            "#,
         )
         .bind(tid)
-        .bind(track_id)
+        .bind(target_lyrics_id)
         .bind(idx as i64)
         .execute(&mut *tx)
         .await;

@@ -39,6 +39,9 @@ pub(crate) async fn store_lyrics_in_cache(
     provider_itunes_ids: &[String],
 ) {
     if let Some(raw_text) = raw {
+        // Note: meta.isrc from local file tags is intentionally NOT merged here
+        // to prevent saving incorrect or corrupted user file tags into the database.
+        // Only authoritative ISRCs returned directly by providers are stored.
         let mut spotify_ids = provider_spotify_ids.to_vec();
         if let Some(meta_sid) = &meta.spotify_id
             && !spotify_ids.iter().any(|s| s.eq_ignore_ascii_case(meta_sid))
