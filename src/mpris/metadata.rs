@@ -1,13 +1,13 @@
 //! Track metadata parsing and querying for MPRIS.
 
 use crate::mpris::connection::{MprisError, get_dbus_conn};
+use crate::mpris::proxies::MediaPlayer2PlayerProxy;
 use lofty::file::TaggedFileExt;
 use lofty::prelude::ItemKey;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::block_in_place;
-use zbus::{proxy, zvariant};
 use zvariant::{OwnedValue, Type};
 
 static ISRC_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -63,10 +63,11 @@ fn get_isrc_from_file(raw_path: &str) -> Option<String> {
     let path_buf = PathBuf::from(decoded.as_ref());
 
     let read_tags = || lofty::read_from_path(path_buf).ok();
-    let tagged_file = if tokio::runtime::Handle::try_current().is_ok() {
-        block_in_place(read_tags)?
-    } else {
-        read_tags()?
+    let tagged_file = match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            block_in_place(read_tags)?
+        }
+        _ => read_tags()?,
     };
 
     for tag in tagged_file.tags() {
@@ -246,16 +247,6 @@ pub fn extract_metadata(map: &HashMap<String, OwnedValue>) -> TrackMetadata {
         isrc,
         itunes_id: None,
     }
-}
-
-/// MPRIS MediaPlayer2.Player interface proxy
-#[proxy(
-    interface = "org.mpris.MediaPlayer2.Player",
-    default_path = "/org/mpris/MediaPlayer2"
-)]
-trait MediaPlayer2Player {
-    #[zbus(property)]
-    fn metadata(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
 }
 
 /// Query metadata for a specific MPRIS player service

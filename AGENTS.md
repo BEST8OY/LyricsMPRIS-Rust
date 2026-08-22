@@ -40,6 +40,14 @@ src/ui/ (modern.rs Ratatui TUI or pipe.rs stdout)
 ## Key Components & Conventions
 
 - **Rust Edition 2024** (`edition = "2024"` in Cargo.toml). Enables Edition 2024 let chains (`if let ... && let ...`).
+- **MPRIS & D-Bus Engine (`src/mpris/`, `src/pool.rs`)**:
+  - Consolidated Proxies: All D-Bus proxy interfaces (`MediaPlayer2Player`, `Playerctld`) are centralized in `src/mpris/proxies.rs`.
+  - Discovery Priority: Queries `playerctld` (recency-ordered) first; falls back to standard D-Bus `ListNames` (`org.mpris.MediaPlayer2.*`) when `playerctld` is absent or returns empty.
+  - Error Safety: Discovery helpers return `Result<Option<String>, MprisError>`; transient D-Bus errors preserve current state and never clear/deactivate active lyrics.
+  - Real-Time Lifecycle: Listens to D-Bus `NameOwnerChanged` signals for instant connect, disconnect, and ownership transfer (`old_owner != new_owner`) detection.
+  - Authoritative Polling: Safety-net checks use `fdo::DBusProxy::name_has_owner(bus_name)` with 3.0s timeouts, bypassing client-side property caches. Inactive state polls every 2.0s.
+  - Resilience: The watcher task in `pool.rs` retries with exponential backoff (500 ms → ×2, cap 30 s), resetting only after sustained uptime (≥ 5 s). The event loop backs off on error to prevent CPU spin.
+  - Multi-Threaded Tag Reading: ISRC extraction checks `runtime_flavor() == RuntimeFlavor::MultiThread` before invoking `block_in_place`.
 - **Musixmatch Token Engine (`src/lyrics/providers/musixmatch.rs`)**:
   - Tier 1: Round-robin pool from `MUSIXMATCH_USERTOKEN` env var.
   - Tier 2: Auto-fetches anonymous token via `token.get` API if Tier 1 is unconfigured or exhausted.

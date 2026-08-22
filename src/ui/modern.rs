@@ -62,8 +62,6 @@ impl ModernUIState {
 
 /// Display lyrics in modern TUI mode (centered, highlighted, real-time)
 pub async fn display_lyrics_modern(
-    _meta: crate::mpris::TrackMetadata,
-    _pos: f64,
     mpris_config: crate::Config,
     karaoke_enabled: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

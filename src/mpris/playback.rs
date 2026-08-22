@@ -1,7 +1,7 @@
 //! Playback status and position querying for MPRIS.
 
 use crate::mpris::connection::{MprisError, get_dbus_conn};
-use zbus::proxy;
+use crate::mpris::proxies::MediaPlayer2PlayerProxy;
 
 /// Playback status values according to MPRIS specification
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -42,19 +42,6 @@ impl From<PlaybackStatus> for String {
     fn from(status: PlaybackStatus) -> Self {
         status.as_str().to_string()
     }
-}
-
-/// MPRIS MediaPlayer2.Player interface proxy for playback control
-#[proxy(
-    interface = "org.mpris.MediaPlayer2.Player",
-    default_path = "/org/mpris/MediaPlayer2"
-)]
-trait MediaPlayer2Player {
-    #[zbus(property)]
-    fn playback_status(&self) -> zbus::Result<String>;
-
-    #[zbus(property)]
-    fn position(&self) -> zbus::Result<i64>;
 }
 
 /// Query the playback position for a specific MPRIS player service

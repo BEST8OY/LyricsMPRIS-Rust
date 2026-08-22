@@ -187,34 +187,20 @@ async fn initialize_with_player(loop_state: &mut LoopState, service: &str, confi
 /// # Returns
 ///
 /// - `Some(service)` if an active, non-blocked player is found
-/// - `None` if no players are available or all are blocked
+/// - `None` if no players are available, all are blocked, or enumeration failed
 ///
 /// # Error Handling
 ///
-/// D-Bus enumeration errors are logged and treated as no player.
+/// D-Bus enumeration errors are logged as warnings and treated as no player.
 async fn discover_active_player(config: &LoopConfig) -> Option<String> {
-    match crate::mpris::get_active_player_names().await {
-        Ok(names) => {
-            tracing::debug!(available_players = ?names, "Discovered MPRIS players");
-
-            let blocked_count = names
-                .iter()
-                .filter(|s| crate::mpris::is_blocked(s, config.block_list()))
-                .count();
-            let active = names
-                .into_iter()
-                .find(|service| !crate::mpris::is_blocked(service, config.block_list()));
-
-            if let Some(ref service) = active {
-                tracing::debug!(selected_player = %service, "Selected active player");
-            } else if blocked_count > 0 {
-                tracing::debug!(
-                    blocked_count = blocked_count,
-                    "All discovered players are blocked"
-                );
-            }
-
-            active
+    match crate::mpris::find_active_service(config.block_list(), config.target_list()).await {
+        Ok(Some(service)) => {
+            tracing::debug!(selected_player = %service, "Selected active player");
+            Some(service)
+        }
+        Ok(None) => {
+            tracing::debug!("No active player found");
+            None
         }
         Err(e) => {
             tracing::warn!(
@@ -304,44 +290,56 @@ async fn initialize_lyrics_state(
 ///
 /// # Error Handling
 ///
-/// Initialization and runtime errors are logged (if debug enabled) but don't
-/// crash the application. The watcher task will terminate on fatal errors.
+/// If initialization fails or the D-Bus connection is lost, the watcher automatically
+/// retries with exponential backoff (500 ms up to 30 s). Backoff is reset to 500 ms
+/// only after sustained uptime (>= 5 seconds).
 fn spawn_mpris_watcher(event_tx: mpsc::Sender<Event>, config: &LoopConfig) {
     tracing::debug!("Spawning MPRIS event watcher");
-    let update_tx = event_tx.clone();
-    let seek_tx = event_tx;
     let block_list = config.block_list().to_vec();
     let target_list = config.target_list().to_vec();
 
     tokio::spawn(async move {
-        let handler_result = MprisEventHandler::with_closures(
-            move |meta, pos, service| {
-                let _ =
-                    update_tx.try_send(Event::Mpris(MprisEvent::PlayerUpdate(meta, pos, service)));
-            },
-            move |meta, pos, service| {
-                let _ = seek_tx.try_send(Event::Mpris(MprisEvent::Seeked(meta, pos, service)));
-            },
-            block_list,
-            target_list,
-        )
-        .await;
+        let mut backoff = std::time::Duration::from_millis(500);
+        loop {
+            let update_tx = event_tx.clone();
+            let seek_tx = event_tx.clone();
+            let handler_result = MprisEventHandler::with_closures(
+                move |meta, pos, service| {
+                    let _ = update_tx
+                        .try_send(Event::Mpris(MprisEvent::PlayerUpdate(meta, pos, service)));
+                },
+                move |meta, pos, service| {
+                    let _ = seek_tx.try_send(Event::Mpris(MprisEvent::Seeked(meta, pos, service)));
+                },
+                block_list.clone(),
+                target_list.clone(),
+            )
+            .await;
 
-        match handler_result {
-            Ok(mut handler) => {
-                if let Err(e) = handler.handle_events().await {
-                    tracing::error!(
+            match handler_result {
+                Ok(mut handler) => {
+                    let start = std::time::Instant::now();
+                    if let Err(e) = handler.handle_events().await {
+                        tracing::warn!(
+                            error = %e,
+                            "MPRIS event handler terminated, retrying..."
+                        );
+                    }
+                    if start.elapsed() >= std::time::Duration::from_secs(5) {
+                        backoff = std::time::Duration::from_millis(500);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
                         error = %e,
-                        "MPRIS event handler terminated"
+                        backoff = ?backoff,
+                        "Failed to initialize MPRIS event handler, retrying with backoff..."
                     );
                 }
             }
-            Err(e) => {
-                tracing::error!(
-                    error = %e,
-                    "Failed to initialize MPRIS event handler"
-                );
-            }
+
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
         }
     });
 }

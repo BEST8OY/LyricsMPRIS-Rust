@@ -127,8 +127,6 @@ impl PipeState {
 
 /// Display lyrics in pipe mode (stdout only, for scripting).
 pub async fn display_lyrics_pipe(
-    _meta: crate::mpris::TrackMetadata,
-    _pos: f64,
     mpris_config: crate::Config,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, mut rx) = mpsc::channel(32);

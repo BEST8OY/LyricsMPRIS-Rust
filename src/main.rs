@@ -7,13 +7,11 @@ mod text_utils;
 mod timer;
 mod ui;
 
-use crate::mpris::metadata::{get_metadata, set_isrc_enabled};
-use crate::mpris::playback::get_position;
+use crate::mpris::metadata::set_isrc_enabled;
 use clap::Parser;
 use std::error::Error;
 use std::fs::OpenOptions;
 use tracing_subscriber::EnvFilter;
-// polling removed; no Duration needed here
 
 /// Application configuration from CLI
 #[derive(Parser, Debug, Clone)]
@@ -52,8 +50,6 @@ pub struct Config {
     /// Path to SQLite lyrics cache database
     #[arg(long = "database")]
     pub database: Option<String>,
-    /// Cached current player service for efficient D-Bus queries
-    pub player_service: Option<String>,
     /// Enable ISRC lookup from metadata for musixmatch lyrics search
     #[arg(long)]
     pub isrc: bool,
@@ -67,7 +63,6 @@ impl Default for Config {
             target: vec![],
             providers: vec!["lrclib".to_string(), "musixmatch".to_string()],
             database: None,
-            player_service: None,
             no_karaoke: false,
             visible_lines: None,
             isrc: false,
@@ -97,51 +92,13 @@ async fn initialize_database(config: &Config) {
     }
 }
 
-/// Fetches initial metadata from the player service.
-///
-/// Returns default metadata on error with warning log.
-async fn fetch_initial_metadata(service: &str) -> crate::mpris::TrackMetadata {
-    match get_metadata(service).await {
-        Ok(meta) => meta,
-        Err(e) => {
-            tracing::warn!(
-                service = %service,
-                error = %e,
-                "D-Bus error getting initial metadata"
-            );
-            Default::default()
-        }
-    }
-}
-
-/// Fetches initial playback position from the player service.
-///
-/// Returns 0.0 on error with warning log.
-async fn fetch_initial_position(service: &str) -> f64 {
-    match get_position(service).await {
-        Ok(pos) => pos,
-        Err(e) => {
-            tracing::warn!(
-                service = %service,
-                error = %e,
-                "D-Bus error getting initial position"
-            );
-            0.0
-        }
-    }
-}
-
 /// Starts the appropriate UI mode based on configuration.
-async fn start_ui(
-    meta: crate::mpris::TrackMetadata,
-    position: f64,
-    config: Config,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn start_ui(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     if config.pipe {
-        crate::ui::pipe::display_lyrics_pipe(meta, position, config).await
+        crate::ui::pipe::display_lyrics_pipe(config).await
     } else {
         let enable_karaoke = !config.no_karaoke;
-        crate::ui::modern::display_lyrics_modern(meta, position, config, enable_karaoke).await
+        crate::ui::modern::display_lyrics_modern(config, enable_karaoke).await
     }
 }
 
@@ -190,13 +147,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     initialize_database(&cfg).await;
 
-    // Fetch initial state from player (fallback to defaults on error)
-    let service = cfg.player_service.as_deref().unwrap_or("");
-    let meta = fetch_initial_metadata(service).await;
-    let position = fetch_initial_position(service).await;
-
     // Start UI and propagate any errors
-    start_ui(meta, position, cfg).await.map_err(|e| {
+    start_ui(cfg).await.map_err(|e| {
         tracing::error!(error = %e, "Application error");
         e
     })
