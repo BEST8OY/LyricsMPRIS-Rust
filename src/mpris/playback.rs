@@ -65,8 +65,15 @@ pub async fn get_position(service: &str) -> Result<f64, MprisError> {
         zbus::names::InterfaceName::from_static_str_unchecked("org.mpris.MediaPlayer2.Player");
 
     let val = props.get(iface, "Position").await?;
-    let microseconds =
-        i64::try_from(val).map_err(|e| MprisError::Fdo(zbus::fdo::Error::Failed(e.to_string())))?;
+    let microseconds = if let Ok(microsecs) = i64::try_from(&val) {
+        microsecs
+    } else if let Ok(microsecs) = u64::try_from(&val) {
+        microsecs as i64
+    } else {
+        return Err(MprisError::Fdo(zbus::fdo::Error::Failed(
+            "Invalid Position value".to_string(),
+        )));
+    };
     Ok(microseconds as f64 / 1_000_000.0)
 }
 
