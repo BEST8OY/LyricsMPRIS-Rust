@@ -128,8 +128,27 @@ fn isrc_from_metadata(url: Option<&str>) -> Option<String> {
     None
 }
 
+/// Check if an MPRIS `mpris:trackid` represents the canonical "NoTrack" sentinel
+/// defined in the MPRIS specification (e.g. `/org/mpris/MediaPlayer2/TrackList/NoTrack`,
+/// `/org/mpris/MediaPlayer2/NoTrack`, `NoTrack`, or `/`).
+pub fn is_no_track(trackid: &str) -> bool {
+    let trimmed = trackid.trim();
+    trimmed.is_empty()
+        || trimmed == "/"
+        || trimmed.ends_with("/NoTrack")
+        || trimmed.eq_ignore_ascii_case("NoTrack")
+}
+
 impl From<MprisMetadata> for TrackMetadata {
     fn from(md: MprisMetadata) -> Self {
+        // If the trackid explicitly signals "NoTrack", return default empty metadata
+        if let Some(ref trackid) = md.trackid
+            && is_no_track(trackid)
+            && md.title.as_deref().unwrap_or("").is_empty()
+        {
+            return TrackMetadata::default();
+        }
+
         let title = md.title.unwrap_or_default();
         let artist = md
             .artist
@@ -183,6 +202,17 @@ pub fn extract_metadata(map: &HashMap<String, OwnedValue>) -> TrackMetadata {
             .and_then(|v| <&str>::try_from(v).ok().map(String::from))
     };
 
+    let trackid = get_string("mpris:trackid");
+    let title = get_string("xesam:title").unwrap_or_default();
+
+    // Check for explicit "NoTrack" sentinel
+    if let Some(ref id) = trackid
+        && is_no_track(id)
+        && title.is_empty()
+    {
+        return TrackMetadata::default();
+    }
+
     // Helper to extract string array from variant
     let get_string_array = |key: &str| -> Option<Vec<String>> {
         map.get(key).and_then(|v| {
@@ -205,15 +235,13 @@ pub fn extract_metadata(map: &HashMap<String, OwnedValue>) -> TrackMetadata {
         })
     };
 
-    let title = get_string("xesam:title").unwrap_or_default();
-
-    // Artist: try array first, fallback to string
+    // Artist: try array first (primary artist), fallback to string
     let artist = get_string_array("xesam:artist")
         .and_then(|arr| arr.into_iter().next())
         .or_else(|| get_string("xesam:artist"))
         .unwrap_or_default();
 
-    // Album: try array first, fallback to string
+    // Album: try array first (primary album), fallback to string
     let album = get_string_array("xesam:album")
         .and_then(|arr| arr.into_iter().next())
         .or_else(|| get_string("xesam:album"))
@@ -229,7 +257,9 @@ pub fn extract_metadata(map: &HashMap<String, OwnedValue>) -> TrackMetadata {
         .as_ref()
         .and_then(|u| normalize_spotify_url(u))
         .or_else(|| {
-            get_string("mpris:trackid").and_then(|trackid| normalize_spotify_trackid(&trackid))
+            trackid
+                .as_ref()
+                .and_then(|id| normalize_spotify_trackid(id))
         });
 
     let isrc = if isrc_enabled() {
@@ -288,6 +318,27 @@ mod tests {
         assert_eq!(track.artist, "Artist 1");
         assert_eq!(track.album, "Test Album");
         assert_eq!(track.length, Some(180.0));
+    }
+
+    #[test]
+    fn test_notrack_sentinel() {
+        assert!(is_no_track("/org/mpris/MediaPlayer2/TrackList/NoTrack"));
+        assert!(is_no_track("/org/mpris/MediaPlayer2/NoTrack"));
+        assert!(is_no_track("/NoTrack"));
+        assert!(is_no_track("NoTrack"));
+        assert!(is_no_track("/"));
+        assert!(!is_no_track("/org/mpris/MediaPlayer2/track/123"));
+
+        let md = MprisMetadata {
+            title: None,
+            artist: Some(vec!["Stale Artist".to_string()]),
+            album: None,
+            length: None,
+            trackid: Some("/org/mpris/MediaPlayer2/TrackList/NoTrack".to_string()),
+            url: None,
+        };
+        let track: TrackMetadata = md.into();
+        assert_eq!(track, TrackMetadata::default());
     }
 
     #[test]

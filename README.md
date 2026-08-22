@@ -283,9 +283,10 @@ src/
 │   └── types.rs      # LyricLine, TrackMatchInfo, error models
 ├── mpris/
 │   ├── connection.rs # D-Bus session singleton
-│   ├── events.rs     # D-Bus signal listener (PropertiesChanged)
+│   ├── events.rs     # D-Bus signal listener (PropertiesChanged & NameOwnerChanged)
 │   ├── metadata.rs   # MPRIS track metadata extraction & local file ISRC (lofty)
-│   └── playback.rs   # Playback position & status querying
+│   ├── playback.rs   # Playback position & status querying
+│   └── proxies.rs    # Consolidated D-Bus proxy interfaces
 └── ui/
     ├── modern.rs     # Modern Ratatui TUI renderer
     ├── pipe.rs       # Stdout pipe mode renderer

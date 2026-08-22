@@ -7,6 +7,8 @@ use crate::mpris::proxies::{MediaPlayer2PlayerProxy, PlayerctldProxy};
 use futures_util::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
+use zbus::fdo::NameOwnerChangedStream;
+use zbus::proxy::PropertyStream;
 
 /// Callback trait for MPRIS events
 pub trait MprisEventCallback: Send + 'static {
@@ -123,78 +125,33 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
 
         // Main event processing loop
         loop {
-            tokio::select! {
-                // Handle playerctld player list changes
-                Some(_) = async {
-                    if let Some(ref mut stream) = player_names_stream {
-                        stream.next().await
-                    } else {
-                        None
-                    }
-                } => {
-                    tracing::debug!("playerctld player list changed, discovering active player");
-                    if let Err(e) = self.discover_active_player().await {
-                        tracing::warn!(
-                            error = %e,
-                            "Failed to discover active player on playerctld signal"
-                        );
-                    }
+            if self.state.is_active() {
+                if let Err(e) = self
+                    .handle_player_events(&mut player_names_stream, &mut name_owner_stream)
+                    .await
+                {
+                    tracing::warn!(error = %e, "Player event handler error, backing off...");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-
-                // Handle D-Bus NameOwnerChanged signals (instant connect / disconnect / ownership transfer)
-                Some(signal) = name_owner_stream.next() => {
-                    if let Ok(args) = signal.args() {
-                        let name = args.name.as_str();
-                        let old_owner = args.old_owner.as_deref().unwrap_or("");
-                        let new_owner = args.new_owner.as_deref().unwrap_or("");
-
-                        let is_current = name == self.state.service;
-                        let is_mpris = name.starts_with("org.mpris.MediaPlayer2.");
-                        let owner_changed = old_owner != new_owner;
-
-                        if (is_current || is_mpris) && owner_changed {
-                            tracing::debug!(
-                                name = %name,
-                                is_current,
-                                old_owner = %old_owner,
-                                new_owner = %new_owner,
-                                "MPRIS player lifecycle event detected via NameOwnerChanged"
-                            );
-                            if let Err(e) = self.discover_active_player().await {
-                                tracing::warn!(
-                                    error = %e,
-                                    "Failed to discover active player on NameOwnerChanged"
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Handle events from current player if active, or idle rediscovery sleep
-                res = self.handle_player_events() => {
-                    if let Err(e) = res {
-                        tracing::warn!(error = %e, "Player event handling failed, backing off...");
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                }
+            } else if let Err(e) = self
+                .handle_idle_events(&mut player_names_stream, &mut name_owner_stream)
+                .await
+            {
+                tracing::warn!(error = %e, "Idle event handler error, backing off...");
+                tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
     }
 
-    /// Handle events from the currently active player, or sleep + rediscover if inactive
-    async fn handle_player_events(&mut self) -> Result<(), MprisError> {
-        if !self.state.is_active() {
-            // No active player: sleep for 2s then attempt discovery
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            if let Err(e) = self.discover_active_player().await {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to discover active player during idle poll"
-                );
-            }
-            return Ok(());
-        }
-
+    /// Handle events while a player is active.
+    ///
+    /// Keeps player-specific signal streams alive continuously without cancelling/recreating them
+    /// on external signals, ensuring property change events (e.g. Play/Pause) are never dropped.
+    async fn handle_player_events<'a>(
+        &mut self,
+        player_names_stream: &mut Option<PropertyStream<'a, Vec<String>>>,
+        name_owner_stream: &mut NameOwnerChangedStream,
+    ) -> Result<(), MprisError> {
         let service = self.state.service.clone();
         tracing::debug!(service = %service, "Subscribing to player events");
 
@@ -205,14 +162,74 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
 
         let dbus_proxy = zbus::fdo::DBusProxy::new(&self.conn).await?;
 
-        // Subscribe to signals and property changes
+        // Subscribe to player signals and property changes
         let mut seeked_stream = proxy.receive_seeked().await?;
         let mut metadata_stream = proxy.receive_metadata_changed().await;
         let mut status_stream = proxy.receive_playback_status_changed().await;
 
+        // Perform an initial sync in case state changed during proxy setup
+        let _ = self.handle_status_change(&proxy).await;
+        let _ = self.handle_metadata_change(&proxy).await;
+
         loop {
             tokio::select! {
-                // Handle Seeked signal
+                // 1. playerctld active player list change
+                Some(_) = async {
+                    if let Some(stream) = player_names_stream.as_mut() {
+                        stream.next().await
+                    } else {
+                        futures_util::future::pending().await
+                    }
+                } => {
+                    tracing::debug!(service = %service, "playerctld player list changed while watching player");
+                    if self.sync_active_service(&service).await? {
+                        break;
+                    } else {
+                        // Same player remains active: sync state without tearing down streams
+                        let _ = self.handle_status_change(&proxy).await;
+                        let _ = self.handle_metadata_change(&proxy).await;
+                    }
+                }
+
+                // 2. D-Bus NameOwnerChanged signals
+                Some(signal) = name_owner_stream.next() => {
+                    if let Ok(args) = signal.args() {
+                        let name = args.name.as_str();
+                        let old_owner = args.old_owner.as_deref().unwrap_or("");
+                        let new_owner = args.new_owner.as_deref().unwrap_or("");
+
+                        let is_current = name == service;
+                        let is_mpris = name.starts_with("org.mpris.MediaPlayer2.");
+                        let owner_changed = old_owner != new_owner;
+
+                        if (is_current || is_mpris) && owner_changed {
+                            tracing::debug!(
+                                name = %name,
+                                is_current,
+                                old_owner = %old_owner,
+                                new_owner = %new_owner,
+                                "NameOwnerChanged signal received while watching player"
+                            );
+
+                            if is_current {
+                                // Current player disconnected or transferred ownership to a new PID.
+                                // Re-discover to ensure fresh GetAll against the new process PID.
+                                tracing::debug!(
+                                    service = %service,
+                                    old_owner = %old_owner,
+                                    new_owner = %new_owner,
+                                    "Current player ownership changed, refreshing player connection"
+                                );
+                                let _ = self.discover_active_player().await;
+                                break;
+                            } else if self.sync_active_service(&service).await? {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                // 3. Player Seeked signal
                 Some(signal) = seeked_stream.next() => {
                     if let Ok(args) = signal.args() {
                         tracing::debug!(service = %service, position = args.position, "Seeked signal received");
@@ -220,9 +237,9 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                     }
                 }
 
-                // Handle Metadata property change
+                // 4. Player Metadata property change
                 Some(_) = metadata_stream.next() => {
-                    tracing::debug!(service = %service, "Metadata changed");
+                    tracing::debug!(service = %service, "Metadata changed signal received");
                     if let Err(e) = self.handle_metadata_change(&proxy).await {
                         tracing::warn!(
                             service = %service,
@@ -232,9 +249,9 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                     }
                 }
 
-                // Handle PlaybackStatus property change
+                // 5. Player PlaybackStatus property change
                 Some(_) = status_stream.next() => {
-                    tracing::debug!(service = %service, "Playback status changed");
+                    tracing::debug!(service = %service, "Playback status changed signal received");
                     if let Err(e) = self.handle_status_change(&proxy).await {
                         tracing::warn!(
                             service = %service,
@@ -244,7 +261,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                     }
                 }
 
-                // Safety-net periodic check (3s timeout avoids 25s D-Bus freeze; uses real D-Bus daemon query)
+                // 6. Safety-net periodic check (3s timeout avoids 25s D-Bus freeze)
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {
                     let has_owner = match zbus::names::BusName::try_from(service.as_str()) {
                         Ok(bus_name) => matches!(
@@ -263,15 +280,51 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                             service = %service,
                             "Player name has no owner or is unreachable, discovering new player"
                         );
-                        if let Err(e) = self.discover_active_player().await {
-                            tracing::warn!(
-                                error = %e,
-                                "Failed to discover player after disconnect"
-                            );
-                        }
-                        break; // Exit inner loop to restart with new player
+                        let _ = self.discover_active_player().await;
+                        break;
                     }
                 }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle events while in idle state (no active player).
+    async fn handle_idle_events<'a>(
+        &mut self,
+        player_names_stream: &mut Option<PropertyStream<'a, Vec<String>>>,
+        name_owner_stream: &mut NameOwnerChangedStream,
+    ) -> Result<(), MprisError> {
+        tokio::select! {
+            // playerctld notification of active player
+            Some(_) = async {
+                if let Some(stream) = player_names_stream {
+                    stream.next().await
+                } else {
+                    futures_util::future::pending().await
+                }
+            } => {
+                tracing::debug!("playerctld player list changed while idle");
+                let _ = self.discover_active_player().await;
+            }
+
+            // D-Bus NameOwnerChanged for new MPRIS player
+            Some(signal) = name_owner_stream.next() => {
+                if let Ok(args) = signal.args() {
+                    let name = args.name.as_str();
+                    let old_owner = args.old_owner.as_deref().unwrap_or("");
+                    let new_owner = args.new_owner.as_deref().unwrap_or("");
+                    if name.starts_with("org.mpris.MediaPlayer2.") && old_owner.is_empty() && !new_owner.is_empty() {
+                        tracing::debug!(name = %name, "New MPRIS player appeared while idle");
+                        let _ = self.discover_active_player().await;
+                    }
+                }
+            }
+
+            // Periodic idle poll
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                let _ = self.discover_active_player().await;
             }
         }
 
@@ -298,9 +351,9 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
         if new_track != self.state.track {
             self.state.track = new_track;
 
-            // Also update position when track changes
-            if let Ok(pos_microsecs) = proxy.position().await {
-                self.state.position = pos_microsecs as f64 / 1_000_000.0;
+            // Also update position when track changes via uncached query
+            if let Ok(pos) = get_position(&self.state.service).await {
+                self.state.position = pos;
             }
 
             self.callback.on_track_change(
@@ -320,9 +373,15 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
         if let Ok(status) = proxy.playback_status().await
             && status != self.state.playback_status
         {
+            tracing::debug!(
+                service = %self.state.service,
+                old_status = %self.state.playback_status,
+                new_status = %status,
+                "Playback status transition detected"
+            );
             self.state.playback_status = status;
 
-            // Get fresh position on playback status change
+            // Get fresh uncached position on playback status change
             let position = if let Ok(pos) = get_position(&self.state.service).await {
                 self.state.position = pos;
                 pos
@@ -339,6 +398,34 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
         }
 
         Ok(())
+    }
+
+    /// Syncs active player state based on current service discovery.
+    ///
+    /// Returns `Ok(true)` if the player switched or deactivated (loop should break),
+    /// or `Ok(false)` if the current player remains active or query encountered transient error.
+    async fn sync_active_service(&mut self, current_service: &str) -> Result<bool, MprisError> {
+        match find_active_service(&self.block_list, &self.target_list).await {
+            Ok(Some(new_service)) if new_service != current_service => {
+                tracing::debug!(
+                    old_service = %current_service,
+                    new_service = %new_service,
+                    "Active player changed, switching"
+                );
+                self.switch_to_player(&new_service).await?;
+                Ok(true)
+            }
+            Ok(Some(_)) => Ok(false),
+            Ok(None) => {
+                tracing::debug!(service = %current_service, "No active players, deactivating");
+                self.deactivate_player();
+                Ok(true)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to query active player on state change");
+                Ok(false)
+            }
+        }
     }
 
     /// Discovers and switches to the active unblocked player
@@ -390,11 +477,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             .map(|map| extract_metadata(&map))
             .unwrap_or_default();
 
-        let position = proxy
-            .position()
-            .await
-            .map(|microsecs| microsecs as f64 / 1_000_000.0)
-            .unwrap_or(0.0);
+        let position = get_position(service).await.unwrap_or(0.0);
 
         let playback_status = proxy
             .playback_status()

@@ -46,7 +46,8 @@ impl From<PlaybackStatus> for String {
 
 /// Query the playback position for a specific MPRIS player service
 ///
-/// Returns position in seconds. Returns 0.0 if the service is unavailable or on error.
+/// Returns position in seconds, or an error if the service is unavailable or D-Bus query fails.
+/// Uses direct D-Bus Properties.Get to bypass proxy caches and ensure real-time accuracy.
 pub async fn get_position(service: &str) -> Result<f64, MprisError> {
     if service.is_empty() {
         return Ok(0.0);
@@ -54,18 +55,19 @@ pub async fn get_position(service: &str) -> Result<f64, MprisError> {
 
     let conn = get_dbus_conn().await?;
 
-    let proxy = MediaPlayer2PlayerProxy::builder(&conn)
+    let props = zbus::fdo::PropertiesProxy::builder(&conn)
         .destination(service)?
+        .path("/org/mpris/MediaPlayer2")?
         .build()
         .await?;
 
-    match proxy.position().await {
-        Ok(microseconds) => {
-            // Convert microseconds to seconds
-            Ok(microseconds as f64 / 1_000_000.0)
-        }
-        Err(_) => Ok(0.0),
-    }
+    let iface =
+        zbus::names::InterfaceName::from_static_str_unchecked("org.mpris.MediaPlayer2.Player");
+
+    let val = props.get(iface, "Position").await?;
+    let microseconds =
+        i64::try_from(val).map_err(|e| MprisError::Fdo(zbus::fdo::Error::Failed(e.to_string())))?;
+    Ok(microseconds as f64 / 1_000_000.0)
 }
 
 /// Query the playback status for a specific MPRIS player service

@@ -5,6 +5,10 @@ use zbus::proxy;
 use zvariant::OwnedValue;
 
 /// MPRIS MediaPlayer2.Player interface proxy for player state and control.
+///
+/// `Metadata` and `PlaybackStatus` use standard property caching (`CacheProperties::Lazily`)
+/// enabling property change streams. For real-time position querying, `get_position()` uses
+/// direct D-Bus `Properties.Get` to avoid stale cached data.
 #[proxy(
     interface = "org.mpris.MediaPlayer2.Player",
     default_path = "/org/mpris/MediaPlayer2"
@@ -12,9 +16,6 @@ use zvariant::OwnedValue;
 pub trait MediaPlayer2Player {
     #[zbus(property)]
     fn metadata(&self) -> zbus::Result<HashMap<String, OwnedValue>>;
-
-    #[zbus(property)]
-    fn position(&self) -> zbus::Result<i64>;
 
     #[zbus(property)]
     fn playback_status(&self) -> zbus::Result<String>;
