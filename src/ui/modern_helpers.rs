@@ -32,7 +32,10 @@ pub fn draw_ui_with_cache<B: Backend>(
     karaoke_enabled: bool,
     max_visible_lines: Option<usize>,
     scroll_offset: isize,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+) -> Result<(), Box<dyn Error + Send + Sync>>
+where
+    B::Error: Error + Send + Sync + 'static,
+{
     terminal
         .draw(|f| {
             let size = f.area();

@@ -162,7 +162,10 @@ fn redraw_and_reschedule<B: ratatui::backend::Backend>(
     styles: &LyricStyles,
     next_word_sleep: &mut Option<Pin<Box<Sleep>>>,
     max_visible_lines: Option<usize>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let (estimated_update, next_sleep) = crate::ui::estimate_update_and_next_sleep(
         &state.last_update,
         state.last_update_instant,
