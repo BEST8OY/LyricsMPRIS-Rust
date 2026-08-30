@@ -15,17 +15,16 @@ use crate::pool;
 use crate::state::Update;
 use crate::ui::styles::LyricStyles;
 use crossterm::{
-    event::{Event, KeyCode, KeyEventKind},
+    event::{Event, EventStream, KeyCode, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use futures_util::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
-use std::io::{self};
+use std::io;
 use std::pin::Pin;
-use std::thread;
 use std::time::Instant;
 use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::Sleep;
 
 /// UI state for the modern TUI mode
@@ -99,42 +98,9 @@ pub async fn display_lyrics_modern(
     state.karaoke_enabled = karaoke_enabled;
     // per-word sleep used to schedule redraws only at interesting times (word boundaries)
     let mut next_word_sleep: Option<Pin<Box<Sleep>>> = None;
-    // Single background thread to poll for crossterm events and forward them
-    // to the async runtime via `event_rx`. This avoids repeatedly calling
-    // `tokio::task::spawn_blocking` which grows the blocking threadpool when
-    // the UI wakes frequently (e.g. karaoke mode).
-    let (event_tx, mut event_rx) = mpsc::channel(32);
-    // Spawn a real OS thread that polls and reads events synchronously.
-    // Use try_send so the thread can exit when the receiver is closed.
-    thread::spawn(move || {
-        loop {
-            // Poll with a short timeout to remain responsive.
-            match crossterm::event::poll(std::time::Duration::from_millis(100)) {
-                Ok(true) => match crossterm::event::read() {
-                    Ok(ev) => {
-                        match event_tx.try_send(ev) {
-                            // Queue momentarily full (e.g. key held down during a
-                            // slow redraw): drop this input event, keep polling.
-                            Err(TrySendError::Full(_)) => {}
-                            // Receiver closed: stop the thread.
-                            Err(TrySendError::Closed(_)) => break,
-                            Ok(()) => {}
-                        }
-                    }
-                    Err(_) => {
-                        // ignore and continue polling
-                    }
-                },
-                Ok(false) => {
-                    // timeout, continue
-                }
-                Err(_) => {
-                    // on error, sleep a bit to avoid busy loop
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-            }
-        }
-    });
+    // Asynchronous crossterm event stream directly integrated into Tokio select loop.
+    let mut event_stream = EventStream::new();
+
     // Main event loop: handle updates, user input, and timer-driven redraws
     while !state.should_exit {
         tokio::select! {
@@ -146,14 +112,20 @@ pub async fn display_lyrics_modern(
                 redraw_and_reschedule(&mut terminal, &mut state, &styles, &mut next_word_sleep, max_visible_lines)?;
             }
 
-            // User keyboard input
-            maybe_event = event_rx.recv() => {
-                if let Some(event) = maybe_event {
-                    process_event(event, &mut state)?;
-                    redraw_and_reschedule(&mut terminal, &mut state, &styles, &mut next_word_sleep, max_visible_lines)?;
-                } else {
-                    // Event channel closed -> exit gracefully
-                    state.should_exit = true;
+            // User keyboard input (async crossterm event stream)
+            maybe_event = event_stream.next() => {
+                match maybe_event {
+                    Some(Ok(event)) => {
+                        process_event(event, &mut state)?;
+                        redraw_and_reschedule(&mut terminal, &mut state, &styles, &mut next_word_sleep, max_visible_lines)?;
+                    }
+                    Some(Err(e)) => {
+                        tracing::warn!(error = %e, "Terminal event stream error");
+                    }
+                    None => {
+                        // Event stream closed -> exit gracefully
+                        state.should_exit = true;
+                    }
                 }
             }
 

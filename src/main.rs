@@ -102,7 +102,7 @@ async fn start_ui(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initialize tracing with environment filter.
     // Logs are OFF by default; enable with RUST_LOG=debug (or any level).
