@@ -7,6 +7,7 @@ pub mod fetch;
 pub mod handlers;
 
 pub use fetch::fetch_and_update_lyrics;
+pub use handlers::RetryDirective;
 
 use crate::mpris::TrackMetadata;
 use crate::state::{StateBundle, Update};
@@ -45,14 +46,20 @@ pub async fn send_update(state: &mut StateBundle, update_tx: &mpsc::Sender<Updat
 }
 
 /// Processes a single event from the event loop.
+///
+/// Returns the [`RetryDirective`] computed by the handler so callers can
+/// maintain the network-retry schedule.
 pub async fn process_event(
     event: Event,
     state: &mut StateBundle,
     update_tx: &mpsc::Sender<Update>,
     providers: &[String],
-) {
+) -> RetryDirective {
     match event {
         Event::Mpris(ev) => handlers::handle_mpris_event(ev, state, update_tx, providers).await,
-        Event::Shutdown => send_update(state, update_tx, true).await,
+        Event::Shutdown => {
+            send_update(state, update_tx, true).await;
+            RetryDirective::Clear
+        }
     }
 }

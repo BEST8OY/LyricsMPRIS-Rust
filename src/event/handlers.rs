@@ -1,6 +1,6 @@
 //! MPRIS event handlers for state transitions, track changes, and seeks.
 
-use super::fetch::fetch_and_update_lyrics;
+use super::fetch::{FetchSummary, fetch_and_update_lyrics};
 use super::{MprisEvent, send_update};
 use crate::mpris::TrackMetadata;
 use crate::state::{StateBundle, Update};
@@ -17,13 +17,30 @@ pub(crate) struct NewTrackContext<'a> {
     pub(crate) providers: &'a [String],
 }
 
+/// Instructs the event loop on how to manage the network-retry timer
+/// after processing an MPRIS event.
+#[derive(Debug)]
+pub enum RetryDirective {
+    /// Leave any scheduled retry untouched (position updates, seeks)
+    Keep,
+    /// Cancel any scheduled retry (no player, stopped, shutdown)
+    Clear,
+    /// Schedule a retry for this track after providers were unreachable
+    Schedule {
+        meta: TrackMetadata,
+        service: String,
+    },
+}
+
 /// Handles MPRIS events (player updates and seeks).
+///
+/// Returns a [`RetryDirective`] so the caller can maintain the retry schedule.
 pub(crate) async fn handle_mpris_event(
     event: MprisEvent,
     state: &mut StateBundle,
     update_tx: &mpsc::Sender<Update>,
     providers: &[String],
-) {
+) -> RetryDirective {
     let (meta, position, service, is_full_update) = match event {
         MprisEvent::PlayerUpdate(m, p, s) => (m, p, s, true),
         MprisEvent::Seeked(m, p, s) => (m, p, s, false),
@@ -32,7 +49,7 @@ pub(crate) async fn handle_mpris_event(
     // No active player: clear state and notify UI
     if service.is_empty() {
         handle_no_player(state, update_tx).await;
-        return;
+        return RetryDirective::Clear;
     }
 
     // Only fetch playback status for full updates (optimization)
@@ -45,12 +62,12 @@ pub(crate) async fn handle_mpris_event(
     // If the player reported 'Stopped' on a full update, treat as no player
     if is_full_update && playback_status.as_deref() == Some("Stopped") {
         handle_no_player(state, update_tx).await;
-        return;
+        return RetryDirective::Clear;
     }
 
     // New track detection on full updates
     if is_full_update && state.player_state.has_changed(&meta) {
-        handle_new_track(NewTrackContext {
+        return handle_new_track(NewTrackContext {
             meta,
             position,
             service,
@@ -60,7 +77,6 @@ pub(crate) async fn handle_mpris_event(
             providers,
         })
         .await;
-        return;
     }
 
     // For seek events, filter initialization Seeked signals.
@@ -82,7 +98,7 @@ pub(crate) async fn handle_mpris_event(
                     time_since_load = elapsed,
                     "Ignoring initialization Seeked echo"
                 );
-                return;
+                return RetryDirective::Keep;
             }
         }
 
@@ -90,11 +106,12 @@ pub(crate) async fn handle_mpris_event(
         let playing = state.player_state.playing;
         state.update_playback_and_position(playing, position);
         send_update(state, update_tx, true).await;
-        return;
+        return RetryDirective::Keep;
     }
 
     // Position/playback state update (for full updates)
     handle_state_update(position, playback_status, state, update_tx).await;
+    RetryDirective::Keep
 }
 
 /// Clears state when no player is active.
@@ -105,7 +122,10 @@ pub(crate) async fn handle_no_player(state: &mut StateBundle, update_tx: &mpsc::
 }
 
 /// Handles detection of a new track.
-pub(crate) async fn handle_new_track(ctx: NewTrackContext<'_>) {
+///
+/// Returns a [`RetryDirective`]: [`RetryDirective::Schedule`] when providers
+/// were unreachable so the event loop can retry in the background.
+pub(crate) async fn handle_new_track(ctx: NewTrackContext<'_>) -> RetryDirective {
     let NewTrackContext {
         meta,
         position: _event_position, // Ignored - often stale from previous track
@@ -131,9 +151,14 @@ pub(crate) async fn handle_new_track(ctx: NewTrackContext<'_>) {
 
     send_update(state, update_tx, true).await;
 
-    let _ = fetch_and_update_lyrics(&meta, state, providers, Some(&service)).await;
+    let (_, summary) = fetch_and_update_lyrics(&meta, state, providers, Some(&service)).await;
 
     send_update(state, update_tx, true).await;
+
+    match summary {
+        FetchSummary::Unavailable => RetryDirective::Schedule { meta, service },
+        FetchSummary::Loaded | FetchSummary::Exhausted => RetryDirective::Clear,
+    }
 }
 
 /// Handles position and playback state updates.

@@ -1,19 +1,46 @@
 //! Multi-provider lyrics fetching and caching pipeline.
 
+use crate::lyrics::types::{LyricsError, is_retryable_status};
 use crate::mpris::TrackMetadata;
 use crate::state::{Provider, StateBundle};
 
+/// Message surfaced to the UI while providers are unreachable.
+pub(crate) const NETWORK_RETRY_MESSAGE: &str = "Network unavailable - retrying...";
+
 /// Result of a lyrics fetch attempt from a single provider.
 ///
-/// This enum classifies failures as transient (retry with next provider)
+/// This enum classifies failures as transient (try next provider / schedule retry)
 /// or non-transient (stop trying and report error).
 pub(crate) enum FetchResult {
     /// Lyrics fetched successfully
     Success,
-    /// Transient error (no lyrics found, network issue) - try next provider
+    /// Provider answered authoritatively: no lyrics exist for this track
+    NotFound,
+    /// Transient failure (network issue, rate limit, server outage) - try next
+    /// provider and consider a delayed retry
     Transient,
-    /// Non-transient error (API error, parse error) - stop trying
-    NonTransient(crate::lyrics::LyricsError),
+    /// Non-transient error (API error, parse error) - stop trying and report
+    NonTransient(LyricsError),
+}
+
+/// Outcome of a full multi-provider fetch pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FetchSummary {
+    /// Lyrics are loaded (from cache or a provider)
+    Loaded,
+    /// Definitive miss or fatal error - retrying will not help
+    Exhausted,
+    /// At least one provider was unreachable - worth retrying after a delay
+    Unavailable,
+}
+
+/// Classifies a provider error into retryable vs fatal.
+fn classify_error(err: LyricsError) -> FetchResult {
+    match err {
+        LyricsError::Network(_) => FetchResult::Transient,
+        LyricsError::Http(code) if is_retryable_status(code) => FetchResult::Transient,
+        e => FetchResult::NonTransient(e),
+    }
 }
 
 /// Attempts to fetch lyrics from a single provider by name.
@@ -25,7 +52,7 @@ pub(crate) async fn try_provider(
     match provider {
         "lrclib" => try_lrclib(meta, state).await,
         "musixmatch" => try_musixmatch(meta, state).await,
-        _ => FetchResult::Transient,
+        _ => FetchResult::NotFound,
     }
 }
 
@@ -96,9 +123,8 @@ pub(crate) async fn try_lrclib(meta: &TrackMetadata, state: &mut StateBundle) ->
             .await;
             FetchResult::Success
         }
-        Ok(_) => FetchResult::Transient,
-        Err(crate::lyrics::LyricsError::Network(_)) => FetchResult::Transient,
-        Err(e) => FetchResult::NonTransient(e),
+        Ok(_) => FetchResult::NotFound,
+        Err(e) => classify_error(e),
     }
 }
 
@@ -150,9 +176,8 @@ pub(crate) async fn try_musixmatch(meta: &TrackMetadata, state: &mut StateBundle
 
             FetchResult::Success
         }
-        Ok(_) => FetchResult::Transient,
-        Err(crate::lyrics::LyricsError::Network(_)) => FetchResult::Transient,
-        Err(e) => FetchResult::NonTransient(e),
+        Ok(_) => FetchResult::NotFound,
+        Err(e) => classify_error(e),
     }
 }
 
@@ -217,19 +242,27 @@ pub(crate) async fn try_database(meta: &TrackMetadata, state: &mut StateBundle) 
 }
 
 /// Fetches lyrics from all configured providers in order.
+///
+/// Returns a [`FetchSummary`] describing whether the fetch succeeded, hit a
+/// definitive dead end, or failed transiently (worth retrying later).
 pub(crate) async fn fetch_api_lyrics(
     meta: &TrackMetadata,
     state: &mut StateBundle,
     providers: &[String],
-) {
+) -> FetchSummary {
     if try_database(meta, state).await {
-        return;
+        return FetchSummary::Loaded;
     }
+
+    let mut saw_transient = false;
 
     for provider in providers {
         match try_provider(provider, meta, state).await {
-            FetchResult::Success => return,
-            FetchResult::Transient => continue,
+            FetchResult::Success => return FetchSummary::Loaded,
+            FetchResult::NotFound => continue,
+            FetchResult::Transient => {
+                saw_transient = true;
+            }
             FetchResult::NonTransient(err) => {
                 tracing::warn!(
                     provider = %provider,
@@ -239,12 +272,25 @@ pub(crate) async fn fetch_api_lyrics(
                     "Provider failed to fetch lyrics"
                 );
                 state.update_lyrics(Vec::new(), meta, Some(err.to_string()), None);
-                return;
+                return FetchSummary::Exhausted;
             }
         }
     }
 
-    state.update_lyrics(Vec::new(), meta, None, None);
+    if saw_transient {
+        // Surface the outage so the UI can display it; the event loop schedules
+        // a background retry with exponential backoff.
+        state.update_lyrics(
+            Vec::new(),
+            meta,
+            Some(NETWORK_RETRY_MESSAGE.to_string()),
+            None,
+        );
+        FetchSummary::Unavailable
+    } else {
+        state.update_lyrics(Vec::new(), meta, None, None);
+        FetchSummary::Exhausted
+    }
 }
 
 /// Fetches a fresh position from the player or estimates it.
@@ -281,16 +327,19 @@ pub(crate) async fn fetch_fresh_position(service: Option<&str>, state: &StateBun
 }
 
 /// Fetches lyrics and updates position atomically.
+///
+/// Returns the fresh playback position along with a [`FetchSummary`] so callers
+/// can decide whether to schedule a retry.
 pub async fn fetch_and_update_lyrics(
     meta: &TrackMetadata,
     state: &mut StateBundle,
     providers: &[String],
     service: Option<&str>,
-) -> f64 {
+) -> (f64, FetchSummary) {
     let position_before = state.player_state.estimate_position();
     let start_time = std::time::Instant::now();
 
-    fetch_api_lyrics(meta, state, providers).await;
+    let summary = fetch_api_lyrics(meta, state, providers).await;
 
     let fetch_duration = start_time.elapsed();
     let position = fetch_fresh_position(service, state).await;
@@ -301,11 +350,47 @@ pub async fn fetch_and_update_lyrics(
         position_after = position,
         position_change,
         fetch_duration = ?fetch_duration,
+        summary = ?summary,
         "Position updated after lyrics fetch"
     );
 
     state.update_index(position);
     state.player_state.set_position(position);
 
-    position
+    (position, summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_classify_error_retryability() {
+        assert!(matches!(
+            classify_error(LyricsError::Http(500)),
+            FetchResult::Transient
+        ));
+        assert!(matches!(
+            classify_error(LyricsError::Http(429)),
+            FetchResult::Transient
+        ));
+        assert!(matches!(
+            classify_error(LyricsError::Http(404)),
+            FetchResult::NonTransient(_)
+        ));
+        assert!(matches!(
+            classify_error(LyricsError::Api("bad request".into())),
+            FetchResult::NonTransient(_)
+        ));
+    }
+
+    #[test]
+    fn test_retryable_status_boundaries() {
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(500));
+        assert!(is_retryable_status(503));
+        assert!(!is_retryable_status(400));
+        assert!(!is_retryable_status(401));
+        assert!(!is_retryable_status(404));
+    }
 }
