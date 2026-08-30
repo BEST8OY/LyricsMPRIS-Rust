@@ -29,7 +29,7 @@ pub async fn fetch_lyrics_from_lrclib(
     }
 
     if !resp.status().is_success() {
-        return Err(LyricsError::Api(format!("lrclib: HTTP {}", resp.status())));
+        return Err(LyricsError::Http(resp.status().as_u16()));
     }
 
     let response: LrcLibResponse = resp.json().await?;

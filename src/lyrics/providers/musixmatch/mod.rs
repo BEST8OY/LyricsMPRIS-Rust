@@ -12,7 +12,7 @@ pub mod token;
 #[allow(unused_imports)]
 pub use token::fetch_fresh_musixmatch_token;
 
-use crate::lyrics::types::{ProviderResult, TrackMatchInfo, http_client};
+use crate::lyrics::types::{LyricsError, ProviderResult, TrackMatchInfo, http_client};
 use request::{FetchOutcome, fetch_lyrics_with_token};
 use token::{TOKEN_MANAGER, fetch_fresh_musixmatch_token as get_fresh_token};
 
@@ -40,8 +40,14 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
     };
 
     // 1. Try env tokens in round-robin fashion if configured
+    // Track network-level failures separately: if every attempt failed to reach
+    // the server at all, there is no point trying token.get - propagate the error
+    // so callers can classify it as transient and schedule a retry.
+    let mut attempts = 0usize;
+    let mut non_network_outcomes = 0usize;
+    let mut last_network_err: Option<LyricsError> = None;
+
     if env_token_count > 0 {
-        let mut attempts = 0;
         while attempts < env_token_count {
             let token = {
                 let mut manager = TOKEN_MANAGER.lock().ok();
@@ -76,6 +82,7 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
                     return Ok((Vec::new(), None, TrackMatchInfo::default()));
                 }
                 Ok(FetchOutcome::TokenError(reason)) => {
+                    non_network_outcomes += 1;
                     tracing::warn!(
                         attempt = attempts,
                         total = env_token_count,
@@ -84,15 +91,34 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
                     );
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        attempt = attempts,
-                        total = env_token_count,
-                        error = %e,
-                        "Musixmatch request failed with env token, trying next token"
-                    );
+                    if matches!(e, LyricsError::Network(_)) {
+                        tracing::warn!(
+                            attempt = attempts,
+                            total = env_token_count,
+                            error = %e,
+                            "Musixmatch request failed with env token"
+                        );
+                        last_network_err = Some(e);
+                    } else {
+                        non_network_outcomes += 1;
+                        tracing::warn!(
+                            attempt = attempts,
+                            total = env_token_count,
+                            error = %e,
+                            "Musixmatch request failed with env token, trying next token"
+                        );
+                    }
                 }
             }
         }
+    }
+
+    if attempts > 0
+        && non_network_outcomes == 0
+        && let Some(e) = last_network_err
+    {
+        tracing::warn!(error = %e, "Musixmatch unreachable with all env tokens");
+        return Err(e);
     }
 
     // 2. Fallback to dynamic token (via token.get API)
@@ -122,7 +148,7 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to auto-fetch dynamic Musixmatch token");
-                    return Ok((Vec::new(), None, TrackMatchInfo::default()));
+                    return Err(e);
                 }
             },
         }
@@ -168,18 +194,21 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
                     .await
                     {
                         Ok(FetchOutcome::Success(parsed, raw, ids)) => Ok((parsed, raw, ids)),
-                        _ => Ok((Vec::new(), None, TrackMatchInfo::default())),
+                        // A freshly-issued token that is still rejected means the
+                        // account/endpoint itself refuses us - treat as a miss.
+                        Ok(_) => Ok((Vec::new(), None, TrackMatchInfo::default())),
+                        Err(e) => Err(e),
                     }
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "Failed to renew dynamic Musixmatch token");
-                    Ok((Vec::new(), None, TrackMatchInfo::default()))
+                    Err(e)
                 }
             }
         }
         Err(e) => {
             tracing::warn!(error = %e, "Musixmatch request failed with dynamic token");
-            Ok((Vec::new(), None, TrackMatchInfo::default()))
+            Err(e)
         }
     }
 }

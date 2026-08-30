@@ -20,10 +20,7 @@ pub async fn fetch_fresh_musixmatch_token(client: &Client) -> Result<String, Lyr
         .await?;
 
     if !resp.status().is_success() {
-        return Err(LyricsError::Api(format!(
-            "Failed to get Musixmatch token: HTTP {}",
-            resp.status()
-        )));
+        return Err(LyricsError::Http(resp.status().as_u16()));
     }
 
     let json: Value = resp.json().await?;

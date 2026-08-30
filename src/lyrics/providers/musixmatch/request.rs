@@ -61,14 +61,17 @@ pub(crate) async fn try_macro_for_lyrics(
         .send()
         .await?;
 
-    if is_token_error_status(macro_resp.status()) {
-        return Ok(FetchOutcome::TokenError(format!(
-            "HTTP {}",
-            macro_resp.status()
-        )));
+    let macro_status = macro_resp.status();
+    if is_token_error_status(macro_status) {
+        return Ok(FetchOutcome::TokenError(format!("HTTP {macro_status}")));
     }
 
-    if !macro_resp.status().is_success() {
+    // Server-side failures are transient network-level issues, not "track not found"
+    if macro_status.is_server_error() {
+        return Err(LyricsError::Http(macro_status.as_u16()));
+    }
+
+    if !macro_status.is_success() {
         return Ok(FetchOutcome::TrackNotFound);
     }
 
@@ -209,14 +212,18 @@ pub(crate) async fn fetch_lyrics_with_token(
         .send()
         .await?;
 
-    if is_token_error_status(matcher_resp.status()) {
+    let matcher_status = matcher_resp.status();
+    if is_token_error_status(matcher_status) {
         return Ok(FetchOutcome::TokenError(format!(
-            "Matcher HTTP {}",
-            matcher_resp.status()
+            "Matcher HTTP {matcher_status}"
         )));
     }
 
-    if !matcher_resp.status().is_success() {
+    if matcher_status.is_server_error() {
+        return Err(LyricsError::Http(matcher_status.as_u16()));
+    }
+
+    if !matcher_status.is_success() {
         return Ok(FetchOutcome::TrackNotFound);
     }
 
