@@ -152,44 +152,24 @@ pub fn estimate_update_and_next_sleep(
     (Some(estimated), next_sleep)
 }
 
-/// Compute the current line index from position using binary search.
+/// Compute the current line index from position.
 ///
 /// Returns `None` if:
 /// - No lyrics
 /// - Position is invalid (NaN)
-/// - Any line time is invalid
+/// - Any line time is invalid (NaN)
 /// - Position is before the first line
+///
+/// Delegates to the shared [`active_line_index`] binary search also used by
+/// `LyricState::get_index`, keeping authoritative state and UI estimation in sync.
 fn compute_line_index(update: &Update) -> Option<usize> {
-    // Need at least 1 line
-    if update.lines.is_empty() {
-        return None;
-    }
-
-    // Validate position and line times
-    if update.position.is_nan() || update.lines.iter().any(|l| l.time.is_nan()) {
-        return None;
-    }
-
-    // Before first line
-    if let Some(first) = update.lines.first()
-        && update.position < first.time
+    // Validate position and line times before searching
+    if update.lines.is_empty()
+        || update.position.is_nan()
+        || update.lines.iter().any(|l| l.time.is_nan())
     {
         return None;
     }
 
-    // Single line case
-    if update.lines.len() == 1 {
-        return Some(0);
-    }
-
-    // Binary search for current line
-    match update.lines.binary_search_by(|line| {
-        line.time
-            .partial_cmp(&update.position)
-            .unwrap_or(std::cmp::Ordering::Less)
-    }) {
-        Ok(idx) => Some(idx),      // Exact match
-        Err(0) => None,            // Before first line
-        Err(idx) => Some(idx - 1), // Between lines
-    }
+    crate::lyrics::types::active_line_index(&update.lines, update.position)
 }

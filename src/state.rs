@@ -344,21 +344,7 @@ impl LyricState {
             return None;
         }
 
-        // Check if position is before first line
-        let first = self.lines.first()?;
-        if position < first.time {
-            return None;
-        }
-
-        // Binary search for the appropriate line
-        match self
-            .lines
-            .binary_search_by(|line| line.time.total_cmp(&position))
-        {
-            Ok(exact_match) => Some(exact_match),
-            Err(0) => None,
-            Err(insert_point) => Some(insert_point - 1),
-        }
+        crate::lyrics::types::active_line_index(&self.lines, position)
     }
 
     /// Replaces lyrics with a new set of lines.

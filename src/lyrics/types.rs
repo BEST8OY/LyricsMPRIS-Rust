@@ -56,10 +56,40 @@ impl WordTiming {
 pub enum LyricsError {
     #[error("Network error: {0}")]
     Network(#[from] reqwest::Error),
+    #[error("HTTP error: {0}")]
+    Http(u16),
     #[error("API error: {0}")]
     Api(String),
     #[error("Serde error: {0}")]
     Serde(#[from] serde_json::Error),
+}
+
+/// Returns the index of the lyric line active at `position` via binary search.
+///
+/// Returns `None` if:
+/// - No lyrics
+/// - Position is before the first line's timestamp
+///
+/// Assumes `position` is finite and line timestamps are sanitized (no NaN).
+/// Shared by [`crate::state::LyricState::get_index`] (authoritative state) and
+/// `crate::ui::progression` (UI-side position estimation).
+pub fn active_line_index(lines: &[LyricLine], position: f64) -> Option<usize> {
+    let first = lines.first()?;
+    if position < first.time {
+        return None;
+    }
+
+    match lines.binary_search_by(|line| line.time.total_cmp(&position)) {
+        Ok(exact_match) => Some(exact_match),
+        Err(0) => None,
+        Err(insert_point) => Some(insert_point - 1),
+    }
+}
+
+/// Returns `true` for HTTP statuses that are worth retrying later
+/// (rate limiting and server-side failures).
+pub fn is_retryable_status(code: u16) -> bool {
+    code == 429 || code >= 500
 }
 
 // Re-export HTTP client for providers within the lyrics module
