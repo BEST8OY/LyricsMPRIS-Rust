@@ -63,8 +63,8 @@ where
 /// Compute the visible spans to render based on current state.
 #[allow(clippy::too_many_arguments)]
 fn compute_visible_spans<'a>(
-    last_update: &Option<Update>,
-    wrapped_cache: &mut Option<(usize, Vec<Vec<String>>)>,
+    last_update: &'a Option<Update>,
+    wrapped_cache: &'a mut Option<(usize, Vec<Vec<String>>)>,
     width: usize,
     height: usize,
     styles: &'a LyricStyles,
@@ -170,16 +170,17 @@ impl<'a> VisibleLines<'a> {
     }
 }
 
-/// Collect lines before the current index. Returns Line in visual top->down order.
+/// Collect lines before the current index. Returns Lines in visual top->down order.
 fn collect_before_spans<'a>(
     current_index: usize,
-    wrapped_blocks: &[Vec<String>],
+    wrapped_blocks: &'a [Vec<String>],
     mut lines_needed: usize,
     styles: &'a LyricStyles,
 ) -> Vec<Line<'a>> {
-    let mut result = Vec::new();
+    // Walk backwards collecting per-block tails; blocks are gathered bottom-up
+    // and reversed once at the end (avoids O(n^2) front-splicing).
+    let mut chunks: Vec<Vec<Line<'a>>> = Vec::new();
 
-    // Walk backwards collecting lines; prepend each block's tail to maintain order
     let mut i = current_index;
     while i > 0 && lines_needed > 0 {
         i -= 1;
@@ -188,24 +189,23 @@ fn collect_before_spans<'a>(
         let block = &wrapped_blocks[i];
         let take = block.len().min(lines_needed);
         let start = block.len() - take;
-        // We want these in the same order they appear visually, so collect and then
-        // insert at the front.
-        let spans = block[start..]
-            .iter()
-            .map(|l| Line::from(Span::styled(l.clone(), style)))
-            .collect::<Vec<_>>();
-        // prepend
-        result.splice(0..0, spans);
+        chunks.push(
+            block[start..]
+                .iter()
+                .map(|l| Line::from(Span::styled(l.as_str(), style)))
+                .collect(),
+        );
         lines_needed -= take;
     }
 
-    result
+    chunks.reverse();
+    chunks.into_iter().flatten().collect()
 }
 
-/// Collect lines after the current index. Returns Line in visual top->down order.
+/// Collect lines after the current index. Returns Lines in visual top->down order.
 fn collect_after_spans<'a>(
     current_index: usize,
-    wrapped_blocks: &[Vec<String>],
+    wrapped_blocks: &'a [Vec<String>],
     mut lines_needed: usize,
     styles: &'a LyricStyles,
 ) -> Vec<Line<'a>> {
@@ -217,7 +217,7 @@ fn collect_after_spans<'a>(
         let block = &wrapped_blocks[j];
         let take = block.len().min(lines_needed);
         for line in block.iter().take(take) {
-            result.push(Line::from(Span::styled(line.clone(), style)));
+            result.push(Line::from(Span::styled(line.as_str(), style)));
         }
         lines_needed -= take;
         j += 1;
@@ -229,32 +229,34 @@ fn collect_after_spans<'a>(
 /// Returns all wrapped lines from each block in visual top->down order.
 fn collect_before_blocks<'a>(
     current_index: usize,
-    wrapped_blocks: &[Vec<String>],
+    wrapped_blocks: &'a [Vec<String>],
     blocks_needed: usize,
     styles: &'a LyricStyles,
 ) -> Vec<Line<'a>> {
-    let mut result = Vec::new();
+    // Blocks are gathered bottom-up and reversed once at the end.
+    let mut chunks: Vec<Vec<Line<'a>>> = Vec::new();
     let start_index = current_index.saturating_sub(blocks_needed);
 
     for block_idx in (start_index..current_index).rev() {
         let dist = current_index - block_idx;
         let style = styles.get_line_style_by_distance(dist, true);
-        let block = &wrapped_blocks[block_idx];
-        let mut block_lines = Vec::new();
-        for line in block {
-            block_lines.push(Line::from(Span::styled(line.clone(), style)));
-        }
-        result.splice(0..0, block_lines);
+        chunks.push(
+            wrapped_blocks[block_idx]
+                .iter()
+                .map(|line| Line::from(Span::styled(line.as_str(), style)))
+                .collect(),
+        );
     }
 
-    result
+    chunks.reverse();
+    chunks.into_iter().flatten().collect()
 }
 
 /// Collect complete lyric blocks after the current index (for max_visible_lines mode).
 /// Returns all wrapped lines from each block in visual top->down order.
 fn collect_after_blocks<'a>(
     current_index: usize,
-    wrapped_blocks: &[Vec<String>],
+    wrapped_blocks: &'a [Vec<String>],
     blocks_needed: usize,
     styles: &'a LyricStyles,
 ) -> Vec<Line<'a>> {
@@ -270,7 +272,7 @@ fn collect_after_blocks<'a>(
         let dist = block_idx - current_index;
         let style = styles.get_line_style_by_distance(dist, false);
         for line in block {
-            result.push(Line::from(Span::styled(line.clone(), style)));
+            result.push(Line::from(Span::styled(line.as_str(), style)));
         }
     }
 
@@ -326,8 +328,8 @@ fn split_words_into_lines<'b>(
 /// * `scroll_offset` - Manual scroll offset in lyric blocks when paused
 #[allow(clippy::too_many_arguments)]
 pub fn gather_visible_lines<'a>(
-    update: &Update,
-    wrapped_blocks: &[Vec<String>],
+    update: &'a Update,
+    wrapped_blocks: &'a [Vec<String>],
     w: usize,
     h: usize,
     styles: &'a LyricStyles,
@@ -415,8 +417,8 @@ pub fn gather_visible_lines<'a>(
 
 /// Build spans for the current line, applying karaoke highlighting if appropriate.
 fn build_current_spans<'a>(
-    update: &Update,
-    current_block: &[String],
+    update: &'a Update,
+    current_block: &'a [String],
     width: usize,
     styles: &'a LyricStyles,
     position: f64,
@@ -443,13 +445,13 @@ fn build_current_spans<'a>(
 
     current_block
         .iter()
-        .map(|line| Line::from(Span::styled(line.clone(), style)))
+        .map(|line| Line::from(Span::styled(line.as_str(), style)))
         .collect()
 }
 
 /// Try to build per-word karaoke spans for richsync lyrics.
 fn try_build_karaoke_spans<'a>(
-    update: &Update,
+    update: &'a Update,
     idx: usize,
     width: usize,
     styles: &'a LyricStyles,
@@ -471,7 +473,7 @@ fn try_build_karaoke_spans<'a>(
 
 /// Build spans for a single line of words with per-word/grapheme highlighting.
 fn build_word_line_spans<'a>(
-    words: &[&crate::lyrics::types::WordTiming],
+    words: &[&'a crate::lyrics::types::WordTiming],
     position: f64,
     styles: &'a LyricStyles,
 ) -> Vec<Span<'a>> {
@@ -486,9 +488,21 @@ fn build_word_line_spans<'a>(
     spans
 }
 
+/// Styled span for a full word, borrowing the text unless a space suffix must be appended.
+fn styled_word<'a>(text: &'a str, suffix: &str, style: ratatui::style::Style) -> Span<'a> {
+    if suffix.is_empty() {
+        Span::styled(text, style)
+    } else {
+        Span::styled(format!("{text}{suffix}"), style)
+    }
+}
+
 /// Build spans for a single word with partial grapheme highlighting.
+///
+/// Word text is borrowed whenever possible; allocation only occurs for the
+/// partially highlighted remainder followed by an inter-word space.
 fn build_word_spans<'a>(
-    word: &crate::lyrics::types::WordTiming,
+    word: &'a crate::lyrics::types::WordTiming,
     position: f64,
     styles: &'a LyricStyles,
     is_last_in_line: bool,
@@ -497,18 +511,12 @@ fn build_word_spans<'a>(
 
     // Word not yet reached
     if position < word.start {
-        return vec![Span::styled(
-            format!("{}{}", word.text, suffix),
-            styles.after,
-        )];
+        return vec![styled_word(&word.text, suffix, styles.after)];
     }
 
     // Word fully passed
     if position >= word.end {
-        return vec![Span::styled(
-            format!("{}{}", word.text, suffix),
-            styles.current,
-        )];
+        return vec![styled_word(&word.text, suffix, styles.current)];
     }
 
     // Word partially highlighted
@@ -519,26 +527,19 @@ fn build_word_spans<'a>(
         ((fraction * total_graphemes as f64).floor() as usize).min(total_graphemes);
 
     if highlighted_count == 0 {
-        return vec![Span::styled(
-            format!("{}{}", word.text, suffix),
-            styles.after,
-        )];
+        return vec![styled_word(&word.text, suffix, styles.after)];
     }
 
     if highlighted_count >= total_graphemes {
-        return vec![Span::styled(
-            format!("{}{}", word.text, suffix),
-            styles.current,
-        )];
+        return vec![styled_word(&word.text, suffix, styles.current)];
     }
 
     // Split at grapheme boundary using the precomputed boundaries
     let split_byte = word.grapheme_boundaries[highlighted_count];
-    let highlighted = &word.text[..split_byte];
     let remaining = &word.text[split_byte..];
 
     vec![
-        Span::styled(highlighted.to_string(), styles.current),
-        Span::styled(format!("{}{}", remaining, suffix), styles.after),
+        Span::styled(&word.text[..split_byte], styles.current),
+        styled_word(remaining, suffix, styles.after),
     ]
 }
