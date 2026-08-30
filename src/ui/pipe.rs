@@ -51,6 +51,12 @@ impl PipeState {
             self.handle_track_change();
             self.last_track_id = Some(track_id);
 
+            // Surface provider/network errors on stderr once per track;
+            // stdout stays clean for pipe consumers.
+            if let Some(err) = &upd.err {
+                print_error(&upd, err);
+            }
+
             if has_lyrics && upd.index.is_some() {
                 self.print_current_line(&upd);
             }
@@ -107,11 +113,18 @@ impl PipeState {
         if let Some(estimated) = maybe_estimated {
             // Print if line index has advanced
             if estimated.index != self.last_line_idx {
-                if let Some(idx) = estimated.index
-                    && let Some(line) = estimated.lines.get(idx)
-                {
-                    println!("{}", line.text);
-                    self.last_track_had_lyric = true;
+                match estimated.index {
+                    Some(idx) => {
+                        if let Some(line) = estimated.lines.get(idx) {
+                            println!("{}", line.text);
+                            self.last_track_had_lyric = true;
+                        }
+                    }
+                    None => {
+                        // Progressed past the end / before first line: clear
+                        // pipe consumers, mirroring MPRIS-driven seek behavior.
+                        println!();
+                    }
                 }
                 self.last_line_idx = estimated.index;
 
@@ -122,6 +135,15 @@ impl PipeState {
         }
 
         self.next_sleep = next;
+    }
+}
+
+/// Prints a fetch error for the track to stderr (never stdout).
+fn print_error(upd: &crate::state::Update, err: &str) {
+    if upd.artist.is_empty() && upd.title.is_empty() {
+        eprintln!("{err}");
+    } else {
+        eprintln!("{} - {}: {err}", upd.artist, upd.title);
     }
 }
 
