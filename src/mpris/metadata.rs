@@ -45,7 +45,7 @@ struct MprisMetadata {
     #[zvariant(rename = "xesam:artist")]
     artist: Option<Vec<String>>,
     #[zvariant(rename = "xesam:album")]
-    album: Option<Vec<String>>,
+    album: Option<String>,
     #[zvariant(rename = "mpris:length")]
     length: Option<i64>,
     #[zvariant(rename = "mpris:trackid")]
@@ -154,10 +154,7 @@ impl From<MprisMetadata> for TrackMetadata {
             .artist
             .and_then(|artists| artists.into_iter().next())
             .unwrap_or_default();
-        let album = md
-            .album
-            .and_then(|albums| albums.into_iter().next())
-            .unwrap_or_default();
+        let album = md.album.unwrap_or_default();
 
         // Convert microseconds to seconds
         let length = md.length.map(|microsecs| microsecs as f64 / 1_000_000.0);
@@ -307,7 +304,7 @@ mod tests {
         let md = MprisMetadata {
             title: Some("Test Song".to_string()),
             artist: Some(vec!["Artist 1".to_string(), "Artist 2".to_string()]),
-            album: Some(vec!["Test Album".to_string()]),
+            album: Some("Test Album".to_string()),
             length: Some(180_000_000), // 180 seconds in microseconds
             trackid: None,
             url: None,

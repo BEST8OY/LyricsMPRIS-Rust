@@ -8,9 +8,9 @@ use unicode_segmentation::UnicodeSegmentation;
 const MAX_LYRIC_LINES: usize = 1000;
 const MAX_WORDS_PER_LINE: usize = 100;
 
-/// Regex pattern for LRC timestamps: [MM:SS.CC]
+/// Regex pattern for LRC timestamps: [MM:SS.CC] or [MM:SS.MMM]
 static SYNCED_LYRICS_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"\[(\d{1,2}):(\d{2})[.](\d{1,2})\]").unwrap());
+    Lazy::new(|| Regex::new(r"\[(\d{1,2}):(\d{2})[.](\d{1,3})\]").unwrap());
 
 /// Parse standard LRC format time-synced lyrics into LyricLine structs.
 ///
@@ -44,12 +44,11 @@ pub fn parse_synced_lyrics(synced: &str) -> Vec<LyricLine> {
                         .get(2)
                         .and_then(|s| s.as_str().parse::<u32>().ok())
                         .unwrap_or(0);
-                    let centiseconds = cap
-                        .get(3)
-                        .and_then(|c| c.as_str().parse::<u32>().ok())
-                        .unwrap_or(0);
+                    let frac_str = cap.get(3).map(|c| c.as_str()).unwrap_or("0");
+                    let frac_val = frac_str.parse::<f64>().unwrap_or(0.0);
+                    let fraction = frac_val / 10f64.powi(frac_str.len() as i32);
 
-                    let time = minutes as f64 * 60.0 + seconds as f64 + centiseconds as f64 / 100.0;
+                    let time = minutes as f64 * 60.0 + seconds as f64 + fraction;
 
                     LyricLine {
                         time,
@@ -431,5 +430,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_parse_synced_lyrics_fraction_digits() {
+        let lrc = "\
+[00:10.5]Tenths second
+[01:20.25]Centiseconds
+[02:30.123]Milliseconds
+[03:40.0]Single zero
+[04:50.05]Centisecond leading zero
+[05:00.005]Millisecond leading zeroes";
+
+        let parsed = parse_synced_lyrics(lrc);
+        assert_eq!(parsed.len(), 6);
+
+        assert!((parsed[0].time - 10.5).abs() < 1e-6);
+        assert_eq!(parsed[0].text, "Tenths second");
+
+        assert!((parsed[1].time - 80.25).abs() < 1e-6);
+        assert_eq!(parsed[1].text, "Centiseconds");
+
+        assert!((parsed[2].time - 150.123).abs() < 1e-6);
+        assert_eq!(parsed[2].text, "Milliseconds");
+
+        assert!((parsed[3].time - 220.0).abs() < 1e-6);
+        assert_eq!(parsed[3].text, "Single zero");
+
+        assert!((parsed[4].time - 290.05).abs() < 1e-6);
+        assert_eq!(parsed[4].text, "Centisecond leading zero");
+
+        assert!((parsed[5].time - 300.005).abs() < 1e-6);
+        assert_eq!(parsed[5].text, "Millisecond leading zeroes");
     }
 }

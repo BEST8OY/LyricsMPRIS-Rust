@@ -68,7 +68,10 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn new() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         enable_raw_mode().map_err(to_boxed_err)?;
-        execute!(io::stdout(), EnterAlternateScreen).map_err(to_boxed_err)?;
+        if let Err(e) = execute!(io::stdout(), EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(to_boxed_err(e));
+        }
         Ok(Self)
     }
 }

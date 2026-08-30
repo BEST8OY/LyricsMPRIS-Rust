@@ -26,6 +26,9 @@ pub async fn fetch_fresh_musixmatch_token(client: &Client) -> Result<String, Lyr
     let json: Value = resp.json().await?;
     let code = super::extract::get_root_status_code(&json).unwrap_or(0);
     if code != 200 {
+        if code == 429 || code >= 500 {
+            return Err(LyricsError::Http(code as u16));
+        }
         return Err(LyricsError::Api(format!(
             "Musixmatch token.get status {}",
             code
