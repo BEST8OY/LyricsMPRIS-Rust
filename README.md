@@ -32,12 +32,13 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 ## 🌟 Key Features
 
 ### 🎨 Modern TUI & Pipe Mode
-* **Ratatui Terminal UI**: Centered lyrics display with smooth auto-scrolling, word-by-word karaoke highlighting, and active line tracking.
+* **Ratatui Terminal UI**: Centered lyrics display with smooth auto-scrolling, word-by-word karaoke highlighting, active line tracking, and resilient RAII terminal lifecycle management.
+* **Adaptive Playback Calibration**: Transient position calibration automatically compensates for streaming buffer delays (e.g., Spotify, browser MPRIS extensions), Bluetooth latency, and seek jitter across all media players—locking into sample-accurate sync within ~1.2s before self-disarming for zero ongoing D-Bus polling overhead.
 * **Manual Scroll**: Browse past or upcoming lyrics using arrow keys (`j`/`k`) when playback is paused.
-* **Streamlined Pipe Mode**: Outputs current lyric line to `stdout` in real-time, making it effortless to pipe into Polybar, Waybar, i3blocks, or custom scripts.
+* **Streamlined Pipe Mode**: Outputs current lyric line to `stdout` in real-time, automatically clearing out-of-bound segments (intros/outros/silence), and routing transient network warnings to `stderr` to keep status bars (Polybar, Waybar, i3blocks) pristine.
 
 ### 📚 Multiple Lyrics Providers
-* **LRCLIB**: Fetches community-sourced, line-synced lyrics (`LRC` format).
+* **LRCLIB**: Fetches community-sourced, line-synced lyrics with support for both centisecond (`.xx`) and millisecond (`.xxx`) timestamp resolutions.
 * **Musixmatch**: Official desktop API integration supporting both word-level timing (**Richsync**) and line-level timing (**Subtitles**).
 
 ### 🔑 3-Tier Automatic Musixmatch Token Engine
@@ -45,12 +46,21 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 * **Token Rotation**: Supports multiple custom usertokens in `MUSIXMATCH_USERTOKEN` env var, rotated in round-robin order.
 * **Auto-Renewal & Retry**: If a token encounters a rate limit (`429`) or auth error (`401`/`403`), the engine invalidates it, fetches a new token, and retries the request transparently.
 
+### ⚡ Resilience & Background Retries
+* **Transient Error Classification**: Automatically distinguishes between missing lyrics and temporary network/server outages (rate limits, DNS failures, 5xx errors).
+* **Exponential Backoff Loop**: Automatically schedules background retries with exponential backoff (up to 30s cap) when providers are temporarily unreachable without interrupting active playback.
+
 ### 🏷️ Local File ISRC Extraction
 * Reads local audio file metadata (FLAC, MP3, M4A, OGG) via `lofty` when `--isrc` is enabled to perform pinpoint ISRC lookups.
 
 ### 💾 Optimized SQLite Persistence
 * Stores raw lyrics compressed with **zstd** level 3.
 * Multi-identifier indexing (ISRC, Spotify ID, iTunes ID, Artist/Title/Album) ensures instant offline hits without redundant network calls.
+
+### 🚀 Ultra-Low Resource Footprint
+* **Single-Threaded Async Engine**: Utilizes Tokio `current_thread` runtime and asynchronous event streaming, reducing active thread count from N+2 threads down to just 1–2 lightweight threads.
+* **Zero-Allocation Rendering**: Zero-copy span borrowing and chunk-reversed visible line collection eliminate frame-by-frame heap allocations.
+* **Pure Event-Driven Idle**: Consumes zero CPU and generates zero IPC traffic when players are inactive or paused, listening asynchronously for D-Bus `NameOwnerChanged` and `playerctld` signals.
 
 ---
 
@@ -108,13 +118,13 @@ The optimized executable binary will be created at `./target/release/lyricsmpris
 
 | Argument | Description | Example |
 | :--- | :--- | :--- |
-| `-d`, `--database <PATH>` | Enable SQLite cache at specified file path | `--database ~/.cache/lyrics.db` |
-| `-p`, `--providers <LIST>` | Comma-separated provider priority order | `--providers musixmatch,lrclib` |
-| `-v`, `--visible-lines <NUM>`| Limit maximum visible lyric lines in TUI | `--visible-lines 3` |
+| `--database <PATH>` | Enable SQLite cache at specified file path | `--database ~/.cache/lyrics.db` |
+| `--providers <LIST>` | Comma-separated provider priority order | `--providers musixmatch,lrclib` |
+| `--visible-lines <COUNT>`| Limit maximum visible lyric lines in TUI | `--visible-lines 3` |
 | `--isrc` | Extract ISRC from local audio files via `lofty` | `--isrc` |
 | `--no-karaoke` | Disable per-word karaoke highlighting | `--no-karaoke` |
 | `--pipe` | Output lyrics to `stdout` (no TUI) | `--pipe` |
-| `-b`, `--block <LIST>` | Ignore specific MPRIS service names | `--block firefox,chromium` |
+| `--block <LIST>` | Ignore specific MPRIS service names | `--block firefox,chromium` |
 | `--target <LIST>` | Target specific MPRIS service names | `--target spotify,mpv` |
 
 ### Environment Variables
@@ -242,7 +252,10 @@ Control the modern TUI backend with these keys:
 
 ## 🔌 Desktop Integration
 
-Pipe mode (`--pipe`) outputs plain text lyric lines to `stdout`, making it easy to display current lyrics on desktop panels.
+Pipe mode (`--pipe`) outputs plain text lyric lines to `stdout`, making it easy to display current lyrics on desktop panels:
+
+- **Clean Streams**: Emits active lyrics on `stdout` while routing transient errors and warnings to `stderr`.
+- **Seek & Boundary Clearing**: Automatically outputs an empty line during instrumental intros, outros, or seeks beyond lyric boundaries to clear panel displays.
 
 ### Polybar Integration
 ```ini
@@ -270,26 +283,27 @@ format-prefix-foreground = #8abeb7
 
 ```
 src/
-├── main.rs           # Entry point, CLI argument parsing (clap), tokio runtime
-├── event/            # Event coordinator (fetch pipeline, MPRIS handlers)
+├── main.rs           # Entry point, CLI argument parsing (clap), current_thread runtime
+├── event/            # Event coordinator (fetch pipeline, MPRIS handlers, retry backoff)
 ├── pool.rs           # Event loop supervisor (wires D-Bus → state → UI)
 ├── state.rs          # StateBundle, PlayerState, LyricState, Update snapshot
 ├── timer.rs          # PlaybackTimer (monotonic position estimation)
 ├── text_utils.rs     # Text wrapping utility
 ├── lyrics/
-│   ├── providers/    # lrclib.rs, musixmatch.rs (API integrations & token manager)
+│   ├── providers/    # lrclib.rs, musixmatch/ (API integrations & token manager)
 │   ├── database/     # SQLite cache engine with sqlx + Zstd compression
-│   ├── parse.rs      # LRC, Richsync, subtitle parsers
+│   ├── parse.rs      # LRC (centisecond & millisecond), Richsync, subtitle parsers
 │   └── types.rs      # LyricLine, TrackMatchInfo, error models
 ├── mpris/
-│   ├── connection.rs # D-Bus session singleton
-│   ├── events.rs     # D-Bus signal listener (PropertiesChanged & NameOwnerChanged)
+│   ├── connection.rs # D-Bus session singleton & direct method calling
+│   ├── events.rs     # D-Bus signal listener & transient position calibration
 │   ├── metadata.rs   # MPRIS track metadata extraction & local file ISRC (lofty)
-│   ├── playback.rs   # Playback position & status querying
+│   ├── playback.rs   # Direct D-Bus playback position & status querying
 │   └── proxies.rs    # Consolidated D-Bus proxy interfaces
 └── ui/
-    ├── modern.rs     # Modern Ratatui TUI renderer
-    ├── pipe.rs       # Stdout pipe mode renderer
+    ├── modern.rs     # Modern Ratatui TUI renderer with RAII terminal lifecycle
+    ├── modern_helpers.rs # Optimized zero-copy line styling and layout calculation
+    ├── pipe.rs       # Clean stdout/stderr pipe mode renderer
     └── ...           # Helpers (styles, progression, wrapping cache)
 ```
 
