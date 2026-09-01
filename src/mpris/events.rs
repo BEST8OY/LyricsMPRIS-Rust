@@ -5,10 +5,101 @@ use crate::mpris::metadata::{TrackMetadata, extract_metadata};
 use crate::mpris::playback::get_position;
 use crate::mpris::proxies::{MediaPlayer2PlayerProxy, PlayerctldProxy};
 use futures_util::StreamExt;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use zbus::fdo::NameOwnerChangedStream;
 use zbus::proxy::PropertyStream;
+
+/// Tuning constants for transient buffering position calibration.
+pub const CALIBRATION_INITIAL_DELAY: Duration = Duration::from_millis(400);
+pub const CALIBRATION_POLL_INTERVAL: Duration = Duration::from_millis(800);
+pub const MAX_CALIBRATION_ATTEMPTS: u8 = 15;
+pub const MOVEMENT_DELTA_THRESHOLD_SECS: f64 = 0.08;
+
+/// Transient calibration state machine for detecting when a player actually starts
+/// advancing audio position after buffering.
+#[derive(Debug)]
+struct CalibrationTracker {
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    attempts: u8,
+    confirmed: bool,
+    anchor_pos: f64,
+}
+
+impl CalibrationTracker {
+    fn new(is_playing: bool, initial_pos: f64) -> Self {
+        let mut tracker = Self {
+            timer: None,
+            attempts: 0,
+            confirmed: false,
+            anchor_pos: initial_pos,
+        };
+        tracker.sync_playback(is_playing, initial_pos);
+        tracker
+    }
+
+    fn arm(&mut self, anchor_pos: f64) {
+        self.attempts = 0;
+        self.confirmed = false;
+        self.anchor_pos = anchor_pos;
+        self.timer = Some(Box::pin(tokio::time::sleep(CALIBRATION_INITIAL_DELAY)));
+    }
+
+    fn disarm(&mut self) {
+        self.timer = None;
+    }
+
+    fn sync_playback(&mut self, is_playing: bool, anchor_pos: f64) {
+        if is_playing {
+            self.arm(anchor_pos);
+        } else {
+            self.disarm();
+        }
+    }
+
+    /// Wait for the next calibration tick if armed, or pend indefinitely if disarmed.
+    async fn tick(&mut self) {
+        if let Some(ref mut timer) = self.timer {
+            timer.as_mut().await;
+        } else {
+            futures_util::future::pending().await
+        }
+    }
+
+    /// Step the calibration state machine given the newly fetched authoritative position.
+    fn on_step(&mut self, real_pos: f64) {
+        self.attempts += 1;
+        let moved = (real_pos - self.anchor_pos).abs() > MOVEMENT_DELTA_THRESHOLD_SECS;
+
+        if moved {
+            if !self.confirmed {
+                // Audio started advancing; schedule 1 final confirmation check to lock in steady-state sync
+                self.confirmed = true;
+                self.timer = Some(Box::pin(tokio::time::sleep(CALIBRATION_POLL_INTERVAL)));
+            } else {
+                // Steady-state verified: disarm calibration for the remainder of this track
+                self.disarm();
+            }
+        } else if self.attempts < MAX_CALIBRATION_ATTEMPTS {
+            // Still buffering (real_pos unchanged from anchor); retry
+            self.timer = Some(Box::pin(tokio::time::sleep(CALIBRATION_POLL_INTERVAL)));
+        } else {
+            // Reached maximum attempts (slow network timeout): disarm
+            self.disarm();
+        }
+    }
+
+    /// Handle a query failure during calibration by scheduling a retry if attempts remain.
+    fn on_error(&mut self) {
+        self.attempts += 1;
+        if self.attempts < MAX_CALIBRATION_ATTEMPTS {
+            self.timer = Some(Box::pin(tokio::time::sleep(CALIBRATION_POLL_INTERVAL)));
+        } else {
+            self.disarm();
+        }
+    }
+}
 
 /// Callback trait for MPRIS events
 pub trait MprisEventCallback: Send + 'static {
@@ -171,8 +262,32 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
         let _ = self.handle_status_change(&proxy).await;
         let _ = self.handle_metadata_change(&proxy).await;
 
+        let mut tracker =
+            CalibrationTracker::new(self.state.playback_status == "Playing", self.state.position);
+
         loop {
             tokio::select! {
+                // 0. Transient post-buffering position calibration for streaming players (e.g. Spotify)
+                _ = tracker.tick() => {
+                    if self.state.playback_status == "Playing" && self.state.is_active() {
+                        match get_position(&self.state.service).await {
+                            Ok(real_pos) => {
+                                self.handle_seek_signal((real_pos * 1_000_000.0) as i64).await;
+                                tracker.on_step(real_pos);
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    service = %self.state.service,
+                                    error = %e,
+                                    "Calibration position query failed, retrying"
+                                );
+                                tracker.on_error();
+                            }
+                        }
+                    } else {
+                        tracker.disarm();
+                    }
+                }
                 // 1. playerctld active player list change
                 Some(_) = async {
                     if let Some(stream) = player_names_stream.as_mut() {
@@ -233,6 +348,8 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                 Some(signal) = seeked_stream.next() => {
                     if let Ok(args) = signal.args() {
                         tracing::debug!(service = %service, position = args.position, "Seeked signal received");
+                        let pos_sec = args.position as f64 / 1_000_000.0;
+                        tracker.sync_playback(self.state.playback_status == "Playing", pos_sec);
                         self.handle_seek_signal(args.position).await;
                     }
                 }
@@ -240,24 +357,42 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                 // 4. Player Metadata property change
                 Some(_) = metadata_stream.next() => {
                     tracing::debug!(service = %service, "Metadata changed signal received");
-                    if let Err(e) = self.handle_metadata_change(&proxy).await {
-                        tracing::warn!(
-                            service = %service,
-                            error = %e,
-                            "Failed to handle metadata change"
-                        );
+                    match self.handle_metadata_change(&proxy).await {
+                        Ok(true) => {
+                            tracker.sync_playback(
+                                self.state.playback_status == "Playing",
+                                self.state.position,
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                service = %service,
+                                error = %e,
+                                "Failed to handle metadata change"
+                            );
+                        }
                     }
                 }
 
                 // 5. Player PlaybackStatus property change
                 Some(_) = status_stream.next() => {
                     tracing::debug!(service = %service, "Playback status changed signal received");
-                    if let Err(e) = self.handle_status_change(&proxy).await {
-                        tracing::warn!(
-                            service = %service,
-                            error = %e,
-                            "Failed to handle playback status change"
-                        );
+                    match self.handle_status_change(&proxy).await {
+                        Ok(true) => {
+                            tracker.sync_playback(
+                                self.state.playback_status == "Playing",
+                                self.state.position,
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                service = %service,
+                                error = %e,
+                                "Failed to handle playback status change"
+                            );
+                        }
                     }
                 }
 
@@ -344,7 +479,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
     async fn handle_metadata_change(
         &mut self,
         proxy: &MediaPlayer2PlayerProxy<'_>,
-    ) -> Result<(), MprisError> {
+    ) -> Result<bool, MprisError> {
         let metadata_map = proxy.metadata().await?;
         let new_track = extract_metadata(&metadata_map);
 
@@ -361,15 +496,16 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                 self.state.position,
                 self.state.service.clone(),
             );
+            Ok(true)
+        } else {
+            Ok(false)
         }
-
-        Ok(())
     }
 
     async fn handle_status_change(
         &mut self,
         proxy: &MediaPlayer2PlayerProxy<'_>,
-    ) -> Result<(), MprisError> {
+    ) -> Result<bool, MprisError> {
         if let Ok(status) = proxy.playback_status().await
             && status != self.state.playback_status
         {
@@ -395,9 +531,10 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                 position,
                 self.state.service.clone(),
             );
+            Ok(true)
+        } else {
+            Ok(false)
         }
-
-        Ok(())
     }
 
     /// Syncs active player state based on current service discovery.
@@ -528,5 +665,100 @@ where
     ) -> Result<Self, MprisError> {
         let callback = ClosureCallback::new(on_track_change, on_seek);
         Self::new(callback, block_list, target_list).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_tracker_initial_state_playing() {
+        let tracker = CalibrationTracker::new(true, 0.0);
+        assert!(tracker.timer.is_some());
+        assert_eq!(tracker.attempts, 0);
+        assert!(!tracker.confirmed);
+        assert_eq!(tracker.anchor_pos, 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_tracker_initial_state_paused() {
+        let tracker = CalibrationTracker::new(false, 0.0);
+        assert!(tracker.timer.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_tracker_buffering_and_steady_state_convergence() {
+        let mut tracker = CalibrationTracker::new(true, 0.0);
+
+        // Step 1: Still buffering at 0.0s
+        tracker.on_step(0.0);
+        assert_eq!(tracker.attempts, 1);
+        assert!(!tracker.confirmed);
+        assert!(tracker.timer.is_some());
+
+        // Step 2: Still buffering at 0.0s
+        tracker.on_step(0.0);
+        assert_eq!(tracker.attempts, 2);
+        assert!(!tracker.confirmed);
+        assert!(tracker.timer.is_some());
+
+        // Step 3: Audio starts playing (moved past delta threshold)
+        tracker.on_step(0.4);
+        assert_eq!(tracker.attempts, 3);
+        assert!(tracker.confirmed);
+        assert!(tracker.timer.is_some()); // Armed for final confirmation
+
+        // Step 4: Final confirmation step verifies continuous playback
+        tracker.on_step(1.6);
+        assert_eq!(tracker.attempts, 4);
+        assert!(tracker.timer.is_none()); // Disarmed!
+    }
+
+    #[tokio::test]
+    async fn test_tracker_mid_track_resume_buffering() {
+        let mut tracker = CalibrationTracker::new(true, 45.0);
+
+        // Step 1: Mid-track buffering (authoritative pos still 45.0)
+        tracker.on_step(45.0);
+        assert_eq!(tracker.attempts, 1);
+        assert!(!tracker.confirmed);
+        assert!(tracker.timer.is_some());
+
+        // Step 2: Resumed playback moves to 45.3s (delta 0.3 > 0.08)
+        tracker.on_step(45.3);
+        assert!(tracker.confirmed);
+        assert!(tracker.timer.is_some());
+
+        // Step 3: Steady-state confirmation
+        tracker.on_step(46.5);
+        assert!(tracker.timer.is_none()); // Disarmed
+    }
+
+    #[tokio::test]
+    async fn test_tracker_max_attempts_timeout() {
+        let mut tracker = CalibrationTracker::new(true, 0.0);
+        for i in 1..=MAX_CALIBRATION_ATTEMPTS {
+            tracker.on_step(0.0);
+            if i < MAX_CALIBRATION_ATTEMPTS {
+                assert!(tracker.timer.is_some());
+            } else {
+                assert!(tracker.timer.is_none()); // Disarmed after max attempts
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tracker_error_retry_and_timeout() {
+        let mut tracker = CalibrationTracker::new(true, 0.0);
+        for i in 1..=MAX_CALIBRATION_ATTEMPTS {
+            tracker.on_error();
+            if i < MAX_CALIBRATION_ATTEMPTS {
+                assert!(tracker.timer.is_some());
+                assert_eq!(tracker.attempts, i);
+            } else {
+                assert!(tracker.timer.is_none()); // Disarmed after max error attempts
+            }
+        }
     }
 }
