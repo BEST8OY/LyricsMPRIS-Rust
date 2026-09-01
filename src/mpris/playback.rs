@@ -1,7 +1,6 @@
 //! Playback status and position querying for MPRIS.
 
 use crate::mpris::connection::{MprisError, get_dbus_conn};
-use crate::mpris::proxies::MediaPlayer2PlayerProxy;
 
 /// Playback status values according to MPRIS specification
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -55,16 +54,17 @@ pub async fn get_position(service: &str) -> Result<f64, MprisError> {
 
     let conn = get_dbus_conn().await?;
 
-    let props = zbus::fdo::PropertiesProxy::builder(&conn)
-        .destination(service)?
-        .path("/org/mpris/MediaPlayer2")?
-        .build()
+    let reply = conn
+        .call_method(
+            Some(service),
+            "/org/mpris/MediaPlayer2",
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &("org.mpris.MediaPlayer2.Player", "Position"),
+        )
         .await?;
 
-    let iface =
-        zbus::names::InterfaceName::from_static_str_unchecked("org.mpris.MediaPlayer2.Player");
-
-    let val = props.get(iface, "Position").await?;
+    let (val,): (zvariant::OwnedValue,) = reply.body().deserialize()?;
     let microseconds = if let Ok(microsecs) = i64::try_from(&val) {
         microsecs
     } else if let Ok(microsecs) = u64::try_from(&val) {
@@ -88,13 +88,21 @@ pub async fn get_playback_status(service: &str) -> Result<String, MprisError> {
 
     let conn = get_dbus_conn().await?;
 
-    let proxy = MediaPlayer2PlayerProxy::builder(&conn)
-        .destination(service)?
-        .build()
-        .await?;
+    let reply = conn
+        .call_method(
+            Some(service),
+            "/org/mpris/MediaPlayer2",
+            Some("org.freedesktop.DBus.Properties"),
+            "Get",
+            &("org.mpris.MediaPlayer2.Player", "PlaybackStatus"),
+        )
+        .await;
 
-    match proxy.playback_status().await {
-        Ok(status) => Ok(status),
+    match reply {
+        Ok(msg) => match msg.body().deserialize::<(zvariant::OwnedValue,)>() {
+            Ok((val,)) => Ok(String::try_from(val).unwrap_or_else(|_| "Stopped".to_string())),
+            Err(_) => Ok("Stopped".to_string()),
+        },
         Err(_) => Ok("Stopped".to_string()),
     }
 }

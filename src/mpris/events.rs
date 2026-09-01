@@ -299,10 +299,6 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                     tracing::debug!(service = %service, "playerctld player list changed while watching player");
                     if self.sync_active_service(&service).await? {
                         break;
-                    } else {
-                        // Same player remains active: sync state without tearing down streams
-                        let _ = self.handle_status_change(&proxy).await;
-                        let _ = self.handle_metadata_change(&proxy).await;
                     }
                 }
 
@@ -456,11 +452,6 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                     }
                 }
             }
-
-            // Periodic idle poll
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                let _ = self.discover_active_player().await;
-            }
         }
 
         Ok(())
@@ -517,10 +508,15 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             );
             self.state.playback_status = status;
 
-            // Get fresh uncached position on playback status change
-            let position = if let Ok(pos) = get_position(&self.state.service).await {
-                self.state.position = pos;
-                pos
+            // When playing/resuming, fetch fresh uncached position from D-Bus.
+            // When pausing/stopping, retain current tracked position to avoid redundant queries.
+            let position = if self.state.playback_status == "Playing" {
+                if let Ok(pos) = get_position(&self.state.service).await {
+                    self.state.position = pos;
+                    pos
+                } else {
+                    self.state.position
+                }
             } else {
                 self.state.position
             };

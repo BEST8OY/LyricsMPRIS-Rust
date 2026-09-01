@@ -37,8 +37,13 @@ pub async fn get_dbus_conn() -> Result<zbus::Connection, MprisError> {
 pub async fn get_active_player_names() -> Result<Vec<String>, MprisError> {
     let conn = get_dbus_conn().await?;
 
-    // Try playerctld first (recency-ordered active players)
-    match PlayerctldProxy::new(&conn).await {
+    // Try playerctld first (recency-ordered active players) using uncached proxy to avoid match rule churn
+    let playerctld_proxy = PlayerctldProxy::builder(&conn)
+        .cache_properties(zbus::proxy::CacheProperties::No)
+        .build()
+        .await;
+
+    match playerctld_proxy {
         Ok(proxy) => match proxy.player_names().await {
             Ok(names) if !names.is_empty() => return Ok(names),
             Ok(_) => {
