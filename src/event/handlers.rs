@@ -90,12 +90,7 @@ pub(crate) async fn handle_mpris_event(
             let queue_latency = sampled_at.elapsed().as_secs_f64();
             let effective_pos = position + queue_latency;
 
-            let playing = state.player_state.playing;
-            let (playing_changed, changed_index, position_jumped) =
-                state.update_playback_and_position(playing, effective_pos);
-            if playing_changed || changed_index || position_jumped {
-                send_update(state, update_tx, position_jumped).await;
-            }
+            handle_state_update(effective_pos, None, state, update_tx).await;
             return RetryDirective::Keep;
         }
     };
@@ -371,6 +366,42 @@ mod tests {
         let update = rx.recv().await.expect("Calibration update should be sent");
         assert_eq!(update.index, Some(0));
         assert!((update.position - 6.0).abs() < 0.1);
+    }
+
+    #[tokio::test]
+    async fn test_handle_calibrated_event_guards_spurious_zero_reset() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut state = StateBundle::new();
+
+        let lines = vec![
+            crate::lyrics::LyricLine::new(10.0, "Line 1"),
+            crate::lyrics::LyricLine::new(50.0, "Line 2"),
+        ];
+        state.lyric_state.update_lines(lines);
+        state.player_state.length = Some(180.0);
+        state.player_state.update_playback_dbus(true, 45.0);
+        state.update_index(45.0);
+        state.mark_state_sent();
+
+        let (event_tx, _event_rx) = mpsc::channel(32);
+        // Spurious calibration tick reporting 0.0s during mid-track playback
+        let directive = handle_mpris_event(
+            MprisEvent::Calibrated {
+                position: 0.0,
+                sampled_at: std::time::Instant::now(),
+            },
+            &mut state,
+            &event_tx,
+            &tx,
+            &[],
+        )
+        .await;
+
+        assert!(matches!(directive, RetryDirective::Keep));
+        // Position must NOT reset to 0.0s
+        assert!(state.player_state.estimate_position() >= 45.0);
+        // No retrograde position update should be emitted
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]
