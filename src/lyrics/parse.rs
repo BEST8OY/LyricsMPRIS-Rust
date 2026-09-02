@@ -50,11 +50,7 @@ pub fn parse_synced_lyrics(synced: &str) -> Vec<LyricLine> {
 
                     let time = minutes as f64 * 60.0 + seconds as f64 + fraction;
 
-                    LyricLine {
-                        time,
-                        text: text.clone(),
-                        words: None,
-                    }
+                    LyricLine::new(time, text.clone())
                 })
                 .collect()
         })
@@ -79,11 +75,7 @@ pub fn parse_subtitle_body(subtitle_body: &str) -> Option<Vec<LyricLine>> {
             .unwrap_or(0.0);
         let text = line.get("text").and_then(|v| v.as_str()).unwrap_or("♪");
 
-        parsed.push(LyricLine {
-            time,
-            text: text.to_string(),
-            words: None, // No word-level timing in subtitle format
-        });
+        parsed.push(LyricLine::new(time, text));
     }
 
     Some(parsed)
@@ -126,11 +118,7 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<Vec<LyricLine>> {
         // Parse word-level timings (if available)
         let words = parse_word_timings(line, line_start, line_end);
 
-        parsed.push(LyricLine {
-            time: line_start,
-            text: text.to_string(),
-            words,
-        });
+        parsed.push(LyricLine::new(line_start, text).with_words(words));
     }
 
     Some(parsed)

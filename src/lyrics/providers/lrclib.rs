@@ -36,7 +36,8 @@ pub async fn fetch_lyrics_from_lrclib(
 
     match response.syncedLyrics {
         Some(synced) if !synced.is_empty() => {
-            let parsed = parse_synced_lyrics(&synced);
+            let mut parsed = parse_synced_lyrics(&synced);
+            crate::lyrics::romanize::apply_romanization(&mut parsed);
             Ok((parsed, Some(synced), TrackMatchInfo::default()))
         }
         _ => Ok((Vec::new(), None, TrackMatchInfo::default())),

@@ -25,3 +25,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
 zstd = "0.13"
 lofty = "0.25"
+deunicode = "1.6"
+kakasi = "0.1.0"
+
+# [profile.release]
+# opt-level = "s"
+# lto = "fat"
+# codegen-units = 1
+# panic = "abort"
+# strip = true
+
+

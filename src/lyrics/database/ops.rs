@@ -17,7 +17,7 @@ use sqlx::sqlite::SqlitePool;
 /// - `Ok((lines, Some(raw), track_ids))` on success with parsed lines, raw text, and identifiers
 /// - `Err` if parsing fails
 pub(crate) fn parse_stored_lyrics(entry: &LyricsEntry) -> ProviderResult {
-    match entry.format {
+    let mut result = match entry.format {
         LyricsFormat::Lrclib => {
             let lines = parse_synced_lyrics(&entry.raw_lyrics);
             Ok((
@@ -46,7 +46,10 @@ pub(crate) fn parse_stored_lyrics(entry: &LyricsEntry) -> ProviderResult {
                 "Failed to parse subtitle lyrics from database".to_string(),
             )),
         },
-    }
+    }?;
+
+    crate::lyrics::romanize::apply_romanization(&mut result.0);
+    Ok(result)
 }
 
 /// Retrieves all associated track identifiers for a given lyrics id in insertion order.
@@ -312,7 +315,7 @@ pub(crate) async fn process_db_row(
         artist,
         title,
         duration: entry_duration,
-        format: format.clone(),
+        format,
         raw_lyrics,
         track_ids,
     };

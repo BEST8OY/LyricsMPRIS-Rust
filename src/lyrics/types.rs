@@ -29,6 +29,30 @@ pub struct LyricLine {
     pub text: String,
     /// Optional per-word timings (start, end, text) for karaoke rendering.
     pub words: Option<Vec<WordTiming>>,
+    /// Optional phonetic transcription/transliteration for foreign writing systems (e.g. Romaji/Pinyin).
+    pub romanized: Option<String>,
+}
+
+impl LyricLine {
+    pub fn new(time: f64, text: impl Into<String>) -> Self {
+        Self {
+            time,
+            text: text.into(),
+            words: None,
+            romanized: None,
+        }
+    }
+
+    pub fn with_words(mut self, words: Option<Vec<WordTiming>>) -> Self {
+        self.words = words;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_romanized(mut self, romanized: Option<String>) -> Self {
+        self.romanized = romanized;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
