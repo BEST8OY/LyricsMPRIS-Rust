@@ -27,6 +27,8 @@ struct PipeState {
     last_update_instant: Option<Instant>,
     /// Scheduled timer for next line/word boundary
     next_sleep: Option<Pin<Box<Sleep>>>,
+    /// Whether to output romanized subtitles when available
+    romanize: bool,
 }
 
 impl PipeState {
@@ -38,6 +40,7 @@ impl PipeState {
             last_update: None,
             last_update_instant: None,
             next_sleep: None,
+            romanize: false,
         }
     }
 
@@ -98,7 +101,13 @@ impl PipeState {
     fn print_current_line(&mut self, upd: &crate::state::Update) {
         if let Some(idx) = upd.index {
             if let Some(line) = upd.lines.get(idx) {
-                println!("{}", line.text);
+                if self.romanize
+                    && let Some(ref rom) = line.romanized
+                {
+                    println!("{rom}");
+                } else {
+                    println!("{}", line.text);
+                }
                 self.last_track_had_lyric = true;
             }
             self.last_line_idx = Some(idx);
@@ -116,7 +125,13 @@ impl PipeState {
                 match estimated.index {
                     Some(idx) => {
                         if let Some(line) = estimated.lines.get(idx) {
-                            println!("{}", line.text);
+                            if self.romanize
+                                && let Some(ref rom) = line.romanized
+                            {
+                                println!("{rom}");
+                            } else {
+                                println!("{}", line.text);
+                            }
                             self.last_track_had_lyric = true;
                         }
                     }
@@ -156,6 +171,7 @@ pub async fn display_lyrics_pipe(
     tokio::spawn(pool::listen(tx, shutdown_rx, mpris_config.clone()));
 
     let mut state = PipeState::new();
+    state.romanize = mpris_config.romanize;
 
     loop {
         tokio::select! {
@@ -193,16 +209,8 @@ mod tests {
         let mut pipe_state = PipeState::new();
 
         let lines = vec![
-            crate::lyrics::LyricLine {
-                time: 10.0,
-                text: "Line 1".to_string(),
-                words: None,
-            },
-            crate::lyrics::LyricLine {
-                time: 50.0,
-                text: "Line 2".to_string(),
-                words: None,
-            },
+            crate::lyrics::LyricLine::new(10.0, "Line 1"),
+            crate::lyrics::LyricLine::new(50.0, "Line 2"),
         ];
 
         let update_60s = crate::state::Update {
@@ -254,5 +262,33 @@ mod tests {
 
         pipe_state.update_from_mpris(update_25s);
         assert_eq!(pipe_state.last_line_idx, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_pipe_state_romanize_flag() {
+        let mut pipe_state = PipeState::new();
+        pipe_state.romanize = true;
+
+        let lines = vec![
+            crate::lyrics::LyricLine::new(10.0, "こんにちは")
+                .with_romanized(Some("konnichiwa".to_string())),
+        ];
+
+        let update = crate::state::Update {
+            lines: Arc::new(lines),
+            index: Some(0),
+            position: 10.0,
+            playing: true,
+            version: 1,
+            err: None,
+            provider: None,
+            title: "Title".to_string(),
+            artist: "Artist".to_string(),
+            album: "Album".to_string(),
+        };
+
+        pipe_state.update_from_mpris(update);
+        assert_eq!(pipe_state.last_line_idx, Some(0));
+        assert!(pipe_state.last_track_had_lyric);
     }
 }

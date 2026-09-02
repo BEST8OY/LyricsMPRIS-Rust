@@ -43,7 +43,7 @@ pub struct Config {
     /// Maximum number of visible lyric lines (treating wrapped lines as one line). Default: unlimited
     #[arg(long = "visible-lines", value_name = "COUNT")]
     pub visible_lines: Option<usize>,
-    /// Comma-separated list of lyric providers in preferred order (e.g. "lrclib,musixmatch").
+    /// Comma-separated list of lyric providers in preferred order (e.g. "musixmatch,lrclib").
     /// If empty, the LYRIC_PROVIDERS env var will be used as a fallback.
     #[arg(long, value_delimiter = ',')]
     pub providers: Vec<String>,
@@ -53,6 +53,9 @@ pub struct Config {
     /// Enable ISRC lookup from metadata for musixmatch lyrics search
     #[arg(long)]
     pub isrc: bool,
+    /// Enable Romanization subtitles for foreign scripts (e.g. Romaji/Pinyin)
+    #[arg(long)]
+    pub romanize: bool,
 }
 
 impl Default for Config {
@@ -61,11 +64,12 @@ impl Default for Config {
             pipe: false,
             block: vec![],
             target: vec![],
-            providers: vec!["lrclib".to_string(), "musixmatch".to_string()],
+            providers: vec!["musixmatch".to_string(), "lrclib".to_string()],
             database: None,
             no_karaoke: false,
             visible_lines: None,
             isrc: false,
+            romanize: false,
         }
     }
 }

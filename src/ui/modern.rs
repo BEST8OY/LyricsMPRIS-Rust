@@ -30,14 +30,16 @@ use tokio::time::Sleep;
 /// UI state for the modern TUI mode
 pub struct ModernUIState {
     pub last_update: Option<Update>,
-    /// Cached wrapped blocks for the current terminal width: (width, wrapped_blocks)
-    pub wrapped_cache: Option<(usize, Vec<Vec<String>>)>,
+    /// Cached wrapped blocks for the current terminal width: (width, romanize_enabled, wrapped_blocks)
+    pub wrapped_cache: Option<(usize, bool, Vec<crate::ui::modern_helpers::WrappedBlock>)>,
     pub last_track_id: Option<(String, String, String)>,
     pub should_exit: bool,
     /// Instant when the last Update was received; used to estimate current position
     pub last_update_instant: Option<Instant>,
     /// Runtime karaoke toggle (can be toggled with 'k')
     pub karaoke_enabled: bool,
+    /// Runtime Romanization toggle (can be toggled with 'r')
+    pub romanize_enabled: bool,
     /// Manual scroll offset when paused (in lyric blocks, not wrapped lines)
     pub scroll_offset: isize,
 }
@@ -51,6 +53,7 @@ impl ModernUIState {
             should_exit: false,
             last_update_instant: None,
             karaoke_enabled: true,
+            romanize_enabled: false,
             scroll_offset: 0,
         }
     }
@@ -115,6 +118,7 @@ pub async fn display_lyrics_modern(
     let styles = LyricStyles::default();
     let mut state = ModernUIState::new();
     state.karaoke_enabled = karaoke_enabled;
+    state.romanize_enabled = mpris_config.romanize;
     // per-word sleep used to schedule redraws only at interesting times (word boundaries)
     let mut next_word_sleep: Option<Pin<Box<Sleep>>> = None;
     // Asynchronous crossterm event stream directly integrated into Tokio select loop.
@@ -227,6 +231,7 @@ where
         &mut state.wrapped_cache,
         styles,
         state.karaoke_enabled,
+        state.romanize_enabled,
         max_visible_lines,
         state.scroll_offset,
     )?;
@@ -315,6 +320,11 @@ fn process_event(
                 // Toggle karaoke at runtime
                 state.karaoke_enabled = !state.karaoke_enabled;
             }
+            KeyCode::Char('r') => {
+                // Toggle romanization at runtime
+                state.romanize_enabled = !state.romanize_enabled;
+                state.wrapped_cache = None;
+            }
             KeyCode::Up => {
                 // Scroll up when paused
                 if let Some(ref update) = state.last_update
@@ -361,11 +371,7 @@ mod tests {
         Update {
             lines: Arc::new(
                 (0..lines)
-                    .map(|i| crate::lyrics::LyricLine {
-                        time: i as f64,
-                        text: format!("line {i}"),
-                        words: None,
-                    })
+                    .map(|i| crate::lyrics::LyricLine::new(i as f64, format!("line {i}")))
                     .collect(),
             ),
             index: (lines > 0).then_some(0),

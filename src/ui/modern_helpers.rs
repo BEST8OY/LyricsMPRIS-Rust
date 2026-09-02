@@ -17,19 +17,54 @@ use ratatui::{
     widgets::Paragraph,
 };
 use std::error::Error;
+/// A wrapped lyric line block containing primary text lines and optional romanized lines.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WrappedBlock {
+    pub primary: Vec<String>,
+    pub romanized: Vec<String>,
+}
+
+impl WrappedBlock {
+    pub fn len(&self) -> usize {
+        self.primary.len() + self.romanized.len()
+    }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.primary.is_empty() && self.romanized.is_empty()
+    }
+
+    pub fn styled_lines<'a>(
+        &'a self,
+        style: ratatui::style::Style,
+    ) -> impl Iterator<Item = Line<'a>> {
+        let rom_style = style.add_modifier(ratatui::style::Modifier::ITALIC);
+        self.primary
+            .iter()
+            .map(move |l| Line::from(Span::styled(l.as_str(), style)))
+            .chain(
+                self.romanized
+                    .iter()
+                    .map(move |l| Line::from(Span::styled(l.as_str(), rom_style))),
+            )
+    }
+}
+
 /// Draw the UI using cached wrapped lines.
 ///
 /// This function handles:
 /// - Error message rendering
-/// - Wrapped text caching (invalidated on width change)
+/// - Wrapped text caching (invalidated on width or romanize change)
 /// - Visible line computation with context
 /// - Vertical centering
+#[allow(clippy::too_many_arguments)]
 pub fn draw_ui_with_cache<B: Backend>(
     terminal: &mut Terminal<B>,
     last_update: &Option<Update>,
-    wrapped_cache: &mut Option<(usize, Vec<Vec<String>>)>,
+    wrapped_cache: &mut Option<(usize, bool, Vec<WrappedBlock>)>,
     styles: &LyricStyles,
     karaoke_enabled: bool,
+    romanize_enabled: bool,
     max_visible_lines: Option<usize>,
     scroll_offset: isize,
 ) -> Result<(), Box<dyn Error + Send + Sync>>
@@ -49,6 +84,7 @@ where
                 height,
                 styles,
                 karaoke_enabled,
+                romanize_enabled,
                 max_visible_lines,
                 scroll_offset,
             );
@@ -64,11 +100,12 @@ where
 #[allow(clippy::too_many_arguments)]
 fn compute_visible_spans<'a>(
     last_update: &'a Option<Update>,
-    wrapped_cache: &'a mut Option<(usize, Vec<Vec<String>>)>,
+    wrapped_cache: &'a mut Option<(usize, bool, Vec<WrappedBlock>)>,
     width: usize,
     height: usize,
     styles: &'a LyricStyles,
     karaoke_enabled: bool,
+    romanize_enabled: bool,
     max_visible_lines: Option<usize>,
     scroll_offset: isize,
 ) -> Vec<Line<'a>> {
@@ -89,7 +126,7 @@ fn compute_visible_spans<'a>(
         return Vec::new();
     }
 
-    let blocks = ensure_wrapped_cache(wrapped_cache, &update.lines, width);
+    let blocks = ensure_wrapped_cache(wrapped_cache, &update.lines, width, romanize_enabled);
     let visible = gather_visible_lines(
         update,
         blocks,
@@ -105,25 +142,38 @@ fn compute_visible_spans<'a>(
     visible.into_vec()
 }
 
-/// Ensure wrapped cache is valid for current width and line count.
+/// Ensure wrapped cache is valid for current width, line count, and romanize state.
 /// Returns a reference to the cached blocks.
 fn ensure_wrapped_cache<'a>(
-    wrapped_cache: &'a mut Option<(usize, Vec<Vec<String>>)>,
+    wrapped_cache: &'a mut Option<(usize, bool, Vec<WrappedBlock>)>,
     lines: &[crate::lyrics::LyricLine],
     width: usize,
-) -> &'a Vec<Vec<String>> {
+    romanize_enabled: bool,
+) -> &'a Vec<WrappedBlock> {
     let needs_rebuild = match wrapped_cache {
-        Some((cached_w, blocks)) => *cached_w != width || blocks.len() != lines.len(),
+        Some((cached_w, cached_rom, blocks)) => {
+            *cached_w != width || *cached_rom != romanize_enabled || blocks.len() != lines.len()
+        }
         None => true,
     };
 
     if needs_rebuild {
-        let new_blocks: Vec<Vec<String>> =
-            lines.iter().map(|l| wrap_text(&l.text, width)).collect();
-        *wrapped_cache = Some((width, new_blocks));
+        let new_blocks: Vec<WrappedBlock> = lines
+            .iter()
+            .map(|l| {
+                let primary = wrap_text(&l.text, width);
+                let romanized = if romanize_enabled && let Some(ref rom) = l.romanized {
+                    wrap_text(rom, width)
+                } else {
+                    Vec::new()
+                };
+                WrappedBlock { primary, romanized }
+            })
+            .collect();
+        *wrapped_cache = Some((width, romanize_enabled, new_blocks));
     }
 
-    &wrapped_cache.as_ref().unwrap().1
+    &wrapped_cache.as_ref().unwrap().2
 }
 
 /// Render a paragraph centered vertically in the given area.
@@ -173,7 +223,7 @@ impl<'a> VisibleLines<'a> {
 /// Collect lines before the current index. Returns Lines in visual top->down order.
 fn collect_before_spans<'a>(
     current_index: usize,
-    wrapped_blocks: &'a [Vec<String>],
+    wrapped_blocks: &'a [WrappedBlock],
     mut lines_needed: usize,
     styles: &'a LyricStyles,
 ) -> Vec<Line<'a>> {
@@ -187,14 +237,10 @@ fn collect_before_spans<'a>(
         let dist = current_index - i;
         let style = styles.get_line_style_by_distance(dist, true);
         let block = &wrapped_blocks[i];
-        let take = block.len().min(lines_needed);
-        let start = block.len() - take;
-        chunks.push(
-            block[start..]
-                .iter()
-                .map(|l| Line::from(Span::styled(l.as_str(), style)))
-                .collect(),
-        );
+        let block_lines: Vec<Line<'a>> = block.styled_lines(style).collect();
+        let take = block_lines.len().min(lines_needed);
+        let start = block_lines.len() - take;
+        chunks.push(block_lines[start..].to_vec());
         lines_needed -= take;
     }
 
@@ -205,7 +251,7 @@ fn collect_before_spans<'a>(
 /// Collect lines after the current index. Returns Lines in visual top->down order.
 fn collect_after_spans<'a>(
     current_index: usize,
-    wrapped_blocks: &'a [Vec<String>],
+    wrapped_blocks: &'a [WrappedBlock],
     mut lines_needed: usize,
     styles: &'a LyricStyles,
 ) -> Vec<Line<'a>> {
@@ -215,9 +261,10 @@ fn collect_after_spans<'a>(
         let dist = j - current_index;
         let style = styles.get_line_style_by_distance(dist, false);
         let block = &wrapped_blocks[j];
-        let take = block.len().min(lines_needed);
-        for line in block.iter().take(take) {
-            result.push(Line::from(Span::styled(line.as_str(), style)));
+        let block_lines: Vec<Line<'a>> = block.styled_lines(style).collect();
+        let take = block_lines.len().min(lines_needed);
+        for line in block_lines.into_iter().take(take) {
+            result.push(line);
         }
         lines_needed -= take;
         j += 1;
@@ -229,7 +276,7 @@ fn collect_after_spans<'a>(
 /// Returns all wrapped lines from each block in visual top->down order.
 fn collect_before_blocks<'a>(
     current_index: usize,
-    wrapped_blocks: &'a [Vec<String>],
+    wrapped_blocks: &'a [WrappedBlock],
     blocks_needed: usize,
     styles: &'a LyricStyles,
 ) -> Vec<Line<'a>> {
@@ -240,12 +287,7 @@ fn collect_before_blocks<'a>(
     for block_idx in (start_index..current_index).rev() {
         let dist = current_index - block_idx;
         let style = styles.get_line_style_by_distance(dist, true);
-        chunks.push(
-            wrapped_blocks[block_idx]
-                .iter()
-                .map(|line| Line::from(Span::styled(line.as_str(), style)))
-                .collect(),
-        );
+        chunks.push(wrapped_blocks[block_idx].styled_lines(style).collect());
     }
 
     chunks.reverse();
@@ -256,7 +298,7 @@ fn collect_before_blocks<'a>(
 /// Returns all wrapped lines from each block in visual top->down order.
 fn collect_after_blocks<'a>(
     current_index: usize,
-    wrapped_blocks: &'a [Vec<String>],
+    wrapped_blocks: &'a [WrappedBlock],
     blocks_needed: usize,
     styles: &'a LyricStyles,
 ) -> Vec<Line<'a>> {
@@ -271,9 +313,7 @@ fn collect_after_blocks<'a>(
     {
         let dist = block_idx - current_index;
         let style = styles.get_line_style_by_distance(dist, false);
-        for line in block {
-            result.push(Line::from(Span::styled(line.as_str(), style)));
-        }
+        result.extend(block.styled_lines(style));
     }
 
     result
@@ -329,7 +369,7 @@ fn split_words_into_lines<'b>(
 #[allow(clippy::too_many_arguments)]
 pub fn gather_visible_lines<'a>(
     update: &'a Update,
-    wrapped_blocks: &'a [Vec<String>],
+    wrapped_blocks: &'a [WrappedBlock],
     w: usize,
     h: usize,
     styles: &'a LyricStyles,
@@ -349,16 +389,15 @@ pub fn gather_visible_lines<'a>(
         base_index
     };
 
-    let current_block = wrapped_blocks
-        .get(effective_index)
-        .map(|v| v.as_slice())
-        .unwrap_or(&[]);
-    let current_height = current_block.len();
+    let current_block = wrapped_blocks.get(effective_index);
+    let current_height = current_block.map(|b| b.len()).unwrap_or(0);
 
     // Build current line spans (with karaoke if applicable, but only when not scrolled)
     let use_karaoke = karaoke_enabled && scroll_offset == 0 && update.playing;
-    let current_spans =
-        build_current_spans(update, current_block, w, styles, position, use_karaoke);
+    let current_spans = match current_block {
+        Some(block) => build_current_spans(update, block, w, styles, position, use_karaoke),
+        None => Vec::new(),
+    };
 
     // Calculate available height considering max_visible_lines
     let available_height = if let Some(max) = max_visible_lines {
@@ -415,17 +454,17 @@ pub fn gather_visible_lines<'a>(
     }
 }
 
-/// Build spans for the current line, applying karaoke highlighting if appropriate.
+/// Build spans for the current line, applying karaoke highlighting and romanized subtitle if appropriate.
 fn build_current_spans<'a>(
     update: &'a Update,
-    current_block: &'a [String],
+    current_block: &'a WrappedBlock,
     width: usize,
     styles: &'a LyricStyles,
     position: f64,
     karaoke_enabled: bool,
 ) -> Vec<Line<'a>> {
     // Try to build richsync karaoke spans
-    if let Some(idx) = update.index
+    let mut lines = if let Some(idx) = update.index
         && karaoke_enabled
         && matches!(
             update.provider,
@@ -433,20 +472,27 @@ fn build_current_spans<'a>(
         )
         && let Some(spans) = try_build_karaoke_spans(update, idx, width, styles, position)
     {
-        return spans;
-    }
-
-    // Fallback: render wrapped block with appropriate style
-    let style = if update.index.is_some() {
-        styles.current
+        spans
     } else {
-        styles.after
+        let style = if update.index.is_some() {
+            styles.current
+        } else {
+            styles.after
+        };
+        current_block
+            .primary
+            .iter()
+            .map(|line| Line::from(Span::styled(line.as_str(), style)))
+            .collect()
     };
 
-    current_block
-        .iter()
-        .map(|line| Line::from(Span::styled(line.as_str(), style)))
-        .collect()
+    // Append romanized subtitle lines if present
+    let rom_style = styles.after.add_modifier(ratatui::style::Modifier::ITALIC);
+    for rom in &current_block.romanized {
+        lines.push(Line::from(Span::styled(rom.as_str(), rom_style)));
+    }
+
+    lines
 }
 
 /// Try to build per-word karaoke spans for richsync lyrics.
@@ -542,4 +588,46 @@ fn build_word_spans<'a>(
         Span::styled(&word.text[..split_byte], styles.current),
         styled_word(remaining, suffix, styles.after),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wrapped_block_styled_lines() {
+        let block = WrappedBlock {
+            primary: vec!["こんにちは".to_string()],
+            romanized: vec!["konnichiwa".to_string()],
+        };
+
+        assert_eq!(block.len(), 2);
+        assert!(!block.is_empty());
+
+        let styles = LyricStyles::default();
+        let lines: Vec<Line> = block.styled_lines(styles.current).collect();
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn test_ensure_wrapped_cache_with_romanize() {
+        let mut cache = None;
+        let lines = vec![
+            crate::lyrics::LyricLine::new(0.0, "こんにちは")
+                .with_romanized(Some("konnichiwa".to_string())),
+        ];
+
+        // Romanize disabled
+        let blocks = ensure_wrapped_cache(&mut cache, &lines, 80, false);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].primary.len(), 1);
+        assert!(blocks[0].romanized.is_empty());
+
+        // Romanize enabled (cache invalidates and rebuilds)
+        let blocks = ensure_wrapped_cache(&mut cache, &lines, 80, true);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].primary.len(), 1);
+        assert_eq!(blocks[0].romanized.len(), 1);
+        assert_eq!(blocks[0].romanized[0], "konnichiwa");
+    }
 }
