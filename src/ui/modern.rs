@@ -60,6 +60,23 @@ impl ModernUIState {
 // Mirrors the binary-search logic used in `LyricState::get_index` but kept
 // small here; VisibleLines and gather_visible_lines live in `modern_helpers`.
 
+/// Restores the terminal to cooked mode, leaves alternate screen, and ensures cursor is visible.
+/// Safe to call multiple times, including from panic hooks and signal handlers.
+pub fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+}
+
+/// Installs a panic hook that ensures the terminal is restored to cooked mode
+/// before printing the panic message and backtrace.
+pub fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        restore_terminal();
+        default_hook(panic_info);
+    }));
+}
+
 /// RAII guard that puts the terminal into raw mode + alternate screen on
 /// creation and always restores it on drop - including on error propagation
 /// (`?`) or panic unwinding from anywhere in the TUI event loop.
@@ -78,8 +95,7 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        restore_terminal();
     }
 }
 
@@ -104,10 +120,34 @@ pub async fn display_lyrics_modern(
     // Asynchronous crossterm event stream directly integrated into Tokio select loop.
     let mut event_stream = EventStream::new();
 
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
     // Main event loop: handle updates, user input, and timer-driven redraws
     while !state.should_exit {
         tokio::select! {
             biased;
+
+            // OS SIGTERM signal
+            _ = async {
+                #[cfg(unix)]
+                {
+                    sigterm.recv().await
+                }
+                #[cfg(not(unix))]
+                {
+                    futures_util::future::pending::<Option<()>>().await
+                }
+            } => {
+                tracing::debug!("Termination signal received, exiting modern TUI");
+                state.should_exit = true;
+            }
+
+            // OS SIGINT (Ctrl+C) signal
+            _ = tokio::signal::ctrl_c() => {
+                tracing::debug!("Ctrl+C signal received, exiting modern TUI");
+                state.should_exit = true;
+            }
 
             // MPRIS lyrics/position updates
             update = rx.recv() => {

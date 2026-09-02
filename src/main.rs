@@ -124,6 +124,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .with_writer(std::io::stderr)
             .init();
     } else {
+        // Install panic hook to restore terminal cooked mode before panics print
+        crate::ui::modern::install_panic_hook();
+
         let log_path =
             std::env::var("RUST_LOG_FILE").unwrap_or_else(|_| "/tmp/lyricsmpris.log".to_string());
         let log_file = OpenOptions::new()
