@@ -5,6 +5,7 @@ use crate::mpris::proxies::MediaPlayer2PlayerProxy;
 use lofty::file::TaggedFileExt;
 use lofty::prelude::ItemKey;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::block_in_place;
@@ -189,18 +190,55 @@ impl From<MprisMetadata> for TrackMetadata {
     }
 }
 
+/// Extract the first non-empty trimmed string from either a string variant or an array of strings.
+/// Borrows `val.deref()` directly to avoid heap clones of `OwnedValue`.
+pub fn extract_string_or_first_item(val: &OwnedValue) -> Option<String> {
+    match val.deref() {
+        zvariant::Value::Str(s) => {
+            let trimmed = s.as_str().trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        zvariant::Value::Array(arr) => {
+            for elem in arr.iter() {
+                if let Ok(s) = <&str>::try_from(elem) {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Extract track length in seconds from either i64 or u64 microseconds.
+pub fn extract_length_seconds(val: &OwnedValue) -> Option<f64> {
+    if let Ok(microsecs) = i64::try_from(val) {
+        return Some(microsecs as f64 / 1_000_000.0);
+    }
+    if let Ok(microsecs) = u64::try_from(val) {
+        return Some(microsecs as f64 / 1_000_000.0);
+    }
+    None
+}
+
 /// Extract metadata from a raw D-Bus property map
 ///
 /// This is used for signal handlers where we receive raw variant maps.
 pub fn extract_metadata(map: &HashMap<String, OwnedValue>) -> TrackMetadata {
-    // Helper to extract string from variant
-    let get_string = |key: &str| -> Option<String> {
-        map.get(key)
-            .and_then(|v| <&str>::try_from(v).ok().map(String::from))
-    };
-
-    let trackid = get_string("mpris:trackid");
-    let title = get_string("xesam:title").unwrap_or_default();
+    let trackid = map
+        .get("mpris:trackid")
+        .and_then(extract_string_or_first_item);
+    let title = map
+        .get("xesam:title")
+        .and_then(extract_string_or_first_item)
+        .unwrap_or_default();
 
     // Check for explicit "NoTrack" sentinel
     if let Some(ref id) = trackid
@@ -210,54 +248,26 @@ pub fn extract_metadata(map: &HashMap<String, OwnedValue>) -> TrackMetadata {
         return TrackMetadata::default();
     }
 
-    // Helper to extract string array from variant
-    let get_string_array = |key: &str| -> Option<Vec<String>> {
-        map.get(key).and_then(|v| {
-            // Try to deserialize directly from OwnedValue as array
-            zvariant::Array::try_from(v.clone()).ok().and_then(|arr| {
-                arr.iter()
-                    .map(|elem| <&str>::try_from(elem).ok().map(String::from))
-                    .collect::<Option<Vec<String>>>()
-            })
-        })
-    };
-
-    // Helper to extract integer from variant
-    let get_i64 = |key: &str| -> Option<i64> {
-        map.get(key).and_then(|v| {
-            // Try both i64 and u64
-            i64::try_from(v)
-                .ok()
-                .or_else(|| u64::try_from(v).ok().map(|u| u as i64))
-        })
-    };
-
-    // Artist: try array first (primary artist), fallback to string
-    let artist = get_string_array("xesam:artist")
-        .and_then(|arr| arr.into_iter().next())
-        .or_else(|| get_string("xesam:artist"))
+    let artist = map
+        .get("xesam:artist")
+        .and_then(extract_string_or_first_item)
         .unwrap_or_default();
 
-    // Album: try array first (primary album), fallback to string
-    let album = get_string_array("xesam:album")
-        .and_then(|arr| arr.into_iter().next())
-        .or_else(|| get_string("xesam:album"))
+    let album = map
+        .get("xesam:album")
+        .and_then(extract_string_or_first_item)
         .unwrap_or_default();
 
-    let length = get_i64("mpris:length").map(|microsecs| microsecs as f64 / 1_000_000.0);
+    let length = map.get("mpris:length").and_then(extract_length_seconds);
 
-    let url = get_string("xesam:url");
+    let url = map.get("xesam:url").and_then(extract_string_or_first_item);
 
     // Extract Spotify ID — try xesam:url first (https://open.spotify.com/track/ID),
     // then fall back to mpris:trackid (/com/spotify/track/ID or spotify:track:ID).
     let spotify_id = url
-        .as_ref()
-        .and_then(|u| normalize_spotify_url(u))
-        .or_else(|| {
-            trackid
-                .as_ref()
-                .and_then(|id| normalize_spotify_trackid(id))
-        });
+        .as_deref()
+        .and_then(normalize_spotify_url)
+        .or_else(|| trackid.as_deref().and_then(normalize_spotify_trackid));
 
     let isrc = if isrc_enabled() {
         isrc_from_metadata(url.as_deref())
@@ -374,5 +384,32 @@ mod tests {
             isrc_from_metadata(Some("https://example.com/song.mp3")),
             None
         );
+    }
+
+    #[test]
+    fn test_extract_metadata_with_array_and_str_variants() {
+        let mut map = HashMap::new();
+        map.insert(
+            "xesam:title".to_string(),
+            OwnedValue::try_from(zvariant::Value::from("Test Title")).unwrap(),
+        );
+        map.insert(
+            "xesam:artist".to_string(),
+            OwnedValue::try_from(zvariant::Value::from(vec!["Artist A", "Artist B"])).unwrap(),
+        );
+        map.insert(
+            "xesam:album".to_string(),
+            OwnedValue::try_from(zvariant::Value::from("Album Name")).unwrap(),
+        );
+        map.insert(
+            "mpris:length".to_string(),
+            OwnedValue::try_from(zvariant::Value::from(210_000_000i64)).unwrap(),
+        );
+
+        let track = extract_metadata(&map);
+        assert_eq!(track.title, "Test Title");
+        assert_eq!(track.artist, "Artist A");
+        assert_eq!(track.album, "Album Name");
+        assert_eq!(track.length, Some(210.0));
     }
 }
