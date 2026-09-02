@@ -11,7 +11,9 @@ use zbus::fdo::NameOwnerChangedStream;
 /// Tuning constants for transient buffering position calibration.
 pub const CALIBRATION_INITIAL_DELAY: Duration = Duration::from_millis(50);
 pub const CALIBRATION_CONFIRMATION_INTERVAL: Duration = Duration::from_millis(250);
-pub const MAX_CALIBRATION_ATTEMPTS: u8 = 10;
+pub const CALIBRATION_STEADY_POLL_INTERVAL: Duration = Duration::from_millis(1000);
+pub const MAX_CALIBRATION_ATTEMPTS: u8 = 35;
+pub const MAX_ERROR_ATTEMPTS: u8 = 8;
 pub const MOVEMENT_DELTA_THRESHOLD_SECS: f64 = 0.03;
 
 /// Returns the adaptive delay for buffering edge-detection probes.
@@ -22,7 +24,8 @@ fn probe_delay(attempt: u8) -> Duration {
         2 => Duration::from_millis(150),
         3 => Duration::from_millis(250),
         4 => Duration::from_millis(400),
-        _ => Duration::from_millis(600),
+        5 => Duration::from_millis(600),
+        _ => CALIBRATION_STEADY_POLL_INTERVAL,
     }
 }
 
@@ -32,6 +35,7 @@ fn probe_delay(attempt: u8) -> Duration {
 struct CalibrationTracker {
     timer: Option<Pin<Box<tokio::time::Sleep>>>,
     attempts: u8,
+    error_attempts: u8,
     confirmed: bool,
     anchor_pos: f64,
 }
@@ -41,6 +45,7 @@ impl CalibrationTracker {
         let mut tracker = Self {
             timer: None,
             attempts: 0,
+            error_attempts: 0,
             confirmed: false,
             anchor_pos: initial_pos,
         };
@@ -50,6 +55,7 @@ impl CalibrationTracker {
 
     fn arm(&mut self, anchor_pos: f64) {
         self.attempts = 0;
+        self.error_attempts = 0;
         self.confirmed = false;
         self.anchor_pos = anchor_pos;
         self.timer = Some(Box::pin(tokio::time::sleep(probe_delay(0))));
@@ -79,6 +85,7 @@ impl CalibrationTracker {
     /// Step the calibration state machine given the newly fetched authoritative position.
     fn on_step(&mut self, real_pos: f64) {
         self.attempts += 1;
+        self.error_attempts = 0;
         let moved = (real_pos - self.anchor_pos).abs() > MOVEMENT_DELTA_THRESHOLD_SECS;
 
         if moved {
@@ -103,9 +110,9 @@ impl CalibrationTracker {
 
     /// Handle a query failure during calibration by scheduling a retry if attempts remain.
     fn on_error(&mut self) {
-        self.attempts += 1;
-        if self.attempts < MAX_CALIBRATION_ATTEMPTS {
-            self.timer = Some(Box::pin(tokio::time::sleep(probe_delay(self.attempts))));
+        self.error_attempts += 1;
+        if self.error_attempts < MAX_ERROR_ATTEMPTS {
+            self.timer = Some(Box::pin(tokio::time::sleep(Duration::from_millis(400))));
         } else {
             self.disarm();
         }
@@ -778,14 +785,36 @@ mod tests {
     #[tokio::test]
     async fn test_tracker_error_retry_and_timeout() {
         let mut tracker = CalibrationTracker::new(true, 0.0);
-        for i in 1..=MAX_CALIBRATION_ATTEMPTS {
+        for i in 1..=MAX_ERROR_ATTEMPTS {
             tracker.on_error();
-            if i < MAX_CALIBRATION_ATTEMPTS {
+            if i < MAX_ERROR_ATTEMPTS {
                 assert!(tracker.timer.is_some());
-                assert_eq!(tracker.attempts, i);
+                assert_eq!(tracker.error_attempts, i);
             } else {
                 assert!(tracker.timer.is_none()); // Disarmed after max error attempts
             }
         }
+    }
+
+    #[tokio::test]
+    async fn test_tracker_long_buffering_tolerance() {
+        let mut tracker = CalibrationTracker::new(true, 0.0);
+
+        // Player buffers online for 15 attempts (past fast probes into 1s interval)
+        for i in 1..=15 {
+            tracker.on_step(0.0);
+            assert_eq!(tracker.attempts, i);
+            assert_eq!(tracker.error_attempts, 0);
+            assert!(tracker.timer.is_some());
+        }
+
+        // At attempt 16 (e.g. after ~10s of buffering), audio finally moves to 0.4s
+        tracker.on_step(0.4);
+        assert!(tracker.confirmed);
+        assert!(tracker.timer.is_some());
+
+        // Final confirmation check
+        tracker.on_step(0.65);
+        assert!(tracker.timer.is_none());
     }
 }
