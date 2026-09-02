@@ -9,7 +9,7 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::block_in_place;
-use zvariant::{OwnedValue, Type};
+use zvariant::OwnedValue;
 
 static ISRC_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -33,26 +33,6 @@ pub struct TrackMetadata {
     pub spotify_id: Option<String>,
     pub isrc: Option<String>,
     pub itunes_id: Option<String>,
-}
-
-/// Internal metadata structure matching MPRIS specification
-///
-/// Uses zvariant's DeserializeDict to properly handle D-Bus dictionary types.
-#[derive(Debug, Type)]
-#[zvariant(signature = "a{sv}")]
-struct MprisMetadata {
-    #[zvariant(rename = "xesam:title")]
-    title: Option<String>,
-    #[zvariant(rename = "xesam:artist")]
-    artist: Option<Vec<String>>,
-    #[zvariant(rename = "xesam:album")]
-    album: Option<String>,
-    #[zvariant(rename = "mpris:length")]
-    length: Option<i64>,
-    #[zvariant(rename = "mpris:trackid")]
-    trackid: Option<String>,
-    #[zvariant(rename = "xesam:url")]
-    url: Option<String>,
 }
 
 /// Try to read ISRC from a local audio file path or URL using lofty.
@@ -143,59 +123,6 @@ pub fn is_explicit_no_track(trackid: &str) -> bool {
 pub fn is_no_track(trackid: &str) -> bool {
     let trimmed = trackid.trim();
     trimmed.is_empty() || trimmed == "/" || is_explicit_no_track(trimmed)
-}
-
-impl From<MprisMetadata> for TrackMetadata {
-    fn from(md: MprisMetadata) -> Self {
-        // If the trackid explicitly signals "NoTrack", return default empty metadata
-        // even if stale title/artist attributes linger in the dictionary.
-        if let Some(ref trackid) = md.trackid {
-            let is_explicit = is_explicit_no_track(trackid);
-            let is_empty_sentinel =
-                is_no_track(trackid) && md.title.as_deref().unwrap_or("").is_empty();
-            if is_explicit || is_empty_sentinel {
-                return TrackMetadata::default();
-            }
-        }
-
-        let title = md.title.unwrap_or_default();
-        let artist = md
-            .artist
-            .and_then(|artists| artists.into_iter().next())
-            .unwrap_or_default();
-        let album = md.album.unwrap_or_default();
-
-        // Convert microseconds to seconds
-        let length = md.length.map(|microsecs| microsecs as f64 / 1_000_000.0);
-
-        // Extract Spotify ID — try xesam:url first (https://open.spotify.com/track/ID),
-        // then fall back to mpris:trackid (/com/spotify/track/ID or spotify:track:ID).
-        let spotify_id = md
-            .url
-            .as_ref()
-            .and_then(|u| normalize_spotify_url(u))
-            .or_else(|| {
-                md.trackid
-                    .as_ref()
-                    .and_then(|trackid| normalize_spotify_trackid(trackid))
-            });
-
-        let isrc = if isrc_enabled() {
-            isrc_from_metadata(md.url.as_deref())
-        } else {
-            None
-        };
-
-        TrackMetadata {
-            title,
-            artist,
-            album,
-            length,
-            spotify_id,
-            isrc,
-            itunes_id: None,
-        }
-    }
 }
 
 /// Extract the first non-empty trimmed string from either a string variant or an array of strings.
@@ -320,16 +247,25 @@ mod tests {
 
     #[test]
     fn test_metadata_conversion() {
-        let md = MprisMetadata {
-            title: Some("Test Song".to_string()),
-            artist: Some(vec!["Artist 1".to_string(), "Artist 2".to_string()]),
-            album: Some("Test Album".to_string()),
-            length: Some(180_000_000), // 180 seconds in microseconds
-            trackid: None,
-            url: None,
-        };
+        let mut map = HashMap::new();
+        map.insert(
+            "xesam:title".to_string(),
+            OwnedValue::try_from(zvariant::Value::from("Test Song")).unwrap(),
+        );
+        map.insert(
+            "xesam:artist".to_string(),
+            OwnedValue::try_from(zvariant::Value::from(vec!["Artist 1", "Artist 2"])).unwrap(),
+        );
+        map.insert(
+            "xesam:album".to_string(),
+            OwnedValue::try_from(zvariant::Value::from("Test Album")).unwrap(),
+        );
+        map.insert(
+            "mpris:length".to_string(),
+            OwnedValue::try_from(zvariant::Value::from(180_000_000i64)).unwrap(),
+        );
 
-        let track: TrackMetadata = md.into();
+        let track = extract_metadata(&map);
         assert_eq!(track.title, "Test Song");
         assert_eq!(track.artist, "Artist 1");
         assert_eq!(track.album, "Test Album");
@@ -354,18 +290,6 @@ mod tests {
         assert!(is_no_track("NoTrack"));
         assert!(is_no_track("/"));
         assert!(!is_no_track("/org/mpris/MediaPlayer2/track/123"));
-
-        // Stale title and artist with explicit NoTrack sentinel must return default
-        let md = MprisMetadata {
-            title: Some("Stale Title".to_string()),
-            artist: Some(vec!["Stale Artist".to_string()]),
-            album: Some("Stale Album".to_string()),
-            length: Some(180_000_000),
-            trackid: Some("/org/mpris/MediaPlayer2/TrackList/NoTrack".to_string()),
-            url: Some("https://open.spotify.com/track/stale".to_string()),
-        };
-        let track: TrackMetadata = md.into();
-        assert_eq!(track, TrackMetadata::default());
 
         // Raw variant map with stale title and explicit NoTrack sentinel
         let mut map = HashMap::new();

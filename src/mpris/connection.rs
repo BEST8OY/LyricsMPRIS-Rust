@@ -105,10 +105,16 @@ pub async fn find_active_service(
 ///
 /// Returns true if the service name (case-insensitive) contains any blocked string.
 pub fn is_blocked(service: &str, block_list: &[String]) -> bool {
-    let service_lower = service.to_lowercase();
-    block_list
-        .iter()
-        .any(|blocked| service_lower.contains(&blocked.to_lowercase()))
+    let s_bytes = service.as_bytes();
+    block_list.iter().any(|blocked| {
+        let b_bytes = blocked.as_bytes();
+        if b_bytes.is_empty() {
+            return false;
+        }
+        s_bytes
+            .windows(b_bytes.len())
+            .any(|window| window.eq_ignore_ascii_case(b_bytes))
+    })
 }
 
 /// Check if a player service is targeted, and should be listened to
@@ -120,10 +126,16 @@ pub fn is_targeted(service: &str, target_list: &[String]) -> bool {
         return true;
     }
 
-    let service_lower = service.to_lowercase();
-    target_list
-        .iter()
-        .any(|target| service_lower.contains(&target.to_lowercase()))
+    let s_bytes = service.as_bytes();
+    target_list.iter().any(|target| {
+        let t_bytes = target.as_bytes();
+        if t_bytes.is_empty() {
+            return false;
+        }
+        s_bytes
+            .windows(t_bytes.len())
+            .any(|window| window.eq_ignore_ascii_case(t_bytes))
+    })
 }
 
 #[cfg(test)]
