@@ -9,6 +9,14 @@ pub(crate) fn get_root_status_code(json: &Value) -> Option<i64> {
         .and_then(|v| v.as_i64())
 }
 
+/// Extracts the root level hint from a Musixmatch response JSON.
+pub(crate) fn get_root_hint(json: &Value) -> Option<String> {
+    json.pointer("/message/header/hint")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 pub(crate) fn extract_string_or_int(value: &Value) -> Option<String> {
     let s = value
         .as_str()
@@ -179,5 +187,23 @@ mod tests {
         assert!(ids.track_isrcs.is_empty());
         assert!(ids.track_spotify_ids.is_empty());
         assert!(ids.track_itunes_ids.is_empty());
+    }
+
+    #[test]
+    fn test_extract_root_status_code_and_hint() {
+        let json: Value = serde_json::from_str(
+            r#"{
+            "message": {
+                "header": {
+                    "status_code": 401,
+                    "hint": "renew"
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+
+        assert_eq!(get_root_status_code(&json), Some(401));
+        assert_eq!(get_root_hint(&json), Some("renew".to_string()));
     }
 }

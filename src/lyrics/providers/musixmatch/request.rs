@@ -1,23 +1,20 @@
 //! HTTP request execution and response handling for Musixmatch API.
 
-use super::extract::{
-    extract_track_ids_from_json, extract_track_ids_from_macro, get_root_status_code,
-};
+use super::extract::{extract_track_ids_from_macro, get_root_hint, get_root_status_code};
+use super::token::DEFAULT_USER_AGENT;
 use crate::lyrics::types::{LyricLine, LyricsError, TrackMatchInfo};
 use reqwest::Client;
 use serde_json::Value;
 
-pub(crate) const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Electron/1.7.6 Safari/537.36";
-
 /// Outcome of a single token's fetch attempt.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum FetchOutcome {
     /// Successfully found lyrics: (parsed lines, raw response content, track identifiers)
     Success(Vec<LyricLine>, Option<String>, TrackMatchInfo),
     /// Track was not found on Musixmatch (200 status but empty list/no lyrics).
     TrackNotFound,
     /// A token-specific issue (401 unauthorized, 402 payment, 403 forbidden, 429 rate limit).
-    TokenError(String),
+    TokenError { reason: String, is_renewable: bool },
 }
 
 /// Returns true if the status code indicates a token/auth/quota/rate-limit error.
@@ -29,6 +26,40 @@ pub(crate) fn is_token_error_code(code: i64) -> bool {
 pub(crate) fn is_token_error_status(status: reqwest::StatusCode) -> bool {
     let code = status.as_u16();
     matches!(code, 401 | 402 | 403 | 429)
+}
+
+/// Evaluates HTTP status code and optional body JSON to determine if a token/rate-limit error occurred.
+/// Differentiates between renewable token expiration (`401` with `hint: "renew"`) and throttling.
+pub(crate) fn evaluate_token_outcome(
+    http_status: reqwest::StatusCode,
+    json: Option<&Value>,
+) -> Option<FetchOutcome> {
+    if let Some(json) = json {
+        let code = get_root_status_code(json);
+        let hint = get_root_hint(json);
+        if let Some(code) = code
+            && is_token_error_code(code)
+        {
+            let is_renewable = code == 401 && hint.as_deref() == Some("renew");
+            let reason = match hint {
+                Some(h) => format!("API Status {code} (hint: {h})"),
+                None => format!("API Status {code}"),
+            };
+            return Some(FetchOutcome::TokenError {
+                reason,
+                is_renewable,
+            });
+        }
+    }
+
+    if is_token_error_status(http_status) {
+        return Some(FetchOutcome::TokenError {
+            reason: format!("HTTP {http_status}"),
+            is_renewable: false,
+        });
+    }
+
+    None
 }
 
 /// Check if a macro response has a successful status code (200).
@@ -62,24 +93,25 @@ pub(crate) async fn try_macro_for_lyrics(
         .await?;
 
     let macro_status = macro_resp.status();
-    if is_token_error_status(macro_status) {
-        return Ok(FetchOutcome::TokenError(format!("HTTP {macro_status}")));
-    }
 
     // Server-side failures are transient network-level issues, not "track not found"
     if macro_status.is_server_error() {
         return Err(LyricsError::Http(macro_status.as_u16()));
     }
 
-    if !macro_status.is_success() {
-        return Ok(FetchOutcome::TrackNotFound);
+    // Try reading JSON body even on HTTP error (e.g. 401/403/429) to inspect status and hint
+    let macro_json: Option<Value> = macro_resp.json().await.ok();
+
+    if let Some(outcome) = evaluate_token_outcome(macro_status, macro_json.as_ref()) {
+        return Ok(outcome);
     }
 
-    let macro_json: Value = macro_resp.json().await?;
-    if let Some(code) = get_root_status_code(&macro_json)
-        && is_token_error_code(code)
-    {
-        return Ok(FetchOutcome::TokenError(format!("API Status {}", code)));
+    let Some(macro_json) = macro_json else {
+        return Ok(FetchOutcome::TrackNotFound);
+    };
+
+    if !macro_status.is_success() {
+        return Ok(FetchOutcome::TrackNotFound);
     }
 
     let macro_calls = macro_json.pointer("/message/body/macro_calls");
@@ -87,13 +119,25 @@ pub(crate) async fn try_macro_for_lyrics(
     if let Some(calls) = macro_calls {
         let track_ids = extract_track_ids_from_macro(calls);
 
+        // Check instrumental status first
+        let is_instrumental = calls
+            .pointer("/matcher.track.get/message/body/track/instrumental")
+            .map(|v| v.as_i64() == Some(1) || v.as_bool() == Some(true))
+            .unwrap_or(false);
+
+        if is_instrumental {
+            let line = LyricLine::new(0.0, "♪ Instrumental ♪");
+            return Ok(FetchOutcome::Success(vec![line], None, track_ids));
+        }
+
         // Prefer richsync (word-level timing) if available
         if is_success(calls, "track.richsync.get")
             && let Some(richsync_body) = calls
                 .pointer("/track.richsync.get/message/body/richsync/richsync_body")
                 .and_then(|v| v.as_str())
-            && let Some(parsed) = crate::lyrics::parse::parse_richsync_body(richsync_body)
+            && let Some(mut parsed) = crate::lyrics::parse::parse_richsync_body(richsync_body)
         {
+            crate::lyrics::romanize::apply_romanization(&mut parsed);
             return Ok(FetchOutcome::Success(
                 parsed,
                 Some(richsync_body.to_string()),
@@ -106,8 +150,9 @@ pub(crate) async fn try_macro_for_lyrics(
             && let Some(subtitle_body) = calls
                 .pointer("/track.subtitles.get/message/body/subtitle_list/0/subtitle/subtitle_body")
                 .and_then(|v| v.as_str())
-            && let Some(parsed) = crate::lyrics::parse::parse_subtitle_body(subtitle_body)
+            && let Some(mut parsed) = crate::lyrics::parse::parse_subtitle_body(subtitle_body)
         {
+            crate::lyrics::romanize::apply_romanization(&mut parsed);
             return Ok(FetchOutcome::Success(
                 parsed,
                 Some(subtitle_body.to_string()),
@@ -147,7 +192,7 @@ pub(crate) async fn fetch_lyrics_with_token(
             FetchOutcome::Success(parsed, raw, ids) => {
                 return Ok(FetchOutcome::Success(parsed, raw, ids));
             }
-            FetchOutcome::TokenError(reason) => return Ok(FetchOutcome::TokenError(reason)),
+            token_err @ FetchOutcome::TokenError { .. } => return Ok(token_err),
             FetchOutcome::TrackNotFound => {} // fall through to next lookup
         }
     }
@@ -165,7 +210,7 @@ pub(crate) async fn fetch_lyrics_with_token(
             FetchOutcome::Success(parsed, raw, ids) => {
                 return Ok(FetchOutcome::Success(parsed, raw, ids));
             }
-            FetchOutcome::TokenError(reason) => return Ok(FetchOutcome::TokenError(reason)),
+            token_err @ FetchOutcome::TokenError { .. } => return Ok(token_err),
             FetchOutcome::TrackNotFound => {} // fall through to next lookup
         }
     }
@@ -183,111 +228,90 @@ pub(crate) async fn fetch_lyrics_with_token(
             FetchOutcome::Success(parsed, raw, ids) => {
                 return Ok(FetchOutcome::Success(parsed, raw, ids));
             }
-            FetchOutcome::TokenError(reason) => return Ok(FetchOutcome::TokenError(reason)),
+            token_err @ FetchOutcome::TokenError { .. } => return Ok(token_err),
             FetchOutcome::TrackNotFound => {} // fall through to search
         }
     }
 
-    // Strategy 2: Use matcher.track.get for matching (musixmatch's own fuzzy matcher),
-    // then fetch lyrics via macro.subtitles.get with the matched commontrack_id.
-    let matcher_base = "https://apic-desktop.musixmatch.com/ws/1.1/matcher.track.get?format=json&app_id=web-desktop-app-v1.0&";
-    let mut matcher_params = vec![
-        format!("q_artist={}", urlencoding::encode(artist)),
-        format!("q_track={}", urlencoding::encode(title)),
-        format!("usertoken={}", urlencoding::encode(token)),
+    // Strategy 2: Query macro.subtitles.get directly with q_track, q_artist, q_album, q_duration.
+    // Musixmatch resolves matcher.track.get, track.richsync.get, and track.subtitles.get
+    // in a single macro call, cutting round-trips from 2 to 1.
+    let mut search_params = vec![
+        ("q_artist".to_string(), artist.to_string()),
+        ("q_track".to_string(), title.to_string()),
+        ("usertoken".to_string(), token.to_string()),
     ];
-
     if !album.is_empty() {
-        matcher_params.push(format!("q_album={}", urlencoding::encode(album)));
+        search_params.push(("q_album".to_string(), album.to_string()));
     }
     if let Some(d) = duration {
-        matcher_params.push(format!("q_duration={}", d.round() as i64));
+        search_params.push(("q_duration".to_string(), (d.round() as i64).to_string()));
     }
 
-    let matcher_url = matcher_base.to_string() + &matcher_params.join("&");
-    let matcher_resp = client
-        .get(&matcher_url)
-        .header("User-Agent", DEFAULT_USER_AGENT)
-        .header("Cookie", "x-mxm-token-guid=")
-        .send()
-        .await?;
+    try_macro_for_lyrics(client, &search_params).await
+}
 
-    let matcher_status = matcher_resp.status();
-    if is_token_error_status(matcher_status) {
-        return Ok(FetchOutcome::TokenError(format!(
-            "Matcher HTTP {matcher_status}"
-        )));
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    if matcher_status.is_server_error() {
-        return Err(LyricsError::Http(matcher_status.as_u16()));
-    }
-
-    if !matcher_status.is_success() {
-        return Ok(FetchOutcome::TrackNotFound);
-    }
-
-    let matcher_json: Value = matcher_resp.json().await?;
-    if let Some(code) = get_root_status_code(&matcher_json)
-        && is_token_error_code(code)
-    {
-        return Ok(FetchOutcome::TokenError(format!(
-            "Matcher API Status {}",
-            code
-        )));
-    }
-
-    let track = matcher_json.pointer("/message/body/track");
-    let Some(track) = track else {
-        return Ok(FetchOutcome::TrackNotFound);
-    };
-
-    // Extract track identifiers from the matcher response
-    let ids = extract_track_ids_from_json(track);
-
-    // Check if track is instrumental
-    if track
-        .get("instrumental")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        let line = LyricLine {
-            time: 0.0,
-            text: "♪ Instrumental ♪".to_string(),
-            words: None,
-        };
-        return Ok(FetchOutcome::Success(vec![line], None, ids));
-    }
-
-    // Check if track has lyrics before attempting to fetch them
-    if !track
-        .get("has_lyrics")
-        .and_then(|v| v.as_i64())
-        .map(|v| v == 1)
-        .unwrap_or(false)
-    {
-        return Ok(FetchOutcome::TrackNotFound);
-    }
-
-    // Fetch lyrics using commontrack_id from the matcher
-    if let Some(commontrack_id) = track.get("commontrack_id").and_then(|v| v.as_i64()) {
-        let mut params = vec![
-            ("commontrack_id".to_string(), commontrack_id.to_string()),
-            ("usertoken".to_string(), token.to_string()),
-        ];
-
-        if let Some(d) = duration {
-            params.push(("q_duration".to_string(), (d.round() as i64).to_string()));
-        }
-
-        match try_macro_for_lyrics(client, &params).await? {
-            FetchOutcome::Success(parsed, raw, _macro_ids) => {
-                return Ok(FetchOutcome::Success(parsed, raw, ids));
+    #[test]
+    fn test_evaluate_token_outcome_renewable() {
+        let json: Value = serde_json::from_str(
+            r#"{
+            "message": {
+                "header": {
+                    "status_code": 401,
+                    "hint": "renew"
+                }
             }
-            FetchOutcome::TokenError(reason) => return Ok(FetchOutcome::TokenError(reason)),
-            FetchOutcome::TrackNotFound => {}
-        }
+        }"#,
+        )
+        .unwrap();
+
+        let outcome = evaluate_token_outcome(reqwest::StatusCode::OK, Some(&json));
+        assert_eq!(
+            outcome,
+            Some(FetchOutcome::TokenError {
+                reason: "API Status 401 (hint: renew)".to_string(),
+                is_renewable: true,
+            })
+        );
     }
 
-    Ok(FetchOutcome::TrackNotFound)
+    #[test]
+    fn test_evaluate_token_outcome_throttled() {
+        let json: Value = serde_json::from_str(
+            r#"{
+            "message": {
+                "header": {
+                    "status_code": 429,
+                    "hint": "too_many_requests"
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let outcome = evaluate_token_outcome(reqwest::StatusCode::OK, Some(&json));
+        assert_eq!(
+            outcome,
+            Some(FetchOutcome::TokenError {
+                reason: "API Status 429 (hint: too_many_requests)".to_string(),
+                is_renewable: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_evaluate_token_outcome_http_fallback() {
+        let outcome = evaluate_token_outcome(reqwest::StatusCode::FORBIDDEN, None);
+        assert_eq!(
+            outcome,
+            Some(FetchOutcome::TokenError {
+                reason: "HTTP 403 Forbidden".to_string(),
+                is_renewable: false,
+            })
+        );
+    }
 }

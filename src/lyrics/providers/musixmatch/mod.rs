@@ -2,8 +2,11 @@
 //!
 //! Features:
 //! - Multi-tier usertoken engine (environment variables + dynamic token.get fallback + transparent error retry)
+//! - Disk-backed persistent dynamic token caching with automatic UpgradeOnly token rejection
+//! - Request pacing (1.5s) and 10-minute throttling cooldown gate to prevent IP bans
+//! - Header hint inspection differentiating between token expiration (`hint: renew`) and network throttling
+//! - Direct ID lookups (Spotify ID, ISRC, iTunes ID) and single-macro fuzzy track search
 //! - Richsync word-level timing and Subtitles line-level timing support
-//! - Direct ID lookups (Spotify ID, ISRC, iTunes ID) with matcher.track.get fallback
 
 pub mod extract;
 pub mod request;
@@ -21,9 +24,11 @@ use token::{TOKEN_MANAGER, fetch_fresh_musixmatch_token as get_fresh_token};
 /// Multi-tier token strategy:
 /// 1. Tries user-configured tokens from `MUSIXMATCH_USERTOKEN` env var in round-robin fashion.
 /// 2. If no env tokens are configured or all return token errors, automatically fetches
-///    an anonymous user token via `token.get`.
-/// 3. If a token error (401/402/403/429) occurs on the dynamic token, automatically
-///    requests a fresh token and retries once transparently.
+///    an anonymous user token via `token.get` (or reads from disk cache).
+/// 3. If a renewable token error (`401` with `hint: renew`) occurs on the dynamic token,
+///    automatically requests a fresh token and retries once transparently.
+/// 4. If throttled (`401` without renew hint, `402`, `403`, `429`), triggers a 10-minute
+///    cooldown period to prevent extended IP bans.
 pub async fn fetch_lyrics_from_musixmatch_usertoken(
     artist: &str,
     title: &str,
@@ -33,6 +38,12 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
     track_isrc: Option<&str>,
     track_itunes_id: Option<&str>,
 ) -> ProviderResult {
+    // Check rate-limiting gate (request pacing + 10-minute throttling cooldown)
+    if !token::wait_for_gate().await {
+        tracing::warn!("Musixmatch is currently under rate-limit cooldown; skipping request");
+        return Ok((Vec::new(), None, TrackMatchInfo::default()));
+    }
+
     let client = http_client();
     let env_token_count = {
         let manager = TOKEN_MANAGER.lock().ok();
@@ -81,12 +92,16 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
                 Ok(FetchOutcome::TrackNotFound) => {
                     return Ok((Vec::new(), None, TrackMatchInfo::default()));
                 }
-                Ok(FetchOutcome::TokenError(reason)) => {
+                Ok(FetchOutcome::TokenError {
+                    reason,
+                    is_renewable,
+                }) => {
                     non_network_outcomes += 1;
                     tracing::warn!(
                         attempt = attempts,
                         total = env_token_count,
                         reason = %reason,
+                        is_renewable = is_renewable,
                         "Musixmatch env token error, attempting fallback to next token"
                     );
                 }
@@ -121,12 +136,12 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
         return Err(e);
     }
 
-    // 2. Fallback to dynamic token (via token.get API)
+    // 2. Fallback to dynamic token (from memory/disk cache or via token.get API)
     let dynamic_token = {
         let cached = TOKEN_MANAGER
             .lock()
             .ok()
-            .and_then(|m| m.get_dynamic_token());
+            .and_then(|mut m| m.get_dynamic_token());
         match cached {
             Some(t) => {
                 tracing::debug!(
@@ -169,10 +184,22 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
     {
         Ok(FetchOutcome::Success(parsed, raw, ids)) => Ok((parsed, raw, ids)),
         Ok(FetchOutcome::TrackNotFound) => Ok((Vec::new(), None, TrackMatchInfo::default())),
-        Ok(FetchOutcome::TokenError(reason)) => {
+        Ok(FetchOutcome::TokenError {
+            reason,
+            is_renewable,
+        }) => {
+            if !is_renewable {
+                tracing::warn!(
+                    reason = %reason,
+                    "Musixmatch network/token is throttled; activating 10-minute cooldown"
+                );
+                token::trigger_gate_cooldown();
+                return Ok((Vec::new(), None, TrackMatchInfo::default()));
+            }
+
             tracing::warn!(
                 reason = %reason,
-                "Dynamic Musixmatch token error, requesting fresh token and retrying"
+                "Dynamic Musixmatch token expired (hint: renew), requesting fresh token and retrying"
             );
             // 3. Renew dynamic token and retry once
             match get_fresh_token(client).await {
@@ -194,9 +221,17 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
                     .await
                     {
                         Ok(FetchOutcome::Success(parsed, raw, ids)) => Ok((parsed, raw, ids)),
-                        // A freshly-issued token that is still rejected means the
-                        // account/endpoint itself refuses us - treat as a miss.
-                        Ok(_) => Ok((Vec::new(), None, TrackMatchInfo::default())),
+                        Ok(FetchOutcome::TokenError { reason, .. }) => {
+                            tracing::warn!(
+                                reason = %reason,
+                                "Freshly issued Musixmatch token was rejected; activating cooldown"
+                            );
+                            token::trigger_gate_cooldown();
+                            Ok((Vec::new(), None, TrackMatchInfo::default()))
+                        }
+                        Ok(FetchOutcome::TrackNotFound) => {
+                            Ok((Vec::new(), None, TrackMatchInfo::default()))
+                        }
                         Err(e) => Err(e),
                     }
                 }
