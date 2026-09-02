@@ -16,11 +16,17 @@ use tokio::sync::mpsc;
 /// Events originating from MPRIS player interface.
 #[derive(Debug, Clone)]
 pub enum MprisEvent {
-    /// Full player state update with metadata, position, service name, and optional playback status.
-    PlayerUpdate(TrackMetadata, f64, String, Option<String>),
+    /// Full player state update with metadata, position, service name, optional playback status, and sample timestamp.
+    PlayerUpdate(
+        TrackMetadata,
+        f64,
+        String,
+        Option<String>,
+        std::time::Instant,
+    ),
 
-    /// Seek event when user scrubs through track.
-    Seeked(TrackMetadata, f64, String),
+    /// Seek event when user scrubs through track with sample timestamp.
+    Seeked(TrackMetadata, f64, String, std::time::Instant),
 
     /// Position calibration event after transient buffering.
     Calibrated {

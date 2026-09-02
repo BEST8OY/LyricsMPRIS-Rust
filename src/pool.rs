@@ -202,6 +202,7 @@ async fn initialize_loop(
     if let Some(service) = active_service {
         tracing::debug!(service = %service, "Active player found");
         initialize_with_player(loop_state, &service, config, &event_tx).await;
+        send_update(&mut loop_state.state_bundle, update_tx, true).await;
     } else {
         tracing::debug!("No active player found");
         handle_no_player(loop_state, update_tx).await;
@@ -371,14 +372,14 @@ fn spawn_mpris_watcher(event_tx: mpsc::Sender<Event>, config: &LoopConfig) {
             let seek_tx = event_tx.clone();
             let calib_tx = event_tx.clone();
             let handler_result = MprisEventHandler::with_closures(
-                move |meta, pos, service, status| {
+                move |meta, pos, service, status, sampled_at| {
                     let _ = update_tx.try_send(Event::Mpris(Box::new(MprisEvent::PlayerUpdate(
-                        meta, pos, service, status,
+                        meta, pos, service, status, sampled_at,
                     ))));
                 },
-                move |meta, pos, service| {
+                move |meta, pos, service, sampled_at| {
                     let _ = seek_tx.try_send(Event::Mpris(Box::new(MprisEvent::Seeked(
-                        meta, pos, service,
+                        meta, pos, service, sampled_at,
                     ))));
                 },
                 move |pos, sampled_at| {

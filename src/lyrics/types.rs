@@ -6,7 +6,7 @@ use thiserror::Error;
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
         .user_agent("LyricsMPRIS/1.0")
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(4))
         .build()
         .expect("failed to build HTTP client")
 });

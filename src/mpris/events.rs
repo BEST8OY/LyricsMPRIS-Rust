@@ -121,16 +121,23 @@ pub trait MprisEventCallback: Send + 'static {
         position: f64,
         service: String,
         playback_status: Option<String>,
+        sampled_at: std::time::Instant,
     );
-    fn on_seek(&mut self, metadata: TrackMetadata, position: f64, service: String);
+    fn on_seek(
+        &mut self,
+        metadata: TrackMetadata,
+        position: f64,
+        service: String,
+        sampled_at: std::time::Instant,
+    );
     fn on_calibrate(&mut self, position: f64, sampled_at: std::time::Instant);
 }
 
 /// Simple callback implementation using closures
 pub struct ClosureCallback<F, G, H>
 where
-    F: FnMut(TrackMetadata, f64, String, Option<String>) + Send + 'static,
-    G: FnMut(TrackMetadata, f64, String) + Send + 'static,
+    F: FnMut(TrackMetadata, f64, String, Option<String>, std::time::Instant) + Send + 'static,
+    G: FnMut(TrackMetadata, f64, String, std::time::Instant) + Send + 'static,
     H: FnMut(f64, std::time::Instant) + Send + 'static,
 {
     on_track_change: F,
@@ -140,8 +147,8 @@ where
 
 impl<F, G, H> ClosureCallback<F, G, H>
 where
-    F: FnMut(TrackMetadata, f64, String, Option<String>) + Send + 'static,
-    G: FnMut(TrackMetadata, f64, String) + Send + 'static,
+    F: FnMut(TrackMetadata, f64, String, Option<String>, std::time::Instant) + Send + 'static,
+    G: FnMut(TrackMetadata, f64, String, std::time::Instant) + Send + 'static,
     H: FnMut(f64, std::time::Instant) + Send + 'static,
 {
     pub fn new(on_track_change: F, on_seek: G, on_calibrate: H) -> Self {
@@ -155,8 +162,8 @@ where
 
 impl<F, G, H> MprisEventCallback for ClosureCallback<F, G, H>
 where
-    F: FnMut(TrackMetadata, f64, String, Option<String>) + Send + 'static,
-    G: FnMut(TrackMetadata, f64, String) + Send + 'static,
+    F: FnMut(TrackMetadata, f64, String, Option<String>, std::time::Instant) + Send + 'static,
+    G: FnMut(TrackMetadata, f64, String, std::time::Instant) + Send + 'static,
     H: FnMut(f64, std::time::Instant) + Send + 'static,
 {
     fn on_track_change(
@@ -165,12 +172,19 @@ where
         position: f64,
         service: String,
         playback_status: Option<String>,
+        sampled_at: std::time::Instant,
     ) {
-        (self.on_track_change)(metadata, position, service, playback_status);
+        (self.on_track_change)(metadata, position, service, playback_status, sampled_at);
     }
 
-    fn on_seek(&mut self, metadata: TrackMetadata, position: f64, service: String) {
-        (self.on_seek)(metadata, position, service);
+    fn on_seek(
+        &mut self,
+        metadata: TrackMetadata,
+        position: f64,
+        service: String,
+        sampled_at: std::time::Instant,
+    ) {
+        (self.on_seek)(metadata, position, service, sampled_at);
     }
 
     fn on_calibrate(&mut self, position: f64, sampled_at: std::time::Instant) {
@@ -518,10 +532,12 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
     async fn handle_seek_signal(&mut self, position_microsecs: i64) {
         let position = position_microsecs as f64 / 1_000_000.0;
         self.state.position = position;
+        let sampled_at = std::time::Instant::now();
         self.callback.on_seek(
             self.state.track.clone(),
             position,
             self.state.service.clone(),
+            sampled_at,
         );
     }
 
@@ -540,11 +556,13 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                 self.state.position = microsecs as f64 / 1_000_000.0;
             }
 
+            let sampled_at = std::time::Instant::now();
             self.callback.on_track_change(
                 self.state.track.clone(),
                 self.state.position,
                 self.state.service.clone(),
                 Some(self.state.playback_status.clone()),
+                sampled_at,
             );
             Ok(true)
         } else {
@@ -574,11 +592,13 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             let position = self.state.position;
 
             // Notify about the playback status change
+            let sampled_at = std::time::Instant::now();
             self.callback.on_track_change(
                 self.state.track.clone(),
                 position,
                 self.state.service.clone(),
                 Some(status),
+                sampled_at,
             );
             Ok(true)
         } else {
@@ -690,11 +710,13 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             position,
         };
 
+        let sampled_at = std::time::Instant::now();
         self.callback.on_track_change(
             metadata,
             position,
             service.to_string(),
             Some(playback_status),
+            sampled_at,
         );
 
         Ok(())
@@ -702,16 +724,22 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
 
     fn deactivate_player(&mut self) {
         self.state.clear();
-        self.callback
-            .on_track_change(TrackMetadata::default(), 0.0, String::new(), None);
+        let sampled_at = std::time::Instant::now();
+        self.callback.on_track_change(
+            TrackMetadata::default(),
+            0.0,
+            String::new(),
+            None,
+            sampled_at,
+        );
     }
 }
 
 // Convenience constructor for closure-based callbacks
 impl<F, G, H> MprisEventHandler<ClosureCallback<F, G, H>>
 where
-    F: FnMut(TrackMetadata, f64, String, Option<String>) + Send + 'static,
-    G: FnMut(TrackMetadata, f64, String) + Send + 'static,
+    F: FnMut(TrackMetadata, f64, String, Option<String>, std::time::Instant) + Send + 'static,
+    G: FnMut(TrackMetadata, f64, String, std::time::Instant) + Send + 'static,
     H: FnMut(f64, std::time::Instant) + Send + 'static,
 {
     /// Create an event handler with closure-based callbacks

@@ -43,9 +43,11 @@ pub(crate) async fn handle_mpris_event(
     update_tx: &mpsc::Sender<Update>,
     providers: &[String],
 ) -> RetryDirective {
-    let (meta, position, service, event_status, is_full_update) = match event {
-        MprisEvent::PlayerUpdate(m, p, s, status) => (m, p, s, status, true),
-        MprisEvent::Seeked(m, p, s) => (m, p, s, None, false),
+    let (meta, position, service, event_status, sampled_at, is_full_update) = match event {
+        MprisEvent::PlayerUpdate(m, p, s, status, sampled_at) => {
+            (m, p, s, status, sampled_at, true)
+        }
+        MprisEvent::Seeked(m, p, s, sampled_at) => (m, p, s, None, sampled_at, false),
         MprisEvent::UpgradeLyrics {
             meta,
             lines,
@@ -97,6 +99,17 @@ pub(crate) async fn handle_mpris_event(
             return RetryDirective::Keep;
         }
     };
+
+    // Discard any event (PlayerUpdate or Seeked) that was sampled before current lyrics were loaded
+    if let Some(loaded_at) = state.lyrics_loaded_at
+        && sampled_at < loaded_at
+    {
+        tracing::debug!(
+            position,
+            "Discarding stale MPRIS event sampled before lyrics were loaded"
+        );
+        return RetryDirective::Keep;
+    }
 
     // No active player: clear state and notify UI
     if service.is_empty() {
@@ -157,15 +170,19 @@ pub(crate) async fn handle_mpris_event(
             }
         }
 
-        // Legitimate seek event - update position immediately
+        // Legitimate seek event - update position immediately with queue latency compensation
+        let queue_latency = sampled_at.elapsed().as_secs_f64();
+        let effective_position = position + queue_latency;
         let playing = state.player_state.playing;
-        state.update_playback_and_position(playing, position);
+        state.update_playback_and_position(playing, effective_position);
         send_update(state, update_tx, true).await;
         return RetryDirective::Keep;
     }
 
-    // Position/playback state update (for full updates)
-    handle_state_update(position, playback_status, state, update_tx).await;
+    // Position/playback state update (for full updates) with queue latency compensation
+    let queue_latency = sampled_at.elapsed().as_secs_f64();
+    let effective_position = position + queue_latency;
+    handle_state_update(effective_position, playback_status, state, update_tx).await;
     RetryDirective::Keep
 }
 
@@ -238,16 +255,15 @@ pub(crate) async fn handle_state_update(
         .map(|s| s == "Playing")
         .unwrap_or(state.player_state.playing);
 
-    // Guard: when transitioning to paused (or already paused), if the incoming position is 0.0
-    // (or uninitialized/unsupported by player) while our estimated playback position was already
-    // active past 1.0s, retain our estimated position instead of resetting to the start of the song.
-    let effective_position = if !playing && position <= 0.0 {
+    // Guard: ignore 0.0s (or near-zero) position reports while playback is already active past 1.0s,
+    // whether playing or paused, avoiding retrograde desyncs from stale buffering events.
+    let effective_position = if position <= 0.05 {
         let current_pos = state.player_state.estimate_position();
         if current_pos > 1.0 {
             tracing::debug!(
                 estimated = current_pos,
                 incoming = position,
-                "Retaining estimated position on pause instead of zero"
+                "Ignoring 0.0s position report while track is already active at {current_pos}s"
             );
             current_pos
         } else {
@@ -452,5 +468,75 @@ mod tests {
         // No update sent because track didn't match
         assert!(rx.try_recv().is_err());
         assert_eq!(state.lyric_state.lines[0].text, "New track line");
+    }
+
+    #[tokio::test]
+    async fn test_discard_stale_player_update_sampled_before_lyrics_loaded() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let (event_tx, _event_rx) = mpsc::channel(32);
+        let mut state = StateBundle::new();
+
+        let mut meta = TrackMetadata::default();
+        meta.title = "Song".into();
+        meta.artist = "Artist".into();
+        state.player_state.update_from_metadata(&meta);
+        state.player_state.update_playback_dbus(true, 18.0);
+
+        let lines = vec![
+            crate::lyrics::LyricLine::new(5.0, "Line 1"),
+            crate::lyrics::LyricLine::new(15.0, "Line 2"),
+        ];
+        state.update_lyrics(lines, &meta, None, None);
+        // Lyrics loaded at current instant
+        let load_time = std::time::Instant::now();
+        state.lyrics_loaded_at = Some(load_time);
+        state.mark_state_sent();
+
+        // Stale PlayerUpdate sampled 200ms BEFORE lyrics were loaded
+        let stale_sample = load_time - std::time::Duration::from_millis(200);
+        let directive = handle_mpris_event(
+            MprisEvent::PlayerUpdate(
+                meta.clone(),
+                0.0, // Stale 0.0s position from track start
+                "org.mpris.MediaPlayer2.spotify".into(),
+                Some("Playing".into()),
+                stale_sample,
+            ),
+            &mut state,
+            &event_tx,
+            &tx,
+            &[],
+        )
+        .await;
+
+        assert!(matches!(directive, RetryDirective::Keep));
+        // Stale update must be discarded; no update sent to UI, position remains active
+        assert!(rx.try_recv().is_err());
+        assert!(state.player_state.estimate_position() >= 17.5);
+    }
+
+    #[tokio::test]
+    async fn test_playing_ignores_zero_position_reset() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut state = StateBundle::new();
+
+        let lines = vec![
+            crate::lyrics::LyricLine::new(10.0, "Line 1"),
+            crate::lyrics::LyricLine::new(20.0, "Line 2"),
+        ];
+        state.lyric_state.update_lines(lines);
+        state.player_state.update_playback_dbus(true, 15.0);
+        state.update_index(15.0);
+        state.mark_state_sent();
+
+        // While playing at 15.0s, an erroneous 0.0s position update arrives
+        handle_state_update(0.0, Some("Playing".to_string()), &mut state, &tx).await;
+
+        // Should ignore 0.0s and retain ~15.0s
+        assert!(state.player_state.estimate_position() >= 14.5);
+        if let Ok(update) = rx.try_recv() {
+            assert!(update.position >= 14.5);
+            assert_eq!(update.index, Some(0));
+        }
     }
 }
