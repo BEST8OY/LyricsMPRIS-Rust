@@ -23,7 +23,17 @@ pub enum MprisEvent {
     Seeked(TrackMetadata, f64, String),
 
     /// Position calibration event after transient buffering.
-    Calibrated { position: f64 },
+    Calibrated {
+        position: f64,
+        sampled_at: std::time::Instant,
+    },
+
+    /// Background upgrade of lyrics format (e.g. line-level to Richsync karaoke).
+    UpgradeLyrics {
+        meta: TrackMetadata,
+        lines: Vec<crate::lyrics::LyricLine>,
+        format: crate::lyrics::database::LyricsFormat,
+    },
 }
 
 /// Top-level events processed by the main event loop.
@@ -55,11 +65,14 @@ pub async fn send_update(state: &mut StateBundle, update_tx: &mpsc::Sender<Updat
 pub async fn process_event(
     event: Event,
     state: &mut StateBundle,
+    event_tx: &mpsc::Sender<Event>,
     update_tx: &mpsc::Sender<Update>,
     providers: &[String],
 ) -> RetryDirective {
     match event {
-        Event::Mpris(ev) => handlers::handle_mpris_event(*ev, state, update_tx, providers).await,
+        Event::Mpris(ev) => {
+            handlers::handle_mpris_event(*ev, state, event_tx, update_tx, providers).await
+        }
         Event::Shutdown => {
             send_update(state, update_tx, true).await;
             RetryDirective::Clear

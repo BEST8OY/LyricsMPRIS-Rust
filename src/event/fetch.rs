@@ -191,8 +191,12 @@ pub(crate) fn determine_musixmatch_provider(lines: &[crate::lyrics::LyricLine]) 
 }
 
 /// Attempts to fetch lyrics from the database cache.
-pub(crate) async fn try_database(meta: &TrackMetadata, state: &mut StateBundle) -> bool {
-    let Some((db_result, format)) = crate::lyrics::database::fetch_from_database(
+/// Returns Some(LyricsFormat) if lyrics were successfully loaded.
+pub(crate) async fn try_database(
+    meta: &TrackMetadata,
+    state: &mut StateBundle,
+) -> Option<crate::lyrics::database::LyricsFormat> {
+    let (db_result, format) = crate::lyrics::database::fetch_from_database(
         &meta.artist,
         &meta.title,
         &meta.album,
@@ -201,10 +205,7 @@ pub(crate) async fn try_database(meta: &TrackMetadata, state: &mut StateBundle) 
         meta.spotify_id.as_deref(),
         meta.itunes_id.as_deref(),
     )
-    .await
-    else {
-        return false;
-    };
+    .await?;
 
     match db_result {
         Ok((lines, _raw, _ids)) if !lines.is_empty() => {
@@ -216,10 +217,11 @@ pub(crate) async fn try_database(meta: &TrackMetadata, state: &mut StateBundle) 
                 title = %meta.title,
                 artist = %meta.artist,
                 lines = line_count,
+                format = ?format,
                 "Database cache hit"
             );
 
-            true
+            Some(format)
         }
         Ok(_) => {
             tracing::debug!(
@@ -227,7 +229,7 @@ pub(crate) async fn try_database(meta: &TrackMetadata, state: &mut StateBundle) 
                 artist = %meta.artist,
                 "Empty lyrics in database cache"
             );
-            false
+            None
         }
         Err(e) => {
             tracing::warn!(
@@ -236,22 +238,45 @@ pub(crate) async fn try_database(meta: &TrackMetadata, state: &mut StateBundle) 
                 error = %e,
                 "Failed to parse cached lyrics"
             );
-            false
+            None
         }
     }
 }
 
-/// Fetches lyrics from all configured providers in order.
+/// Fetches lyrics from all configured providers.
 ///
-/// Returns a [`FetchSummary`] describing whether the fetch succeeded, hit a
-/// definitive dead end, or failed transiently (worth retrying later).
+/// Implements Instant Stale-While-Revalidate (SWR) cache emission: if lyrics are cached in SQLite,
+/// they are loaded and returned immediately (<1ms) without blocking the UI. If line-synced lyrics
+/// are cached and Musixmatch is configured, an asynchronous background task is spawned to upgrade
+/// the cache and UI to Richsync karaoke when available.
+///
+/// On cache miss, if both Musixmatch and LRCLIB are configured, concurrent hedged fetching is used
+/// to race the providers, displaying whichever lyrics arrive first and seamlessly hot-swapping to
+/// Richsync karaoke if Musixmatch finishes afterwards.
 pub(crate) async fn fetch_api_lyrics(
     meta: &TrackMetadata,
     state: &mut StateBundle,
     providers: &[String],
+    event_tx: &tokio::sync::mpsc::Sender<crate::event::Event>,
 ) -> FetchSummary {
-    if try_database(meta, state).await {
+    let db_format = try_database(meta, state).await;
+    if db_format == Some(crate::lyrics::database::LyricsFormat::Richsync) {
         return FetchSummary::Loaded;
+    }
+
+    // Instant SWR Cache Emission:
+    // If database already loaded line-level lyrics, return immediately so the UI displays them in <1ms!
+    // If musixmatch is enabled, spawn a background task to upgrade to Richsync karaoke asynchronously.
+    if db_format.is_some() {
+        if providers.iter().any(|p| p == "musixmatch") {
+            spawn_background_richsync_upgrade(meta.clone(), event_tx.clone());
+        }
+        return FetchSummary::Loaded;
+    }
+
+    // On cold cache miss: if both Musixmatch and LRCLIB are configured, use concurrent hedged fetching
+    if providers.iter().any(|p| p == "musixmatch") && providers.iter().any(|p| p == "lrclib") {
+        return fetch_concurrent_hedged(meta, state, event_tx).await;
     }
 
     let mut saw_transient = false;
@@ -291,6 +316,200 @@ pub(crate) async fn fetch_api_lyrics(
         state.update_lyrics(Vec::new(), meta, None, None);
         FetchSummary::Exhausted
     }
+}
+
+/// Races Musixmatch and LRCLIB concurrently with streaming hot-swap priority.
+async fn fetch_concurrent_hedged(
+    meta: &TrackMetadata,
+    state: &mut StateBundle,
+    event_tx: &tokio::sync::mpsc::Sender<crate::event::Event>,
+) -> FetchSummary {
+    let mut lrclib_fut = std::pin::pin!(crate::lyrics::fetch_lyrics_from_lrclib(
+        &meta.artist,
+        &meta.title,
+        &meta.album,
+        meta.length,
+    ));
+
+    let mut mxm_fut = std::pin::pin!(crate::lyrics::fetch_lyrics_from_musixmatch_usertoken(
+        &meta.artist,
+        &meta.title,
+        &meta.album,
+        meta.length,
+        meta.spotify_id.as_deref(),
+        meta.isrc.as_deref(),
+        meta.itunes_id.as_deref(),
+    ));
+
+    tokio::select! {
+        mxm_res = &mut mxm_fut => {
+            match mxm_res {
+                Ok((lines, raw, ids)) if !lines.is_empty() => {
+                    let format = if lines.iter().any(|l| l.words.is_some()) {
+                        crate::lyrics::database::LyricsFormat::Richsync
+                    } else {
+                        crate::lyrics::database::LyricsFormat::Subtitles
+                    };
+                    let provider = db_format_to_provider(format);
+                    state.update_lyrics(lines, meta, None, Some(provider));
+                    store_lyrics_in_cache(
+                        meta,
+                        raw,
+                        format,
+                        &ids.track_isrcs,
+                        &ids.track_spotify_ids,
+                        &ids.track_itunes_ids,
+                    )
+                    .await;
+                    FetchSummary::Loaded
+                }
+                _ => {
+                    // Musixmatch missed or errored; wait for in-flight LRCLIB
+                    match lrclib_fut.await {
+                        Ok((lines, raw, ids)) if !lines.is_empty() => {
+                            state.update_lyrics(lines, meta, None, Some(Provider::Lrclib));
+                            store_lyrics_in_cache(
+                                meta,
+                                raw,
+                                crate::lyrics::database::LyricsFormat::Lrclib,
+                                &ids.track_isrcs,
+                                &ids.track_spotify_ids,
+                                &ids.track_itunes_ids,
+                            )
+                            .await;
+                            FetchSummary::Loaded
+                        }
+                        Ok(_) => {
+                            state.update_lyrics(Vec::new(), meta, None, None);
+                            FetchSummary::Exhausted
+                        }
+                        Err(e) => {
+                            if matches!(classify_error(e), FetchResult::Transient) {
+                                state.update_lyrics(
+                                    Vec::new(),
+                                    meta,
+                                    Some(NETWORK_RETRY_MESSAGE.to_string()),
+                                    None,
+                                );
+                                FetchSummary::Unavailable
+                            } else {
+                                state.update_lyrics(Vec::new(), meta, None, None);
+                                FetchSummary::Exhausted
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        lrc_res = &mut lrclib_fut => {
+            match lrc_res {
+                Ok((lines, raw, ids)) if !lines.is_empty() => {
+                    // Display line lyrics instantly (~100-150ms)!
+                    state.update_lyrics(lines, meta, None, Some(Provider::Lrclib));
+                    store_lyrics_in_cache(
+                        meta,
+                        raw,
+                        crate::lyrics::database::LyricsFormat::Lrclib,
+                        &ids.track_isrcs,
+                        &ids.track_spotify_ids,
+                        &ids.track_itunes_ids,
+                    )
+                    .await;
+
+                    // Asynchronously check Musixmatch to upgrade to Richsync karaoke
+                    spawn_background_richsync_upgrade(meta.clone(), event_tx.clone());
+
+                    FetchSummary::Loaded
+                }
+                _ => {
+                    // LRCLIB missed or errored; wait for in-flight Musixmatch
+                    match mxm_fut.await {
+                        Ok((lines, raw, ids)) if !lines.is_empty() => {
+                            let format = if lines.iter().any(|l| l.words.is_some()) {
+                                crate::lyrics::database::LyricsFormat::Richsync
+                            } else {
+                                crate::lyrics::database::LyricsFormat::Subtitles
+                            };
+                            let provider = db_format_to_provider(format);
+                            state.update_lyrics(lines, meta, None, Some(provider));
+                            store_lyrics_in_cache(
+                                meta,
+                                raw,
+                                format,
+                                &ids.track_isrcs,
+                                &ids.track_spotify_ids,
+                                &ids.track_itunes_ids,
+                            )
+                            .await;
+                            FetchSummary::Loaded
+                        }
+                        Ok(_) => {
+                            state.update_lyrics(Vec::new(), meta, None, None);
+                            FetchSummary::Exhausted
+                        }
+                        Err(e) => {
+                            if matches!(classify_error(e), FetchResult::Transient) {
+                                state.update_lyrics(
+                                    Vec::new(),
+                                    meta,
+                                    Some(NETWORK_RETRY_MESSAGE.to_string()),
+                                    None,
+                                );
+                                FetchSummary::Unavailable
+                            } else {
+                                state.update_lyrics(Vec::new(), meta, None, None);
+                                FetchSummary::Exhausted
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Spawns a background task to check if Musixmatch has Richsync word-level karaoke,
+/// storing it in SQLite and notifying the event loop via `UpgradeLyrics` without blocking the UI.
+pub(crate) fn spawn_background_richsync_upgrade(
+    meta: TrackMetadata,
+    event_tx: tokio::sync::mpsc::Sender<crate::event::Event>,
+) {
+    tokio::spawn(async move {
+        if let Ok((lines, raw, ids)) = crate::lyrics::fetch_lyrics_from_musixmatch_usertoken(
+            &meta.artist,
+            &meta.title,
+            &meta.album,
+            meta.length,
+            meta.spotify_id.as_deref(),
+            meta.isrc.as_deref(),
+            meta.itunes_id.as_deref(),
+        )
+        .await
+        {
+            let is_richsync = lines.iter().any(|l| l.words.is_some());
+            if is_richsync {
+                store_lyrics_in_cache(
+                    &meta,
+                    raw,
+                    crate::lyrics::database::LyricsFormat::Richsync,
+                    &ids.track_isrcs,
+                    &ids.track_spotify_ids,
+                    &ids.track_itunes_ids,
+                )
+                .await;
+
+                let _ = event_tx
+                    .send(crate::event::Event::Mpris(Box::new(
+                        crate::event::MprisEvent::UpgradeLyrics {
+                            meta,
+                            lines,
+                            format: crate::lyrics::database::LyricsFormat::Richsync,
+                        },
+                    )))
+                    .await;
+            }
+        }
+    });
 }
 
 /// Fetches a fresh position from the player or estimates it.
@@ -335,11 +554,12 @@ pub async fn fetch_and_update_lyrics(
     state: &mut StateBundle,
     providers: &[String],
     service: Option<&str>,
+    event_tx: &tokio::sync::mpsc::Sender<crate::event::Event>,
 ) -> (f64, FetchSummary) {
     let position_before = state.player_state.estimate_position();
     let start_time = std::time::Instant::now();
 
-    let summary = fetch_api_lyrics(meta, state, providers).await;
+    let summary = fetch_api_lyrics(meta, state, providers, event_tx).await;
 
     let fetch_duration = start_time.elapsed();
     let position = fetch_fresh_position(service, state).await;
@@ -392,5 +612,39 @@ mod tests {
         assert!(!is_retryable_status(400));
         assert!(!is_retryable_status(401));
         assert!(!is_retryable_status(404));
+    }
+
+    #[test]
+    fn test_default_config_provider_order() {
+        let config = crate::Config::default();
+        assert_eq!(
+            config.providers.first().map(|s| s.as_str()),
+            Some("musixmatch")
+        );
+        assert_eq!(config.providers.get(1).map(|s| s.as_str()), Some("lrclib"));
+        assert!(!config.romanize);
+    }
+
+    #[test]
+    fn test_determine_musixmatch_provider_format() {
+        let plain_lines = vec![crate::lyrics::LyricLine::new(0.0, "hello")];
+        assert_eq!(
+            determine_musixmatch_provider(&plain_lines),
+            Provider::MusixmatchSubtitles
+        );
+
+        let word = crate::lyrics::types::WordTiming {
+            start: 0.0,
+            end: 1.0,
+            text: "hello".into(),
+            grapheme_boundaries: vec![0, 5],
+            grapheme_times: vec![],
+        };
+        let rich_lines =
+            vec![crate::lyrics::LyricLine::new(0.0, "hello").with_words(Some(vec![word]))];
+        assert_eq!(
+            determine_musixmatch_provider(&rich_lines),
+            Provider::MusixmatchRichsync
+        );
     }
 }

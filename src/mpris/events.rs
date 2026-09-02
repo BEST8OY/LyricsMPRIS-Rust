@@ -10,10 +10,22 @@ use std::time::Duration;
 use zbus::fdo::NameOwnerChangedStream;
 
 /// Tuning constants for transient buffering position calibration.
-pub const CALIBRATION_INITIAL_DELAY: Duration = Duration::from_millis(400);
-pub const CALIBRATION_POLL_INTERVAL: Duration = Duration::from_millis(800);
-pub const MAX_CALIBRATION_ATTEMPTS: u8 = 15;
-pub const MOVEMENT_DELTA_THRESHOLD_SECS: f64 = 0.08;
+pub const CALIBRATION_INITIAL_DELAY: Duration = Duration::from_millis(50);
+pub const CALIBRATION_CONFIRMATION_INTERVAL: Duration = Duration::from_millis(250);
+pub const MAX_CALIBRATION_ATTEMPTS: u8 = 10;
+pub const MOVEMENT_DELTA_THRESHOLD_SECS: f64 = 0.03;
+
+/// Returns the adaptive delay for buffering edge-detection probes.
+fn probe_delay(attempt: u8) -> Duration {
+    match attempt {
+        0 => CALIBRATION_INITIAL_DELAY,
+        1 => Duration::from_millis(100),
+        2 => Duration::from_millis(150),
+        3 => Duration::from_millis(250),
+        4 => Duration::from_millis(400),
+        _ => Duration::from_millis(600),
+    }
+}
 
 /// Transient calibration state machine for detecting when a player actually starts
 /// advancing audio position after buffering.
@@ -41,7 +53,7 @@ impl CalibrationTracker {
         self.attempts = 0;
         self.confirmed = false;
         self.anchor_pos = anchor_pos;
-        self.timer = Some(Box::pin(tokio::time::sleep(CALIBRATION_INITIAL_DELAY)));
+        self.timer = Some(Box::pin(tokio::time::sleep(probe_delay(0))));
     }
 
     fn disarm(&mut self) {
@@ -74,14 +86,16 @@ impl CalibrationTracker {
             if !self.confirmed {
                 // Audio started advancing; schedule 1 final confirmation check to lock in steady-state sync
                 self.confirmed = true;
-                self.timer = Some(Box::pin(tokio::time::sleep(CALIBRATION_POLL_INTERVAL)));
+                self.timer = Some(Box::pin(tokio::time::sleep(
+                    CALIBRATION_CONFIRMATION_INTERVAL,
+                )));
             } else {
                 // Steady-state verified: disarm calibration for the remainder of this track
                 self.disarm();
             }
         } else if self.attempts < MAX_CALIBRATION_ATTEMPTS {
-            // Still buffering (real_pos unchanged from anchor); retry
-            self.timer = Some(Box::pin(tokio::time::sleep(CALIBRATION_POLL_INTERVAL)));
+            // Still buffering (real_pos unchanged from anchor); adaptive probe
+            self.timer = Some(Box::pin(tokio::time::sleep(probe_delay(self.attempts))));
         } else {
             // Reached maximum attempts (slow network timeout): disarm
             self.disarm();
@@ -92,7 +106,7 @@ impl CalibrationTracker {
     fn on_error(&mut self) {
         self.attempts += 1;
         if self.attempts < MAX_CALIBRATION_ATTEMPTS {
-            self.timer = Some(Box::pin(tokio::time::sleep(CALIBRATION_POLL_INTERVAL)));
+            self.timer = Some(Box::pin(tokio::time::sleep(probe_delay(self.attempts))));
         } else {
             self.disarm();
         }
@@ -109,7 +123,7 @@ pub trait MprisEventCallback: Send + 'static {
         playback_status: Option<String>,
     );
     fn on_seek(&mut self, metadata: TrackMetadata, position: f64, service: String);
-    fn on_calibrate(&mut self, position: f64);
+    fn on_calibrate(&mut self, position: f64, sampled_at: std::time::Instant);
 }
 
 /// Simple callback implementation using closures
@@ -117,7 +131,7 @@ pub struct ClosureCallback<F, G, H>
 where
     F: FnMut(TrackMetadata, f64, String, Option<String>) + Send + 'static,
     G: FnMut(TrackMetadata, f64, String) + Send + 'static,
-    H: FnMut(f64) + Send + 'static,
+    H: FnMut(f64, std::time::Instant) + Send + 'static,
 {
     on_track_change: F,
     on_seek: G,
@@ -128,7 +142,7 @@ impl<F, G, H> ClosureCallback<F, G, H>
 where
     F: FnMut(TrackMetadata, f64, String, Option<String>) + Send + 'static,
     G: FnMut(TrackMetadata, f64, String) + Send + 'static,
-    H: FnMut(f64) + Send + 'static,
+    H: FnMut(f64, std::time::Instant) + Send + 'static,
 {
     pub fn new(on_track_change: F, on_seek: G, on_calibrate: H) -> Self {
         Self {
@@ -143,7 +157,7 @@ impl<F, G, H> MprisEventCallback for ClosureCallback<F, G, H>
 where
     F: FnMut(TrackMetadata, f64, String, Option<String>) + Send + 'static,
     G: FnMut(TrackMetadata, f64, String) + Send + 'static,
-    H: FnMut(f64) + Send + 'static,
+    H: FnMut(f64, std::time::Instant) + Send + 'static,
 {
     fn on_track_change(
         &mut self,
@@ -159,8 +173,8 @@ where
         (self.on_seek)(metadata, position, service);
     }
 
-    fn on_calibrate(&mut self, position: f64) {
-        (self.on_calibrate)(position);
+    fn on_calibrate(&mut self, position: f64, sampled_at: std::time::Instant) {
+        (self.on_calibrate)(position, sampled_at);
     }
 }
 
@@ -292,8 +306,9 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                         match proxy.position().await {
                             Ok(microsecs) => {
                                 let real_pos = microsecs as f64 / 1_000_000.0;
+                                let sampled_at = std::time::Instant::now();
                                 self.state.position = real_pos;
-                                self.callback.on_calibrate(real_pos);
+                                self.callback.on_calibrate(real_pos, sampled_at);
                                 tracker.on_step(real_pos);
                             }
                             Err(e) => {
@@ -552,19 +567,11 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             );
             self.state.playback_status = status.clone();
 
-            // When playing/resuming, fetch fresh uncached position from D-Bus.
-            // When pausing/stopping, retain current tracked position to avoid redundant queries.
-            let position = if self.state.playback_status == "Playing" {
-                if let Ok(microsecs) = proxy.position().await {
-                    let pos = microsecs as f64 / 1_000_000.0;
-                    self.state.position = pos;
-                    pos
-                } else {
-                    self.state.position
-                }
-            } else {
-                self.state.position
-            };
+            // Query fresh authoritative position from D-Bus on any status transition (Playing or Paused)
+            if let Ok(microsecs) = proxy.position().await {
+                self.state.position = microsecs as f64 / 1_000_000.0;
+            }
+            let position = self.state.position;
 
             // Notify about the playback status change
             self.callback.on_track_change(
@@ -705,7 +712,7 @@ impl<F, G, H> MprisEventHandler<ClosureCallback<F, G, H>>
 where
     F: FnMut(TrackMetadata, f64, String, Option<String>) + Send + 'static,
     G: FnMut(TrackMetadata, f64, String) + Send + 'static,
-    H: FnMut(f64) + Send + 'static,
+    H: FnMut(f64, std::time::Instant) + Send + 'static,
 {
     /// Create an event handler with closure-based callbacks
     pub async fn with_closures(

@@ -13,6 +13,7 @@ pub(crate) struct NewTrackContext<'a> {
     pub(crate) service: String,
     pub(crate) playback_status: Option<String>,
     pub(crate) state: &'a mut StateBundle,
+    pub(crate) event_tx: &'a mpsc::Sender<super::Event>,
     pub(crate) update_tx: &'a mpsc::Sender<Update>,
     pub(crate) providers: &'a [String],
 }
@@ -38,16 +39,58 @@ pub enum RetryDirective {
 pub(crate) async fn handle_mpris_event(
     event: MprisEvent,
     state: &mut StateBundle,
+    event_tx: &mpsc::Sender<super::Event>,
     update_tx: &mpsc::Sender<Update>,
     providers: &[String],
 ) -> RetryDirective {
     let (meta, position, service, event_status, is_full_update) = match event {
         MprisEvent::PlayerUpdate(m, p, s, status) => (m, p, s, status, true),
         MprisEvent::Seeked(m, p, s) => (m, p, s, None, false),
-        MprisEvent::Calibrated { position } => {
+        MprisEvent::UpgradeLyrics {
+            meta,
+            lines,
+            format,
+        } => {
+            if state.player_state.title == meta.title && state.player_state.artist == meta.artist {
+                let provider = super::fetch::db_format_to_provider(format);
+                state.update_lyrics(lines, &meta, None, Some(provider));
+                let current_pos = state.player_state.estimate_position();
+                state.update_index(current_pos);
+                send_update(state, update_tx, false).await;
+                tracing::info!(
+                    title = %meta.title,
+                    artist = %meta.artist,
+                    "Hot-swapped lyrics to Richsync karaoke"
+                );
+            }
+            return RetryDirective::Keep;
+        }
+        MprisEvent::Calibrated {
+            position,
+            sampled_at,
+        } => {
+            if !state.player_state.playing {
+                return RetryDirective::Keep;
+            }
+
+            // Discard calibration events that were captured before the current track's lyrics were loaded
+            if let Some(loaded_at) = state.lyrics_loaded_at
+                && sampled_at < loaded_at
+            {
+                tracing::debug!(
+                    position,
+                    "Discarding calibration event sampled before lyrics were loaded"
+                );
+                return RetryDirective::Keep;
+            }
+
+            // Compensate for any time the event spent waiting in the channel queue
+            let queue_latency = sampled_at.elapsed().as_secs_f64();
+            let effective_pos = position + queue_latency;
+
             let playing = state.player_state.playing;
             let (playing_changed, changed_index, position_jumped) =
-                state.update_playback_and_position(playing, position);
+                state.update_playback_and_position(playing, effective_pos);
             if playing_changed || changed_index || position_jumped {
                 send_update(state, update_tx, position_jumped).await;
             }
@@ -84,6 +127,7 @@ pub(crate) async fn handle_mpris_event(
             service,
             playback_status,
             state,
+            event_tx,
             update_tx,
             providers,
         })
@@ -139,17 +183,26 @@ pub(crate) async fn handle_no_player(state: &mut StateBundle, update_tx: &mpsc::
 pub(crate) async fn handle_new_track(ctx: NewTrackContext<'_>) -> RetryDirective {
     let NewTrackContext {
         meta,
-        position: _event_position, // Ignored - often stale from previous track
+        position: event_position,
         service,
         playback_status,
         state,
+        event_tx,
         update_tx,
         providers,
     } = ctx;
 
     state.clear_lyrics();
     state.player_state.update_from_metadata(&meta);
-    state.player_state.set_position(0.0);
+
+    // If starting mid-track (> 0.5s), lock to actual playback position immediately;
+    // otherwise initialize to 0.0 for start-of-track buffering alignment.
+    let initial_pos = if event_position > 0.5 {
+        event_position
+    } else {
+        0.0
+    };
+    state.player_state.set_position(initial_pos);
 
     if let Some(status) = playback_status {
         let playing = status == "Playing";
@@ -162,7 +215,8 @@ pub(crate) async fn handle_new_track(ctx: NewTrackContext<'_>) -> RetryDirective
 
     send_update(state, update_tx, true).await;
 
-    let (_, summary) = fetch_and_update_lyrics(&meta, state, providers, Some(&service)).await;
+    let (_, summary) =
+        fetch_and_update_lyrics(&meta, state, providers, Some(&service), event_tx).await;
 
     send_update(state, update_tx, true).await;
 
@@ -180,11 +234,31 @@ pub(crate) async fn handle_state_update(
     update_tx: &mpsc::Sender<Update>,
 ) {
     let playing = playback_status
+        .as_deref()
         .map(|s| s == "Playing")
         .unwrap_or(state.player_state.playing);
 
+    // Guard: when transitioning to paused (or already paused), if the incoming position is 0.0
+    // (or uninitialized/unsupported by player) while our estimated playback position was already
+    // active past 1.0s, retain our estimated position instead of resetting to the start of the song.
+    let effective_position = if !playing && position <= 0.0 {
+        let current_pos = state.player_state.estimate_position();
+        if current_pos > 1.0 {
+            tracing::debug!(
+                estimated = current_pos,
+                incoming = position,
+                "Retaining estimated position on pause instead of zero"
+            );
+            current_pos
+        } else {
+            position
+        }
+    } else {
+        position
+    };
+
     let (playing_changed, changed_index, position_jumped) =
-        state.update_playback_and_position(playing, position);
+        state.update_playback_and_position(playing, effective_position);
 
     if playing_changed || changed_index || position_jumped {
         send_update(state, update_tx, position_jumped).await;
@@ -209,16 +283,8 @@ mod tests {
         let mut state = StateBundle::new();
 
         let lines = vec![
-            crate::lyrics::LyricLine {
-                time: 10.0,
-                text: "Line 1".to_string(),
-                words: None,
-            },
-            crate::lyrics::LyricLine {
-                time: 50.0,
-                text: "Line 2".to_string(),
-                words: None,
-            },
+            crate::lyrics::LyricLine::new(10.0, "Line 1"),
+            crate::lyrics::LyricLine::new(50.0, "Line 2"),
         ];
         state.lyric_state.update_lines(lines);
         state.player_state.update_playback_dbus(true, 45.0);
@@ -239,26 +305,23 @@ mod tests {
         let mut state = StateBundle::new();
 
         let lines = vec![
-            crate::lyrics::LyricLine {
-                time: 5.0,
-                text: "Line 1".to_string(),
-                words: None,
-            },
-            crate::lyrics::LyricLine {
-                time: 15.0,
-                text: "Line 2".to_string(),
-                words: None,
-            },
+            crate::lyrics::LyricLine::new(5.0, "Line 1"),
+            crate::lyrics::LyricLine::new(15.0, "Line 2"),
         ];
         state.lyric_state.update_lines(lines);
         state.player_state.update_playback_dbus(true, 0.0);
         state.update_index(0.0);
         state.mark_state_sent();
 
+        let (event_tx, _event_rx) = mpsc::channel(32);
         // Calibration moves position to 6.0s (Line 1 active)
         let directive = handle_mpris_event(
-            MprisEvent::Calibrated { position: 6.0 },
+            MprisEvent::Calibrated {
+                position: 6.0,
+                sampled_at: std::time::Instant::now(),
+            },
             &mut state,
+            &event_tx,
             &tx,
             &[],
         )
@@ -268,5 +331,126 @@ mod tests {
         let update = rx.recv().await.expect("Calibration update should be sent");
         assert_eq!(update.index, Some(0));
         assert!((update.position - 6.0).abs() < 0.1);
+    }
+
+    #[tokio::test]
+    async fn test_pause_retains_position_when_incoming_is_zero() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut state = StateBundle::new();
+
+        let lines = vec![
+            crate::lyrics::LyricLine::new(10.0, "Line 1"),
+            crate::lyrics::LyricLine::new(50.0, "Line 2"),
+        ];
+        state.lyric_state.update_lines(lines);
+        state.player_state.update_playback_dbus(true, 45.0);
+        state.update_index(45.0);
+        state.mark_state_sent();
+
+        // Pause occurs, but player erroneously reports position 0.0
+        handle_state_update(0.0, Some("Paused".to_string()), &mut state, &tx).await;
+
+        let update = rx.recv().await.expect("Pause update should be sent");
+        assert!(!update.playing);
+        // Should NOT reset to 0.0; should retain ~45.0s and active line 0
+        assert_eq!(update.index, Some(0));
+        assert!((update.position - 45.0).abs() < 0.5);
+    }
+
+    #[tokio::test]
+    async fn test_upgrade_lyrics_hotswap_current_track() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let (event_tx, _event_rx) = mpsc::channel(32);
+        let mut state = StateBundle::new();
+
+        let mut meta = TrackMetadata::default();
+        meta.title = "Current Song".into();
+        meta.artist = "Current Artist".into();
+        state.player_state.update_from_metadata(&meta);
+        state.player_state.update_playback_dbus(true, 12.0);
+
+        let initial_lines = vec![
+            crate::lyrics::LyricLine::new(5.0, "Old line 1"),
+            crate::lyrics::LyricLine::new(15.0, "Old line 2"),
+        ];
+        state.lyric_state.update_lines(initial_lines);
+        state.update_index(12.0);
+        state.mark_state_sent();
+
+        // An UpgradeLyrics event arrives for the currently playing track
+        let rich_word = crate::lyrics::types::WordTiming {
+            start: 10.0,
+            end: 14.0,
+            text: "Karaoke".into(),
+            grapheme_boundaries: vec![0, 7],
+            grapheme_times: vec![],
+        };
+        let upgraded_lines = vec![
+            crate::lyrics::LyricLine::new(5.0, "Upgraded line 1"),
+            crate::lyrics::LyricLine::new(10.0, "Karaoke line 2").with_words(Some(vec![rich_word])),
+        ];
+
+        let directive = handle_mpris_event(
+            MprisEvent::UpgradeLyrics {
+                meta: meta.clone(),
+                lines: upgraded_lines,
+                format: crate::lyrics::database::LyricsFormat::Richsync,
+            },
+            &mut state,
+            &event_tx,
+            &tx,
+            &[],
+        )
+        .await;
+
+        assert!(matches!(directive, RetryDirective::Keep));
+        let update = rx.recv().await.expect("Hot-swap update should be sent");
+        assert_eq!(
+            update.provider,
+            Some(crate::state::Provider::MusixmatchRichsync)
+        );
+        assert_eq!(state.lyric_state.lines.len(), 2);
+        assert_eq!(state.lyric_state.lines[1].text, "Karaoke line 2");
+        assert!(state.lyric_state.lines[1].words.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_upgrade_lyrics_ignores_stale_track() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let (event_tx, _event_rx) = mpsc::channel(32);
+        let mut state = StateBundle::new();
+
+        // Player is now on Track B
+        let mut current_meta = TrackMetadata::default();
+        current_meta.title = "New Song".into();
+        current_meta.artist = "New Artist".into();
+        state.player_state.update_from_metadata(&current_meta);
+        let initial_lines = vec![crate::lyrics::LyricLine::new(0.0, "New track line")];
+        state.lyric_state.update_lines(initial_lines);
+        state.mark_state_sent();
+
+        // Stale upgrade event arrives for Track A
+        let mut old_meta = TrackMetadata::default();
+        old_meta.title = "Old Song".into();
+        old_meta.artist = "Old Artist".into();
+        let old_lines = vec![crate::lyrics::LyricLine::new(0.0, "Stale line")];
+
+        let directive = handle_mpris_event(
+            MprisEvent::UpgradeLyrics {
+                meta: old_meta,
+                lines: old_lines,
+                format: crate::lyrics::database::LyricsFormat::Richsync,
+            },
+            &mut state,
+            &event_tx,
+            &tx,
+            &[],
+        )
+        .await;
+
+        assert!(matches!(directive, RetryDirective::Keep));
+        // No update sent because track didn't match
+        assert!(rx.try_recv().is_err());
+        assert_eq!(state.lyric_state.lines[0].text, "New track line");
     }
 }

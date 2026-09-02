@@ -89,7 +89,7 @@ impl LoopConfig {
     /// If no providers are specified, defaults to ["lrclib", "musixmatch"].
     fn new(mut config: crate::Config) -> Self {
         let providers = if config.providers.is_empty() {
-            vec!["lrclib".to_string(), "musixmatch".to_string()]
+            vec!["musixmatch".to_string(), "lrclib".to_string()]
         } else {
             std::mem::take(&mut config.providers)
         };
@@ -165,9 +165,17 @@ pub async fn listen(
     let loop_config = LoopConfig::new(config);
     let mut loop_state = LoopState::new();
 
-    let event_rx = initialize_loop(&mut loop_state, &update_tx, &loop_config).await;
+    let (event_tx, event_rx) = initialize_loop(&mut loop_state, &update_tx, &loop_config).await;
 
-    run_event_loop(loop_state, event_rx, update_tx, shutdown_rx, loop_config).await;
+    run_event_loop(
+        loop_state,
+        event_tx,
+        event_rx,
+        update_tx,
+        shutdown_rx,
+        loop_config,
+    )
+    .await;
 }
 
 /// Initializes the event loop infrastructure.
@@ -185,7 +193,7 @@ async fn initialize_loop(
     loop_state: &mut LoopState,
     update_tx: &mpsc::Sender<Update>,
     config: &LoopConfig,
-) -> mpsc::Receiver<Event> {
+) -> (mpsc::Sender<Event>, mpsc::Receiver<Event>) {
     tracing::debug!("Initializing event loop");
     let (event_tx, event_rx) = mpsc::channel::<Event>(16);
 
@@ -193,29 +201,35 @@ async fn initialize_loop(
 
     if let Some(service) = active_service {
         tracing::debug!(service = %service, "Active player found");
-        initialize_with_player(loop_state, &service, config).await;
+        initialize_with_player(loop_state, &service, config, &event_tx).await;
     } else {
         tracing::debug!("No active player found");
         handle_no_player(loop_state, update_tx).await;
     }
 
-    spawn_mpris_watcher(event_tx, config);
+    spawn_mpris_watcher(event_tx.clone(), config);
 
-    event_rx
+    (event_tx, event_rx)
 }
 
 /// Initializes state with an active player.
 ///
 /// Fetches initial metadata and lyrics for the current track. If providers
 /// were unreachable, schedules a background retry on the loop state.
-async fn initialize_with_player(loop_state: &mut LoopState, service: &str, config: &LoopConfig) {
+async fn initialize_with_player(
+    loop_state: &mut LoopState,
+    service: &str,
+    config: &LoopConfig,
+    event_tx: &mpsc::Sender<Event>,
+) {
     tracing::debug!(
         service = %service,
         providers = ?config.providers(),
         "Initializing with active player"
     );
     let initial_metadata = fetch_initial_metadata(service, config).await;
-    let summary = initialize_lyrics_state(loop_state, &initial_metadata, service, config).await;
+    let summary =
+        initialize_lyrics_state(loop_state, &initial_metadata, service, config, event_tx).await;
 
     if summary == FetchSummary::Unavailable {
         tracing::info!(
@@ -301,6 +315,7 @@ async fn initialize_lyrics_state(
     metadata: &TrackMetadata,
     service: &str,
     config: &LoopConfig,
+    event_tx: &mpsc::Sender<Event>,
 ) -> FetchSummary {
     tracing::debug!(
         title = %metadata.title,
@@ -314,6 +329,7 @@ async fn initialize_lyrics_state(
         &mut loop_state.state_bundle,
         config.providers(),
         Some(service),
+        event_tx,
     )
     .await;
 
@@ -365,9 +381,10 @@ fn spawn_mpris_watcher(event_tx: mpsc::Sender<Event>, config: &LoopConfig) {
                         meta, pos, service,
                     ))));
                 },
-                move |pos| {
+                move |pos, sampled_at| {
                     let _ = calib_tx.try_send(Event::Mpris(Box::new(MprisEvent::Calibrated {
                         position: pos,
+                        sampled_at,
                     })));
                 },
                 block_list.clone(),
@@ -419,6 +436,7 @@ fn spawn_mpris_watcher(event_tx: mpsc::Sender<Event>, config: &LoopConfig) {
 /// All event handlers are designed to never panic, ensuring graceful degradation.
 async fn run_event_loop(
     mut loop_state: LoopState,
+    event_tx: mpsc::Sender<Event>,
     mut event_rx: mpsc::Receiver<Event>,
     update_tx: mpsc::Sender<Update>,
     mut shutdown_rx: mpsc::Receiver<()>,
@@ -428,7 +446,7 @@ async fn run_event_loop(
         tokio::select! {
             // Shutdown signal received - clean up and terminate
             _ = shutdown_rx.recv() => {
-                handle_shutdown(&mut loop_state, &update_tx, &config).await;
+                handle_shutdown(&mut loop_state, &event_tx, &update_tx, &config).await;
                 break;
             }
 
@@ -436,7 +454,7 @@ async fn run_event_loop(
             event = event_rx.recv() => {
                 if let Some(ev) = event {
                     let directive =
-                        handle_event(ev, &mut loop_state, &update_tx, &config).await;
+                        handle_event(ev, &mut loop_state, &event_tx, &update_tx, &config).await;
                     apply_retry_directive(&mut loop_state, directive);
                 } else {
                     tracing::warn!("MPRIS event channel closed, terminating event loop");
@@ -451,7 +469,7 @@ async fn run_event_loop(
                     None => futures_util::future::pending().await,
                 }
             } => {
-                handle_retry_tick(&mut loop_state, &update_tx, &config).await;
+                handle_retry_tick(&mut loop_state, &event_tx, &update_tx, &config).await;
             }
         }
     }
@@ -485,6 +503,7 @@ fn apply_retry_directive(loop_state: &mut LoopState, directive: RetryDirective) 
 /// (capped at [`RETRY_MAX_DELAY`]); otherwise the retry is retired.
 async fn handle_retry_tick(
     loop_state: &mut LoopState,
+    event_tx: &mpsc::Sender<Event>,
     update_tx: &mpsc::Sender<Update>,
     config: &LoopConfig,
 ) {
@@ -514,6 +533,7 @@ async fn handle_retry_tick(
         &mut loop_state.state_bundle,
         config.providers(),
         Some(&pending.service),
+        event_tx,
     )
     .await;
 
@@ -542,6 +562,7 @@ async fn handle_retry_tick(
 /// Sends a final update to observers before terminating.
 async fn handle_shutdown(
     loop_state: &mut LoopState,
+    event_tx: &mpsc::Sender<Event>,
     update_tx: &mpsc::Sender<Update>,
     config: &LoopConfig,
 ) {
@@ -549,6 +570,7 @@ async fn handle_shutdown(
     process_event(
         Event::Shutdown,
         &mut loop_state.state_bundle,
+        event_tx,
         update_tx,
         config.providers(),
     )
@@ -559,12 +581,14 @@ async fn handle_shutdown(
 async fn handle_event(
     event: Event,
     loop_state: &mut LoopState,
+    event_tx: &mpsc::Sender<Event>,
     update_tx: &mpsc::Sender<Update>,
     config: &LoopConfig,
 ) -> RetryDirective {
     process_event(
         event,
         &mut loop_state.state_bundle,
+        event_tx,
         update_tx,
         config.providers(),
     )
