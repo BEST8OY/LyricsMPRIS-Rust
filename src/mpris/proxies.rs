@@ -20,6 +20,15 @@ pub trait MediaPlayer2Player {
     #[zbus(property)]
     fn playback_status(&self) -> zbus::Result<String>;
 
+    #[zbus(property)]
+    fn rate(&self) -> zbus::Result<f64>;
+
+    /// Dynamic position queries: `emits_changed_signal = "false"` disables property caching
+    /// in zbus 5, omitting cached_position() and causing proxy.position().await to always
+    /// issue a live D-Bus Get call without separate proxies or raw connection calls.
+    #[zbus(property(emits_changed_signal = "false"))]
+    fn position(&self) -> zbus::Result<i64>;
+
     #[zbus(signal)]
     fn seeked(&self, position: i64) -> zbus::Result<()>;
 }

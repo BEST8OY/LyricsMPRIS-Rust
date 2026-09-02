@@ -36,38 +36,47 @@ pub async fn get_dbus_conn() -> Result<zbus::Connection, MprisError> {
 /// querying the standard D-Bus daemon (`ListNames`) for any `org.mpris.MediaPlayer2.*` names.
 pub async fn get_active_player_names() -> Result<Vec<String>, MprisError> {
     let conn = get_dbus_conn().await?;
+    let dbus_proxy = zbus::fdo::DBusProxy::new(&conn).await?;
 
-    // Try playerctld first (recency-ordered active players) using uncached proxy to avoid match rule churn
-    let playerctld_proxy = PlayerctldProxy::builder(&conn)
-        .cache_properties(zbus::proxy::CacheProperties::No)
-        .build()
-        .await;
+    // Tier 1: Query playerctld (recency-ordered active players)
+    // Check name_has_owner first to prevent triggering unwanted D-Bus auto-activation
+    if dbus_proxy
+        .name_has_owner(
+            zbus::names::BusName::from_static_str("org.mpris.MediaPlayer2.playerctld").unwrap(),
+        )
+        .await
+        .unwrap_or(false)
+    {
+        let playerctld_proxy = PlayerctldProxy::builder(&conn)
+            .cache_properties(zbus::proxy::CacheProperties::No)
+            .build()
+            .await;
 
-    match playerctld_proxy {
-        Ok(proxy) => match proxy.player_names().await {
-            Ok(names) if !names.is_empty() => return Ok(names),
-            Ok(_) => {
-                tracing::debug!(
-                    "playerctld returned empty player list; falling back to DBus ListNames"
-                );
-            }
+        match playerctld_proxy {
+            Ok(proxy) => match proxy.player_names().await {
+                Ok(names) if !names.is_empty() => return Ok(names),
+                Ok(_) => {
+                    tracing::debug!(
+                        "playerctld returned empty player list; falling back to DBus ListNames"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "playerctld player_names property failed; falling back to DBus ListNames"
+                    );
+                }
+            },
             Err(e) => {
                 tracing::debug!(
                     error = %e,
-                    "playerctld player_names property failed; falling back to DBus ListNames"
+                    "playerctld proxy unavailable; falling back to DBus ListNames"
                 );
             }
-        },
-        Err(e) => {
-            tracing::debug!(
-                error = %e,
-                "playerctld proxy unavailable; falling back to DBus ListNames"
-            );
         }
     }
 
     // Fallback: list all names on the bus matching org.mpris.MediaPlayer2.*
-    let dbus_proxy = zbus::fdo::DBusProxy::new(&conn).await?;
     let names = dbus_proxy.list_names().await?;
     let mpris_names: Vec<String> = names
         .into_iter()
