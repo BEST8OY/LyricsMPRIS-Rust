@@ -353,13 +353,22 @@ fn spawn_mpris_watcher(event_tx: mpsc::Sender<Event>, config: &LoopConfig) {
         loop {
             let update_tx = event_tx.clone();
             let seek_tx = event_tx.clone();
+            let calib_tx = event_tx.clone();
             let handler_result = MprisEventHandler::with_closures(
-                move |meta, pos, service| {
-                    let _ = update_tx
-                        .try_send(Event::Mpris(MprisEvent::PlayerUpdate(meta, pos, service)));
+                move |meta, pos, service, status| {
+                    let _ = update_tx.try_send(Event::Mpris(Box::new(MprisEvent::PlayerUpdate(
+                        meta, pos, service, status,
+                    ))));
                 },
                 move |meta, pos, service| {
-                    let _ = seek_tx.try_send(Event::Mpris(MprisEvent::Seeked(meta, pos, service)));
+                    let _ = seek_tx.try_send(Event::Mpris(Box::new(MprisEvent::Seeked(
+                        meta, pos, service,
+                    ))));
+                },
+                move |pos| {
+                    let _ = calib_tx.try_send(Event::Mpris(Box::new(MprisEvent::Calibrated {
+                        position: pos,
+                    })));
                 },
                 block_list.clone(),
                 target_list.clone(),

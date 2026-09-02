@@ -41,9 +41,18 @@ pub(crate) async fn handle_mpris_event(
     update_tx: &mpsc::Sender<Update>,
     providers: &[String],
 ) -> RetryDirective {
-    let (meta, position, service, is_full_update) = match event {
-        MprisEvent::PlayerUpdate(m, p, s) => (m, p, s, true),
-        MprisEvent::Seeked(m, p, s) => (m, p, s, false),
+    let (meta, position, service, event_status, is_full_update) = match event {
+        MprisEvent::PlayerUpdate(m, p, s, status) => (m, p, s, status, true),
+        MprisEvent::Seeked(m, p, s) => (m, p, s, None, false),
+        MprisEvent::Calibrated { position } => {
+            let playing = state.player_state.playing;
+            let (playing_changed, changed_index, position_jumped) =
+                state.update_playback_and_position(playing, position);
+            if playing_changed || changed_index || position_jumped {
+                send_update(state, update_tx, position_jumped).await;
+            }
+            return RetryDirective::Keep;
+        }
     };
 
     // No active player: clear state and notify UI
@@ -52,8 +61,10 @@ pub(crate) async fn handle_mpris_event(
         return RetryDirective::Clear;
     }
 
-    // Only fetch playback status for full updates (optimization)
-    let playback_status = if is_full_update {
+    // Prioritize playback status provided in event payload; fallback to live D-Bus query only if absent
+    let playback_status = if let Some(status) = event_status {
+        Some(status)
+    } else if is_full_update {
         get_playback_status(&service).await
     } else {
         None
@@ -220,5 +231,42 @@ mod tests {
         let update = rx.recv().await.expect("Seek update should be received");
         assert_eq!(update.index, Some(0));
         assert!((update.position - 20.0).abs() < 0.5);
+    }
+
+    #[tokio::test]
+    async fn test_handle_calibrated_event() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut state = StateBundle::new();
+
+        let lines = vec![
+            crate::lyrics::LyricLine {
+                time: 5.0,
+                text: "Line 1".to_string(),
+                words: None,
+            },
+            crate::lyrics::LyricLine {
+                time: 15.0,
+                text: "Line 2".to_string(),
+                words: None,
+            },
+        ];
+        state.lyric_state.update_lines(lines);
+        state.player_state.update_playback_dbus(true, 0.0);
+        state.update_index(0.0);
+        state.mark_state_sent();
+
+        // Calibration moves position to 6.0s (Line 1 active)
+        let directive = handle_mpris_event(
+            MprisEvent::Calibrated { position: 6.0 },
+            &mut state,
+            &tx,
+            &[],
+        )
+        .await;
+
+        assert!(matches!(directive, RetryDirective::Keep));
+        let update = rx.recv().await.expect("Calibration update should be sent");
+        assert_eq!(update.index, Some(0));
+        assert!((update.position - 6.0).abs() < 0.1);
     }
 }

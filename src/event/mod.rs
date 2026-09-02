@@ -16,18 +16,21 @@ use tokio::sync::mpsc;
 /// Events originating from MPRIS player interface.
 #[derive(Debug, Clone)]
 pub enum MprisEvent {
-    /// Full player state update with metadata, position, and service name.
-    PlayerUpdate(TrackMetadata, f64, String),
+    /// Full player state update with metadata, position, service name, and optional playback status.
+    PlayerUpdate(TrackMetadata, f64, String, Option<String>),
 
     /// Seek event when user scrubs through track.
     Seeked(TrackMetadata, f64, String),
+
+    /// Position calibration event after transient buffering.
+    Calibrated { position: f64 },
 }
 
 /// Top-level events processed by the main event loop.
 #[derive(Debug)]
 pub enum Event {
     /// MPRIS player event
-    Mpris(MprisEvent),
+    Mpris(Box<MprisEvent>),
     /// Shutdown signal (graceful termination)
     Shutdown,
 }
@@ -56,7 +59,7 @@ pub async fn process_event(
     providers: &[String],
 ) -> RetryDirective {
     match event {
-        Event::Mpris(ev) => handlers::handle_mpris_event(ev, state, update_tx, providers).await,
+        Event::Mpris(ev) => handlers::handle_mpris_event(*ev, state, update_tx, providers).await,
         Event::Shutdown => {
             send_update(state, update_tx, true).await;
             RetryDirective::Clear
