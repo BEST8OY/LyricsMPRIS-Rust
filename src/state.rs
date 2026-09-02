@@ -654,11 +654,7 @@ mod tests {
     #[test]
     fn test_lyric_index_before_first() {
         let mut state = LyricState::default();
-        state.update_lines(vec![LyricLine {
-            time: 10.0,
-            text: "First".into(),
-            words: None,
-        }]);
+        state.update_lines(vec![LyricLine::new(10.0, "First")]);
         assert_eq!(state.get_index(5.0), None);
     }
 
@@ -666,16 +662,8 @@ mod tests {
     fn test_lyric_index_basic() {
         let mut state = LyricState::default();
         state.update_lines(vec![
-            LyricLine {
-                time: 10.0,
-                text: "First".into(),
-                words: None,
-            },
-            LyricLine {
-                time: 20.0,
-                text: "Second".into(),
-                words: None,
-            },
+            LyricLine::new(10.0, "First"),
+            LyricLine::new(20.0, "Second"),
         ]);
 
         assert_eq!(state.get_index(15.0), Some(0));

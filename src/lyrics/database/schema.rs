@@ -10,7 +10,7 @@ use std::str::FromStr;
 pub const DURATION_TOLERANCE_SECS: f64 = 2.0;
 
 /// Format of stored lyrics for correct parsing on retrieval.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LyricsFormat {
     /// LRC timestamp format (from LRCLIB provider): `[MM:SS.CC]lyrics`
     Lrclib,
@@ -22,7 +22,7 @@ pub enum LyricsFormat {
 
 impl LyricsFormat {
     #[must_use]
-    pub const fn fidelity_rank(&self) -> u8 {
+    pub const fn fidelity_rank(self) -> u8 {
         match self {
             Self::Richsync => 3,
             Self::Subtitles => 2,
@@ -31,7 +31,7 @@ impl LyricsFormat {
     }
 
     #[must_use]
-    pub fn to_str(&self) -> &'static str {
+    pub const fn to_str(self) -> &'static str {
         match self {
             Self::Lrclib => "lrclib",
             Self::Richsync => "richsync",
