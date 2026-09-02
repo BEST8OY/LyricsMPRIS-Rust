@@ -110,7 +110,7 @@ pub(crate) async fn handle_mpris_event(
     let playback_status = if let Some(status) = event_status {
         Some(status)
     } else if is_full_update {
-        get_playback_status(&service).await
+        Some(crate::mpris::get_playback_status(&service).await)
     } else {
         None
     };
@@ -311,14 +311,6 @@ pub(crate) async fn handle_state_update(
     if playing_changed || changed_index || position_jumped {
         send_update(state, update_tx, position_jumped).await;
     }
-}
-
-/// Fetches playback status from the player via D-Bus.
-pub(crate) async fn get_playback_status(service: &str) -> Option<String> {
-    crate::mpris::get_playback_status(service)
-        .await
-        .ok()
-        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
