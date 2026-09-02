@@ -129,25 +129,33 @@ fn isrc_from_metadata(url: Option<&str>) -> Option<String> {
     None
 }
 
+/// Check if an MPRIS `mpris:trackid` represents an explicit canonical "NoTrack" sentinel
+/// defined in the MPRIS specification (e.g. `/org/mpris/MediaPlayer2/TrackList/NoTrack`,
+/// `/org/mpris/MediaPlayer2/NoTrack`, `NoTrack`).
+pub fn is_explicit_no_track(trackid: &str) -> bool {
+    let trimmed = trackid.trim();
+    trimmed.ends_with("/NoTrack") || trimmed.eq_ignore_ascii_case("NoTrack")
+}
+
 /// Check if an MPRIS `mpris:trackid` represents the canonical "NoTrack" sentinel
 /// defined in the MPRIS specification (e.g. `/org/mpris/MediaPlayer2/TrackList/NoTrack`,
 /// `/org/mpris/MediaPlayer2/NoTrack`, `NoTrack`, or `/`).
 pub fn is_no_track(trackid: &str) -> bool {
     let trimmed = trackid.trim();
-    trimmed.is_empty()
-        || trimmed == "/"
-        || trimmed.ends_with("/NoTrack")
-        || trimmed.eq_ignore_ascii_case("NoTrack")
+    trimmed.is_empty() || trimmed == "/" || is_explicit_no_track(trimmed)
 }
 
 impl From<MprisMetadata> for TrackMetadata {
     fn from(md: MprisMetadata) -> Self {
         // If the trackid explicitly signals "NoTrack", return default empty metadata
-        if let Some(ref trackid) = md.trackid
-            && is_no_track(trackid)
-            && md.title.as_deref().unwrap_or("").is_empty()
-        {
-            return TrackMetadata::default();
+        // even if stale title/artist attributes linger in the dictionary.
+        if let Some(ref trackid) = md.trackid {
+            let is_explicit = is_explicit_no_track(trackid);
+            let is_empty_sentinel =
+                is_no_track(trackid) && md.title.as_deref().unwrap_or("").is_empty();
+            if is_explicit || is_empty_sentinel {
+                return TrackMetadata::default();
+            }
         }
 
         let title = md.title.unwrap_or_default();
@@ -240,12 +248,13 @@ pub fn extract_metadata(map: &HashMap<String, OwnedValue>) -> TrackMetadata {
         .and_then(extract_string_or_first_item)
         .unwrap_or_default();
 
-    // Check for explicit "NoTrack" sentinel
-    if let Some(ref id) = trackid
-        && is_no_track(id)
-        && title.is_empty()
-    {
-        return TrackMetadata::default();
+    // Check for explicit "NoTrack" sentinel or empty sentinel with empty title
+    if let Some(ref id) = trackid {
+        let is_explicit = is_explicit_no_track(id);
+        let is_empty_sentinel = is_no_track(id) && title.is_empty();
+        if is_explicit || is_empty_sentinel {
+            return TrackMetadata::default();
+        }
     }
 
     let artist = map
@@ -329,6 +338,16 @@ mod tests {
 
     #[test]
     fn test_notrack_sentinel() {
+        assert!(is_explicit_no_track(
+            "/org/mpris/MediaPlayer2/TrackList/NoTrack"
+        ));
+        assert!(is_explicit_no_track("/org/mpris/MediaPlayer2/NoTrack"));
+        assert!(is_explicit_no_track("/NoTrack"));
+        assert!(is_explicit_no_track("NoTrack"));
+        assert!(!is_explicit_no_track("/"));
+        assert!(!is_explicit_no_track(""));
+        assert!(!is_explicit_no_track("/org/mpris/MediaPlayer2/track/123"));
+
         assert!(is_no_track("/org/mpris/MediaPlayer2/TrackList/NoTrack"));
         assert!(is_no_track("/org/mpris/MediaPlayer2/NoTrack"));
         assert!(is_no_track("/NoTrack"));
@@ -336,16 +355,37 @@ mod tests {
         assert!(is_no_track("/"));
         assert!(!is_no_track("/org/mpris/MediaPlayer2/track/123"));
 
+        // Stale title and artist with explicit NoTrack sentinel must return default
         let md = MprisMetadata {
-            title: None,
+            title: Some("Stale Title".to_string()),
             artist: Some(vec!["Stale Artist".to_string()]),
-            album: None,
-            length: None,
+            album: Some("Stale Album".to_string()),
+            length: Some(180_000_000),
             trackid: Some("/org/mpris/MediaPlayer2/TrackList/NoTrack".to_string()),
-            url: None,
+            url: Some("https://open.spotify.com/track/stale".to_string()),
         };
         let track: TrackMetadata = md.into();
         assert_eq!(track, TrackMetadata::default());
+
+        // Raw variant map with stale title and explicit NoTrack sentinel
+        let mut map = HashMap::new();
+        map.insert(
+            "mpris:trackid".to_string(),
+            OwnedValue::try_from(zvariant::Value::from(
+                "/org/mpris/MediaPlayer2/TrackList/NoTrack",
+            ))
+            .unwrap(),
+        );
+        map.insert(
+            "xesam:title".to_string(),
+            OwnedValue::try_from(zvariant::Value::from("Stale Lingering Title")).unwrap(),
+        );
+        map.insert(
+            "xesam:artist".to_string(),
+            OwnedValue::try_from(zvariant::Value::from(vec!["Stale Artist"])).unwrap(),
+        );
+        let extracted = extract_metadata(&map);
+        assert_eq!(extracted, TrackMetadata::default());
     }
 
     #[test]
