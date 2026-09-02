@@ -421,6 +421,9 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                                 error = %e,
                                 "Failed to handle metadata change"
                             );
+                            if self.sync_active_service(&service).await? {
+                                break;
+                            }
                         }
                     }
                 }
@@ -442,31 +445,10 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                                 error = %e,
                                 "Failed to handle playback status change"
                             );
+                            if self.sync_active_service(&service).await? {
+                                break;
+                            }
                         }
-                    }
-                }
-
-                // 6. Safety-net periodic check (3s timeout avoids 25s D-Bus freeze)
-                _ = tokio::time::sleep(Duration::from_secs(5)) => {
-                    let has_owner = match zbus::names::BusName::try_from(service.as_str()) {
-                        Ok(bus_name) => matches!(
-                            tokio::time::timeout(
-                                Duration::from_secs(3),
-                                dbus_proxy.name_has_owner(bus_name)
-                            )
-                            .await,
-                            Ok(Ok(true))
-                        ),
-                        Err(_) => false,
-                    };
-
-                    if !has_owner {
-                        tracing::debug!(
-                            service = %service,
-                            "Player name has no owner or is unreachable, discovering new player"
-                        );
-                        let _ = self.discover_active_player().await;
-                        break;
                     }
                 }
             }
