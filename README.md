@@ -7,7 +7,7 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 [![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg?style=flat-sq&logo=linux)](https://kernel.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-sq)](LICENSE)
 
-`LyricsMPRIS-Rust` monitors your active media player in real-time using D-Bus, fetches synchronized lyrics automatically, and renders them beautifully in a modern Terminal User Interface (TUI) with word-level karaoke support. It also features a scriptable **Pipe Mode** for status bar integration, **ISRC tag reading** from local audio files, and an optimized **local SQLite database** with Zstd compression for instant offline lookups.
+`LyricsMPRIS-Rust` monitors your active media player in real-time using D-Bus, fetches synchronized lyrics automatically, and renders them beautifully in a modern Terminal User Interface (TUI) with word-level karaoke support. It also features a scriptable **Pipe Mode** for status bar integration, **ISRC tag reading** from local audio files, **multi-script Romanization** (Romaji, Pinyin, Cyrillic), and an optimized **local SQLite database** with Zstd compression for instant offline lookups.
 
 ![LyricMPRIS-Rust](https://github.com/user-attachments/assets/501f224e-6c40-46cd-ac66-cd9ae4f927cf)
 
@@ -34,8 +34,13 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 ### 🎨 Modern TUI & Pipe Mode
 * **Ratatui Terminal UI**: Centered lyrics display with smooth auto-scrolling, word-by-word karaoke highlighting, active line tracking, and resilient RAII terminal lifecycle management.
 * **Adaptive Playback Calibration**: Transient position calibration automatically compensates for streaming buffer delays (e.g., Spotify, browser MPRIS extensions), Bluetooth latency, and seek jitter across all media players—locking into sample-accurate sync within ~1.2s before self-disarming for zero ongoing D-Bus polling overhead.
-* **Manual Scroll**: Browse past or upcoming lyrics using arrow keys (`j`/`k`) when playback is paused.
+* **Manual Scroll**: Browse past or upcoming lyrics using arrow keys (`↑`/`↓`) when playback is paused.
+* **Dynamic Runtime Toggles**: Hot-toggle per-word karaoke highlighting (`k`) and phonetic script romanization (`r`) in real-time during playback.
 * **Streamlined Pipe Mode**: Outputs current lyric line to `stdout` in real-time, automatically clearing out-of-bound segments (intros/outros/silence), and routing transient network warnings to `stderr` to keep status bars (Polybar, Waybar, i3blocks) pristine.
+
+### 🌐 Multi-Language Script Romanization
+* **Foreign Script Transliteration**: Automatically generates synchronized Romaji, Pinyin, Korean Hangul, and Cyrillic phonetic subtitles for non-Latin lyrics using `kakasi` and `deunicode`.
+* **Flexible Activation**: Enable at launch via `--romanize` or toggle interactively in the TUI with the `r` key.
 
 ### 📚 Multiple Lyrics Providers
 * **LRCLIB**: Fetches community-sourced, line-synced lyrics with support for both centisecond (`.xx`) and millisecond (`.xxx`) timestamp resolutions.
@@ -60,7 +65,9 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 ### 🚀 Ultra-Low Resource Footprint
 * **Single-Threaded Async Engine**: Utilizes Tokio `current_thread` runtime and asynchronous event streaming, reducing active thread count from N+2 threads down to just 1–2 lightweight threads.
 * **Zero-Allocation Rendering**: Zero-copy span borrowing and chunk-reversed visible line collection eliminate frame-by-frame heap allocations.
-* **Pure Event-Driven Idle**: Consumes zero CPU and generates zero IPC traffic when players are inactive or paused, listening asynchronously for D-Bus `NameOwnerChanged` and `playerctld` signals.
+* **Dual-Tier Discovery & Playback Prioritization**: Prefers `playerctld` for recency-ordered player prioritization, with an intelligent, priority-ranked fallback (`Playing` > `Paused` > `Stopped`) via standard D-Bus discovery. Idle or stopped players will never shadow an actively playing player.
+* **Real-Time Lifecycle & Cross-Player Handoff**: 100% event-driven, instant response to player startup, exit, and playback handoff via D-Bus `NameOwnerChanged`, broker-level `PropertiesChanged` match rules, and optional `playerctld` signals. Works completely standalone without requiring `playerctld`.
+* **Pure Event-Driven Idle**: Consumes zero CPU and generates zero IPC traffic when players are inactive or paused, listening asynchronously for D-Bus `NameOwnerChanged`, broker-level `PropertiesChanged` match rules, and `playerctld` signals.
 
 ---
 
@@ -69,7 +76,7 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 ### Prerequisites
 - **Linux** desktop environment with **D-Bus** session daemon.
 - **Rust Toolchain** (1.70+): Install via [rustup.rs](https://rustup.rs).
-- **playerctld** *(recommended)*: Tracks active MPRIS players automatically.
+- **playerctld** *(optional)*: Enhances active player tracking across desktop sessions; completely optional as priority-ranked standalone discovery is built-in.
 
 ### Build from Source
 ```bash
@@ -88,7 +95,7 @@ The optimized executable binary will be created at `./target/release/lyricsmpris
 ## 💻 Basic Usage
 
 ```bash
-# Launch with default settings (LRCLIB + Musixmatch)
+# Launch with default settings (Musixmatch + LRCLIB)
 ./target/release/lyricsmpris
 
 # Enable local SQLite database caching
@@ -96,6 +103,9 @@ The optimized executable binary will be created at `./target/release/lyricsmpris
 
 # Enable ISRC extraction from local audio files
 ./target/release/lyricsmpris --isrc
+
+# Enable phonetic Romanization subtitles (Romaji/Pinyin/Cyrillic)
+./target/release/lyricsmpris --romanize
 
 # Limit TUI visible lyric lines (compact view)
 ./target/release/lyricsmpris --visible-lines 3
@@ -119,9 +129,10 @@ The optimized executable binary will be created at `./target/release/lyricsmpris
 | Argument | Description | Example |
 | :--- | :--- | :--- |
 | `--database <PATH>` | Enable SQLite cache at specified file path | `--database ~/.cache/lyrics.db` |
-| `--providers <LIST>` | Comma-separated provider priority order | `--providers musixmatch,lrclib` |
+| `--providers <LIST>` | Comma-separated provider priority order (default: `musixmatch,lrclib`) | `--providers musixmatch,lrclib` |
 | `--visible-lines <COUNT>`| Limit maximum visible lyric lines in TUI | `--visible-lines 3` |
 | `--isrc` | Extract ISRC from local audio files via `lofty` | `--isrc` |
+| `--romanize` | Enable phonetic Romanization subtitles (Romaji/Pinyin) | `--romanize` |
 | `--no-karaoke` | Disable per-word karaoke highlighting | `--no-karaoke` |
 | `--pipe` | Output lyrics to `stdout` (no TUI) | `--pipe` |
 | `--block <LIST>` | Ignore specific MPRIS service names | `--block firefox,chromium` |
@@ -132,7 +143,7 @@ The optimized executable binary will be created at `./target/release/lyricsmpris
 Configure default options via environment variables in `~/.bashrc` or `~/.zshrc`:
 
 ```bash
-# Provider preference (default: lrclib,musixmatch)
+# Provider preference (default: musixmatch,lrclib)
 export LYRIC_PROVIDERS="musixmatch,lrclib"
 
 # Musixmatch custom usertokens (comma-separated for round-robin rotation)
@@ -241,9 +252,10 @@ Control the modern TUI backend with these keys:
 | Key | Action |
 | :---: | :--- |
 | `k` | Toggle Karaoke Highlight Mode |
-| `↑` / `k` | Scroll up one line (when player is paused) |
-| `↓` / `j` | Scroll down one line (when player is paused) |
-| `q` / `Esc` | Quit `LyricsMPRIS-Rust` |
+| `r` | Toggle Phonetic Romanization Subtitles |
+| `↑` | Scroll up one line (when player is paused) |
+| `↓` | Scroll down one line (when player is paused) |
+| `q` / `Esc` / `Ctrl+C` | Quit `LyricsMPRIS-Rust` |
 
 > [!NOTE]
 > Manual line scrolling is active only when playback is **paused**. Once playback resumes, the TUI automatically locks back to the current playing position.
@@ -293,10 +305,11 @@ src/
 │   ├── providers/    # lrclib.rs, musixmatch/ (API integrations & token manager)
 │   ├── database/     # SQLite cache engine with sqlx + Zstd compression
 │   ├── parse.rs      # LRC (centisecond & millisecond), Richsync, subtitle parsers
+│   ├── romanize/     # Multi-script romanization engine (kakasi Japanese Kana, deunicode)
 │   └── types.rs      # LyricLine, TrackMatchInfo, error models
 ├── mpris/
-│   ├── connection.rs # D-Bus session singleton & direct method calling
-│   ├── events.rs     # D-Bus signal listener & transient position calibration
+│   ├── connection.rs # D-Bus session singleton, PlaybackPriority, discovery & filtering
+│   ├── events.rs     # D-Bus signal listener, broker-level match rules & calibration
 │   ├── metadata.rs   # MPRIS track metadata extraction & local file ISRC (lofty)
 │   ├── playback.rs   # Direct D-Bus playback position & status querying
 │   └── proxies.rs    # Consolidated D-Bus proxy interfaces
@@ -333,7 +346,7 @@ src/
    ```bash
    playerctl -l
    ```
-   Installing `playerctld` ensures `lyricsmpris` tracks your active player reliably.
+   `LyricsMPRIS-Rust` works completely standalone with priority-ranked fallback and broker-level event handoff. Installing `playerctld` is optional and can provide additional cross-session recency ordering.
 
 ---
 

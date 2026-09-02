@@ -42,9 +42,10 @@ src/ui/ (modern.rs Ratatui TUI or pipe.rs stdout)
 - **Rust Edition 2024** (`edition = "2024"` in Cargo.toml). Enables Edition 2024 let chains (`if let ... && let ...`).
 - **MPRIS & D-Bus Engine (`src/mpris/`, `src/pool.rs`)**:
   - Consolidated Proxies: All D-Bus proxy interfaces (`MediaPlayer2Player`, `Playerctld`) are centralized in `src/mpris/proxies.rs`.
-  - Discovery Priority: Queries `playerctld` (recency-ordered) first; falls back to standard D-Bus `ListNames` (`org.mpris.MediaPlayer2.*`) when `playerctld` is absent or returns empty.
+  - Discovery Priority: Queries `playerctld` (recency-ordered) first; falls back to standard D-Bus `ListNames` (`org.mpris.MediaPlayer2.*`, excluding `playerctld`) when `playerctld` is absent or returns empty, ranking candidates by `PlaybackPriority` (`Playing` > `Paused` > `Stopped` > `Unresponsive`) with concurrent status probing.
+  - Stability & Standalone Handoff: Retains current player on priority ties to prevent bouncing; immediately yields to newly playing players via broker-level `PropertiesChanged` match rules on `/org/mpris/MediaPlayer2`, providing 100% event-driven cross-player handoff and reactive idle wakeup without requiring `playerctld`.
   - Error Safety: Discovery helpers return `Result<Option<String>, MprisError>`; transient D-Bus errors preserve current state and never clear/deactivate active lyrics.
-  - Pure Event-Driven Idle: Inactive state uses pure event-driven sleep waiting for D-Bus `NameOwnerChanged` and `playerctld` property streams, generating zero IPC traffic while idle.
+  - Pure Event-Driven Idle: Inactive state uses pure event-driven sleep waiting for D-Bus `NameOwnerChanged`, broker-level `PropertiesChanged`, and `playerctld` property streams, generating zero IPC traffic while idle.
   - Real-Time Position & Property Streams: `Metadata` and `PlaybackStatus` use standard caching (`CacheProperties::Lazily`) enabling property change streams. Dynamic `Position` is queried via `get_position()` using direct D-Bus `Properties.Get` (via `conn.call_method()`) to avoid stale cached position data and eliminate proxy construction overhead, propagating errors so callers retain estimated positions on transient failures.
   - Resilience: The watcher task in `pool.rs` retries with exponential backoff (500 ms → ×2, cap 30 s), resetting only after sustained uptime (≥ 5 s). The event loop backs off on error to prevent CPU spin.
   - Multi-Threaded Tag Reading: ISRC extraction checks `runtime_flavor() == RuntimeFlavor::MultiThread` before invoking `block_in_place`.
