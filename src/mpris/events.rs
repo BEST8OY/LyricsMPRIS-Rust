@@ -5,7 +5,6 @@ use crate::mpris::metadata::{TrackMetadata, extract_metadata};
 use crate::mpris::proxies::{MediaPlayer2PlayerProxy, PlayerctldProxy};
 use futures_util::StreamExt;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
 use zbus::fdo::NameOwnerChangedStream;
 
@@ -133,39 +132,7 @@ pub trait MprisEventCallback: Send + 'static {
     fn on_calibrate(&mut self, position: f64, sampled_at: std::time::Instant);
 }
 
-/// Simple callback implementation using closures
-pub struct ClosureCallback<F, G, H>
-where
-    F: FnMut(TrackMetadata, f64, String, Option<String>, std::time::Instant) + Send + 'static,
-    G: FnMut(TrackMetadata, f64, String, std::time::Instant) + Send + 'static,
-    H: FnMut(f64, std::time::Instant) + Send + 'static,
-{
-    on_track_change: F,
-    on_seek: G,
-    on_calibrate: H,
-}
-
-impl<F, G, H> ClosureCallback<F, G, H>
-where
-    F: FnMut(TrackMetadata, f64, String, Option<String>, std::time::Instant) + Send + 'static,
-    G: FnMut(TrackMetadata, f64, String, std::time::Instant) + Send + 'static,
-    H: FnMut(f64, std::time::Instant) + Send + 'static,
-{
-    pub fn new(on_track_change: F, on_seek: G, on_calibrate: H) -> Self {
-        Self {
-            on_track_change,
-            on_seek,
-            on_calibrate,
-        }
-    }
-}
-
-impl<F, G, H> MprisEventCallback for ClosureCallback<F, G, H>
-where
-    F: FnMut(TrackMetadata, f64, String, Option<String>, std::time::Instant) + Send + 'static,
-    G: FnMut(TrackMetadata, f64, String, std::time::Instant) + Send + 'static,
-    H: FnMut(f64, std::time::Instant) + Send + 'static,
-{
+impl MprisEventCallback for tokio::sync::mpsc::Sender<crate::event::Event> {
     fn on_track_change(
         &mut self,
         metadata: TrackMetadata,
@@ -174,7 +141,13 @@ where
         playback_status: Option<String>,
         sampled_at: std::time::Instant,
     ) {
-        (self.on_track_change)(metadata, position, service, playback_status, sampled_at);
+        let _ = self.try_send(crate::event::Event::PlayerUpdate(
+            metadata,
+            position,
+            service,
+            playback_status,
+            sampled_at,
+        ));
     }
 
     fn on_seek(
@@ -184,24 +157,29 @@ where
         service: String,
         sampled_at: std::time::Instant,
     ) {
-        (self.on_seek)(metadata, position, service, sampled_at);
+        let _ = self.try_send(crate::event::Event::Seeked(
+            metadata, position, service, sampled_at,
+        ));
     }
 
     fn on_calibrate(&mut self, position: f64, sampled_at: std::time::Instant) {
-        (self.on_calibrate)(position, sampled_at);
+        let _ = self.try_send(crate::event::Event::Calibrated {
+            position,
+            sampled_at,
+        });
     }
 }
 
-/// Represents the current state of the active player
+/// Represents the current state of the watched active player
 #[derive(Debug, Clone, Default)]
-struct PlayerState {
+struct WatcherPlayerState {
     service: String,
     track: TrackMetadata,
     playback_status: String,
     position: f64,
 }
 
-impl PlayerState {
+impl WatcherPlayerState {
     fn is_active(&self) -> bool {
         !self.service.is_empty()
     }
@@ -214,9 +192,9 @@ impl PlayerState {
 /// Handles MPRIS events and manages player state
 pub struct MprisEventHandler<C: MprisEventCallback> {
     callback: C,
-    block_list: Arc<Vec<String>>,
-    target_list: Arc<Vec<String>>,
-    state: PlayerState,
+    block_list: Vec<String>,
+    target_list: Vec<String>,
+    state: WatcherPlayerState,
     conn: zbus::Connection,
 }
 
@@ -231,9 +209,9 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
 
         let mut handler = Self {
             callback,
-            block_list: Arc::new(block_list),
-            target_list: Arc::new(target_list),
-            state: PlayerState::default(),
+            block_list,
+            target_list,
+            state: WatcherPlayerState::default(),
             conn,
         };
 
@@ -685,7 +663,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             "Switched to player"
         );
 
-        self.state = PlayerState {
+        self.state = WatcherPlayerState {
             service: service.to_string(),
             track: metadata.clone(),
             playback_status: playback_status.clone(),
@@ -714,26 +692,6 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             None,
             sampled_at,
         );
-    }
-}
-
-// Convenience constructor for closure-based callbacks
-impl<F, G, H> MprisEventHandler<ClosureCallback<F, G, H>>
-where
-    F: FnMut(TrackMetadata, f64, String, Option<String>, std::time::Instant) + Send + 'static,
-    G: FnMut(TrackMetadata, f64, String, std::time::Instant) + Send + 'static,
-    H: FnMut(f64, std::time::Instant) + Send + 'static,
-{
-    /// Create an event handler with closure-based callbacks
-    pub async fn with_closures(
-        on_track_change: F,
-        on_seek: G,
-        on_calibrate: H,
-        block_list: Vec<String>,
-        target_list: Vec<String>,
-    ) -> Result<Self, MprisError> {
-        let callback = ClosureCallback::new(on_track_change, on_seek, on_calibrate);
-        Self::new(callback, block_list, target_list).await
     }
 }
 

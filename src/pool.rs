@@ -36,7 +36,7 @@
 //! ```
 
 use crate::event::fetch::FetchSummary;
-use crate::event::{self, Event, MprisEvent, RetryDirective, process_event, send_update};
+use crate::event::{self, Event, RetryDirective, process_event, send_update};
 use crate::mpris::{TrackMetadata, events::MprisEventHandler};
 use crate::state::{StateBundle, Update};
 use std::pin::Pin;
@@ -368,30 +368,9 @@ fn spawn_mpris_watcher(event_tx: mpsc::Sender<Event>, config: &LoopConfig) {
     tokio::spawn(async move {
         let mut backoff = std::time::Duration::from_millis(500);
         loop {
-            let update_tx = event_tx.clone();
-            let seek_tx = event_tx.clone();
-            let calib_tx = event_tx.clone();
-            let handler_result = MprisEventHandler::with_closures(
-                move |meta, pos, service, status, sampled_at| {
-                    let _ = update_tx.try_send(Event::Mpris(Box::new(MprisEvent::PlayerUpdate(
-                        meta, pos, service, status, sampled_at,
-                    ))));
-                },
-                move |meta, pos, service, sampled_at| {
-                    let _ = seek_tx.try_send(Event::Mpris(Box::new(MprisEvent::Seeked(
-                        meta, pos, service, sampled_at,
-                    ))));
-                },
-                move |pos, sampled_at| {
-                    let _ = calib_tx.try_send(Event::Mpris(Box::new(MprisEvent::Calibrated {
-                        position: pos,
-                        sampled_at,
-                    })));
-                },
-                block_list.clone(),
-                target_list.clone(),
-            )
-            .await;
+            let handler_result =
+                MprisEventHandler::new(event_tx.clone(), block_list.clone(), target_list.clone())
+                    .await;
 
             match handler_result {
                 Ok(mut handler) => {
@@ -447,7 +426,7 @@ async fn run_event_loop(
         tokio::select! {
             // Shutdown signal received - clean up and terminate
             _ = shutdown_rx.recv() => {
-                handle_shutdown(&mut loop_state, &event_tx, &update_tx, &config).await;
+                handle_shutdown(&mut loop_state, &update_tx).await;
                 break;
             }
 
@@ -561,21 +540,9 @@ async fn handle_retry_tick(
 /// Processes a shutdown event and cleans up state.
 ///
 /// Sends a final update to observers before terminating.
-async fn handle_shutdown(
-    loop_state: &mut LoopState,
-    event_tx: &mpsc::Sender<Event>,
-    update_tx: &mpsc::Sender<Update>,
-    config: &LoopConfig,
-) {
+async fn handle_shutdown(loop_state: &mut LoopState, update_tx: &mpsc::Sender<Update>) {
     tracing::debug!("Shutting down event loop");
-    process_event(
-        Event::Shutdown,
-        &mut loop_state.state_bundle,
-        event_tx,
-        update_tx,
-        config.providers(),
-    )
-    .await;
+    send_update(&mut loop_state.state_bundle, update_tx, true).await;
 }
 
 /// Handles an incoming event from the event channel.

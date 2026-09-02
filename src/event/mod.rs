@@ -13,9 +13,9 @@ use crate::mpris::TrackMetadata;
 use crate::state::{StateBundle, Update};
 use tokio::sync::mpsc;
 
-/// Events originating from MPRIS player interface.
+/// Top-level events processed by the main event loop.
 #[derive(Debug, Clone)]
-pub enum MprisEvent {
+pub enum Event {
     /// Full player state update with metadata, position, service name, optional playback status, and sample timestamp.
     PlayerUpdate(
         TrackMetadata,
@@ -42,14 +42,8 @@ pub enum MprisEvent {
     },
 }
 
-/// Top-level events processed by the main event loop.
-#[derive(Debug)]
-pub enum Event {
-    /// MPRIS player event
-    Mpris(Box<MprisEvent>),
-    /// Shutdown signal (graceful termination)
-    Shutdown,
-}
+/// Alias for backwards compatibility
+pub type MprisEvent = Event;
 
 /// Sends an update to the UI channel when appropriate.
 pub async fn send_update(state: &mut StateBundle, update_tx: &mpsc::Sender<Update>, force: bool) {
@@ -75,13 +69,5 @@ pub async fn process_event(
     update_tx: &mpsc::Sender<Update>,
     providers: &[String],
 ) -> RetryDirective {
-    match event {
-        Event::Mpris(ev) => {
-            handlers::handle_mpris_event(*ev, state, event_tx, update_tx, providers).await
-        }
-        Event::Shutdown => {
-            send_update(state, update_tx, true).await;
-            RetryDirective::Clear
-        }
-    }
+    handlers::handle_mpris_event(event, state, event_tx, update_tx, providers).await
 }

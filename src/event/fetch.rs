@@ -499,13 +499,11 @@ pub(crate) fn spawn_background_richsync_upgrade(
                 .await;
 
                 let _ = event_tx
-                    .send(crate::event::Event::Mpris(Box::new(
-                        crate::event::MprisEvent::UpgradeLyrics {
-                            meta,
-                            lines,
-                            format: crate::lyrics::database::LyricsFormat::Richsync,
-                        },
-                    )))
+                    .send(crate::event::Event::UpgradeLyrics {
+                        meta,
+                        lines,
+                        format: crate::lyrics::database::LyricsFormat::Richsync,
+                    })
                     .await;
             }
         }
