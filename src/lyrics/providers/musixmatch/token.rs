@@ -298,7 +298,7 @@ mod tests {
         };
 
         assert_eq!(tm.next_env_token(), None);
-        assert_eq!(tm.get_dynamic_token(), None);
+        assert_eq!(tm.get_dynamic_token(), load_token_from_disk());
 
         // Memory cache test without relying on disk
         tm.cached_dynamic_token = Some("fresh_dynamic_token_123".to_string());

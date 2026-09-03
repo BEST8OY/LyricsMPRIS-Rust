@@ -334,4 +334,391 @@ mod tests {
         timer.set_position(f64::INFINITY);
         assert_eq!(timer.estimate(false), 0.0);
     }
+
+    #[tokio::test]
+    #[ignore = "Live real-time comparison test against active media player"]
+    async fn test_live_timer_vs_player() {
+        let active = crate::mpris::connection::find_best_active_service(&[], &[], None, None).await;
+        let Ok(Some(service)) = active else {
+            eprintln!("No active MPRIS player service found; skipping live test.");
+            return;
+        };
+
+        let status = crate::mpris::playback::get_playback_status(&service).await;
+        if status != "Playing" {
+            eprintln!(
+                "Active player ({service}) is not currently Playing (status: {status}); skipping live test."
+            );
+            return;
+        }
+
+        let Ok(initial_pos) = crate::mpris::playback::get_position(&service).await else {
+            eprintln!("Failed to fetch initial position from {service}; skipping live test.");
+            return;
+        };
+
+        let mut timer = PlaybackTimer::default();
+        timer.set_position(initial_pos);
+        timer.mark_playing();
+
+        eprintln!("\n=== Live Real-Time Timer vs Player Comparison ===");
+        eprintln!("Player service: {service}");
+        eprintln!("Anchor position: {initial_pos:.4}s at t0\n");
+        eprintln!(
+            "{:<6} | {:<16} | {:<16} | {:<12} | {:<10}",
+            "Step", "Internal Timer", "Player (D-Bus)", "Diff (ms)", "D-Bus RTT"
+        );
+        eprintln!(
+            "{:-<6}-+-{:-<16}-+-{:-<16}-+-{:-<12}-+-{:-<10}",
+            "", "", "", "", ""
+        );
+
+        for step in 1..=10 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            let query_start = std::time::Instant::now();
+            let timer_pos_before = timer.estimate(true);
+
+            let real_pos = match crate::mpris::playback::get_position(&service).await {
+                Ok(pos) => pos,
+                Err(e) => {
+                    eprintln!("D-Bus query failed at step {step}: {e}");
+                    break;
+                }
+            };
+
+            let rtt = query_start.elapsed();
+            let timer_pos_after = timer.estimate(true);
+            let timer_pos_mid = (timer_pos_before + timer_pos_after) / 2.0;
+            let diff_ms = (timer_pos_mid - real_pos) * 1000.0;
+
+            eprintln!(
+                "{:<6} | {:<16.4} | {:<16.4} | {:<+12.2} | {:<10.2?}",
+                format!("#{step}"),
+                timer_pos_mid,
+                real_pos,
+                diff_ms,
+                rtt
+            );
+        }
+        eprintln!("=================================================\n");
+    }
+
+    #[tokio::test]
+    #[ignore = "Live real-time track transition test against active media player"]
+    async fn test_live_track_transition() {
+        let active = crate::mpris::connection::find_best_active_service(&[], &[], None, None).await;
+        let Ok(Some(service)) = active else {
+            eprintln!("No active MPRIS player service found; skipping live test.");
+            return;
+        };
+
+        let conn = match crate::mpris::connection::get_dbus_conn().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to get D-Bus connection: {e}");
+                return;
+            }
+        };
+
+        let proxy = match crate::mpris::proxies::MediaPlayer2PlayerProxy::builder(&conn)
+            .destination(service.as_str())
+            .unwrap()
+            .build()
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Failed to build proxy for {service}: {e}");
+                return;
+            }
+        };
+
+        let initial_meta = match proxy.metadata().await {
+            Ok(m) => crate::mpris::metadata::extract_metadata(&m),
+            Err(e) => {
+                eprintln!("Failed to get initial metadata: {e}");
+                return;
+            }
+        };
+
+        eprintln!("\n=== Live Real-Time Song Transition Test ===");
+        eprintln!("Player: {service}");
+        eprintln!(
+            "Current track: {} - {}",
+            initial_meta.artist, initial_meta.title
+        );
+        eprintln!("Issuing Next() call on player...\n");
+
+        let t_next = std::time::Instant::now();
+        if let Err(e) = conn
+            .call_method(
+                Some(service.as_str()),
+                "/org/mpris/MediaPlayer2",
+                Some("org.mpris.MediaPlayer2.Player"),
+                "Next",
+                &(),
+            )
+            .await
+        {
+            eprintln!("Next() D-Bus call failed: {e}");
+            return;
+        }
+
+        // Wait for metadata to change
+        let mut new_track = initial_meta.clone();
+        let mut switch_latency = std::time::Duration::ZERO;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            if let Ok(meta_map) = proxy.metadata().await {
+                let track = crate::mpris::metadata::extract_metadata(&meta_map);
+                if track != initial_meta {
+                    new_track = track;
+                    switch_latency = t_next.elapsed();
+                    break;
+                }
+            }
+        }
+
+        if new_track == initial_meta {
+            eprintln!("Player did not transition to a new track within 1.5s.");
+            return;
+        }
+
+        eprintln!(
+            "New track detected in {:.1?}: {} - {}",
+            switch_latency, new_track.artist, new_track.title
+        );
+
+        // Fetch initial position and start PlaybackTimer as handle_new_track does
+        let raw_pos = proxy.position().await.unwrap_or(0) as f64 / 1_000_000.0;
+        let init_pos = if raw_pos > 0.5 { raw_pos } else { 0.0 };
+
+        let mut timer = PlaybackTimer::default();
+        timer.set_position(init_pos);
+        timer.mark_playing();
+
+        eprintln!(
+            "Initial position reported: {raw_pos:.4}s -> timer initialized at {init_pos:.4}s\n"
+        );
+        eprintln!(
+            "{:<6} | {:<10} | {:<15} | {:<15} | {:<12} | {:<10}",
+            "Step", "Elapsed", "Internal Timer", "Player (D-Bus)", "Diff (ms)", "State"
+        );
+        eprintln!(
+            "{:-<6}-+-{:-<10}-+-{:-<15}-+-{:-<15}-+-{:-<12}-+-{:-<10}",
+            "", "", "", "", "", ""
+        );
+
+        let t_track_start = std::time::Instant::now();
+        for step in 1..=20 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+            let elapsed = t_track_start.elapsed();
+            let timer_pos = timer.estimate(true);
+            let real_pos = match proxy.position().await {
+                Ok(us) => us as f64 / 1_000_000.0,
+                Err(e) => {
+                    eprintln!("Failed to read position at step {step}: {e}");
+                    break;
+                }
+            };
+            let diff_ms = (timer_pos - real_pos) * 1000.0;
+            let state = if real_pos <= 0.03 {
+                "Buffering"
+            } else {
+                "Playing"
+            };
+
+            eprintln!(
+                "{:<6} | {:<10.2?} | {:<15.4} | {:<15.4} | {:<+12.1} | {:<10}",
+                format!("#{step}"),
+                elapsed,
+                timer_pos,
+                real_pos,
+                diff_ms,
+                state
+            );
+        }
+        eprintln!("===========================================\n");
+    }
+
+    #[tokio::test]
+    #[ignore = "Live real-time natural song end transition test against active media player"]
+    async fn test_live_natural_song_end_transition() {
+        let active = crate::mpris::connection::find_best_active_service(&[], &[], None, None).await;
+        let Ok(Some(service)) = active else {
+            eprintln!("No active MPRIS player service found; skipping live test.");
+            return;
+        };
+
+        let conn = match crate::mpris::connection::get_dbus_conn().await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to get D-Bus connection: {e}");
+                return;
+            }
+        };
+
+        let proxy = match crate::mpris::proxies::MediaPlayer2PlayerProxy::builder(&conn)
+            .destination(service.as_str())
+            .unwrap()
+            .build()
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Failed to build proxy for {service}: {e}");
+                return;
+            }
+        };
+
+        let meta_map = match proxy.metadata().await {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Failed to read metadata: {e}");
+                return;
+            }
+        };
+        let track_a = crate::mpris::metadata::extract_metadata(&meta_map);
+        let Some(length) = track_a.length else {
+            eprintln!("Track does not report length; skipping natural end test.");
+            return;
+        };
+
+        if length <= 5.0 {
+            eprintln!("Track length too short; skipping.");
+            return;
+        }
+
+        let seek_target = length - 2.5;
+        eprintln!("\n=== Live Real-Time Natural Song-End Transition Test ===");
+        eprintln!("Player: {service}");
+        eprintln!(
+            "Current song (Song A): {} - {} (length: {:.2}s)",
+            track_a.artist, track_a.title, length
+        );
+        eprintln!(
+            "Seeking via D-Bus SetPosition to {:.2}s (2.5s before end of song)...",
+            seek_target
+        );
+
+        // Seek to 2.5s before track end using D-Bus SetPosition
+        let track_id_str = meta_map
+            .get("mpris:trackid")
+            .and_then(crate::mpris::metadata::extract_string_or_first_item)
+            .unwrap_or_default();
+        let obj_path = zvariant::ObjectPath::try_from(track_id_str.as_str())
+            .unwrap_or_else(|_| zvariant::ObjectPath::from_static_str("/").unwrap());
+        let pos_us = (seek_target * 1_000_000.0) as i64;
+        let _ = conn
+            .call_method(
+                Some(service.as_str()),
+                "/org/mpris/MediaPlayer2",
+                Some("org.mpris.MediaPlayer2.Player"),
+                "SetPosition",
+                &(obj_path, pos_us),
+            )
+            .await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let mut timer_a = PlaybackTimer::default();
+        let pos_after_seek = proxy.position().await.unwrap_or(0) as f64 / 1_000_000.0;
+        timer_a.set_position(pos_after_seek);
+        timer_a.mark_playing();
+
+        eprintln!("\nPlaying out the end of Song A into Song B by itself...");
+        eprintln!(
+            "{:<6} | {:<10} | {:<28} | {:<12} | {:<12} | {:<8}",
+            "Step", "Elapsed", "Track", "Timer (s)", "D-Bus (s)", "Phase"
+        );
+        eprintln!(
+            "{:-<6}-+-{:-<10}-+-{:-<28}-+-{:-<12}-+-{:-<12}-+-{:-<8}",
+            "", "", "", "", "", ""
+        );
+
+        let t_start = std::time::Instant::now();
+        let mut track_changed = false;
+        let mut timer_b: Option<PlaybackTimer> = None;
+        let mut song_b_start: Option<std::time::Instant> = None;
+        let mut track_b = track_a.clone();
+
+        for step in 1..=45 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let elapsed = t_start.elapsed();
+
+            let cur_meta = match proxy.metadata().await {
+                Ok(m) => crate::mpris::metadata::extract_metadata(&m),
+                Err(_) => track_a.clone(),
+            };
+
+            let real_pos = match proxy.position().await {
+                Ok(us) => us as f64 / 1_000_000.0,
+                Err(_) => 0.0,
+            };
+
+            if !track_changed && cur_meta != track_a {
+                track_changed = true;
+                track_b = cur_meta.clone();
+                song_b_start = Some(std::time::Instant::now());
+
+                let mut t_b = PlaybackTimer::default();
+                let init_b = if real_pos > 0.5 { real_pos } else { 0.0 };
+                t_b.set_position(init_b);
+                t_b.mark_playing();
+                timer_b = Some(t_b);
+
+                eprintln!(
+                    ">>> TRACK CHANGED NATURALLY: {} - {} (init pos: {:.4}s)",
+                    track_b.artist, track_b.title, real_pos
+                );
+            }
+
+            let (active_track_name, timer_val, phase) = if !track_changed {
+                let clamped_timer = timer_a.estimate(true).min(length);
+                let phase = if (length - real_pos).abs() < 0.8 {
+                    "Outro/Pad"
+                } else {
+                    "Ending"
+                };
+                (
+                    format!("{} - {}", track_a.artist, track_a.title),
+                    clamped_timer,
+                    phase,
+                )
+            } else {
+                let timer_val = timer_b.as_ref().map(|t| t.estimate(true)).unwrap_or(0.0);
+                (
+                    format!("{} - {}", track_b.artist, track_b.title),
+                    timer_val,
+                    "Song B",
+                )
+            };
+
+            let truncated_title = if active_track_name.len() > 28 {
+                format!("{}...", &active_track_name[..25])
+            } else {
+                active_track_name
+            };
+
+            eprintln!(
+                "{:<6} | {:<10.2?} | {:<28} | {:<12.4} | {:<12.4} | {:<8}",
+                format!("#{step}"),
+                elapsed,
+                truncated_title,
+                timer_val,
+                real_pos,
+                phase
+            );
+
+            // After 10 steps into Song B, finish the test
+            if let Some(b_start) = song_b_start
+                && b_start.elapsed() > std::time::Duration::from_millis(1200)
+            {
+                break;
+            }
+        }
+        eprintln!("=======================================================\n");
+    }
 }
