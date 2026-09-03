@@ -1,9 +1,11 @@
 //! D-Bus connection management and player discovery for MPRIS.
 
-use super::proxies::{MediaPlayer2PlayerProxy, PlayerctldProxy};
+use super::proxies::PlayerctldProxy;
+use std::ops::Deref;
 use tokio::sync::OnceCell;
 use zbus::fdo::DBusProxy;
 use zbus::names::BusName;
+use zvariant::OwnedValue;
 
 /// Errors that can occur during MPRIS operations
 #[derive(thiserror::Error, Debug)]
@@ -112,14 +114,22 @@ impl PlaybackPriority {
 /// Probe a player's PlaybackStatus with a short timeout to prevent slow or wedged players from hanging.
 pub async fn query_player_priority(conn: &zbus::Connection, service: &str) -> PlaybackPriority {
     let query = async {
-        let proxy = MediaPlayer2PlayerProxy::builder(conn)
-            .destination(service)
-            .ok()?
-            .build()
+        let reply = conn
+            .call_method(
+                Some(service),
+                "/org/mpris/MediaPlayer2",
+                Some("org.freedesktop.DBus.Properties"),
+                "Get",
+                &("org.mpris.MediaPlayer2.Player", "PlaybackStatus"),
+            )
             .await
             .ok()?;
-        let status = proxy.playback_status().await.ok()?;
-        Some(PlaybackPriority::from_status_str(&status))
+        let val: OwnedValue = reply.body().deserialize().ok()?;
+        let status = match val.deref() {
+            zvariant::Value::Str(s) => s.as_str(),
+            _ => return None,
+        };
+        Some(PlaybackPriority::from_status_str(status))
     };
 
     tokio::time::timeout(std::time::Duration::from_millis(50), query)

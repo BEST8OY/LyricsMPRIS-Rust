@@ -289,6 +289,16 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             .await?;
 
         let dbus_proxy = zbus::fdo::DBusProxy::new(&self.conn).await?;
+        let current_unique_name: Option<String> =
+            if let Ok(bus_name) = zbus::names::BusName::try_from(service.as_str()) {
+                dbus_proxy
+                    .get_name_owner(bus_name)
+                    .await
+                    .ok()
+                    .map(|u| u.to_string())
+            } else {
+                None
+            };
 
         // Subscribe to player signals and property changes
         let mut seeked_stream = proxy.receive_seeked().await?;
@@ -446,8 +456,8 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                                 self.state.position,
                             );
 
-                            // If current player transitioned to Paused or Stopped, check if another player is currently Playing
-                            if self.state.playback_status != "Playing"
+                            // If current player transitioned to Stopped, check if another player is currently Playing
+                            if self.state.playback_status == "Stopped"
                                 && let Ok(Some(ref best_service)) = find_best_active_service(
                                     &self.block_list,
                                     &self.target_list,
@@ -490,6 +500,15 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                             if is_playing {
                                 let header = msg.header();
                                 let sender_unique = header.sender().map(|u| u.as_str());
+
+                                // Skip self: If this signal was emitted by the currently monitored player,
+                                // our dedicated status_stream already handles it. Avoid redundant whole-bus scans.
+                                if let Some(ref cur_u) = current_unique_name
+                                    && sender_unique == Some(cur_u.as_str())
+                                {
+                                    continue;
+                                }
+
                                 match find_best_active_service(
                                     &self.block_list,
                                     &self.target_list,
