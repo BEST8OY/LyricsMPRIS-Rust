@@ -44,8 +44,9 @@ pub struct Config {
     #[arg(long = "visible-lines", value_name = "COUNT")]
     pub visible_lines: Option<usize>,
     /// Comma-separated list of lyric providers in preferred order (e.g. "musixmatch,lrclib").
+    /// Supported providers: "lrclib", "musixmatch".
     /// If empty, the LYRIC_PROVIDERS env var will be used as a fallback.
-    #[arg(long, value_delimiter = ',')]
+    #[arg(long, value_delimiter = ',', value_parser = parse_provider)]
     pub providers: Vec<String>,
     /// Path to SQLite lyrics cache database
     #[arg(long = "database")]
@@ -56,6 +57,26 @@ pub struct Config {
     /// Enable Romanization subtitles for foreign scripts (e.g. Romaji/Pinyin)
     #[arg(long)]
     pub romanize: bool,
+}
+
+/// Supported lyrics providers.
+pub const SUPPORTED_PROVIDERS: &[&str] = &["lrclib", "musixmatch"];
+
+/// Validates and normalizes a lyrics provider name.
+pub fn parse_provider(s: &str) -> Result<String, String> {
+    let lower = s.trim().to_lowercase();
+    if SUPPORTED_PROVIDERS.contains(&lower.as_str()) {
+        Ok(lower)
+    } else {
+        Err(format!(
+            "unknown lyrics provider '{s}'. Supported providers are: {}",
+            SUPPORTED_PROVIDERS
+                .iter()
+                .map(|p| format!("'{p}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+    }
 }
 
 impl Default for Config {
@@ -74,19 +95,19 @@ impl Default for Config {
     }
 }
 
-fn providers_from_env_if_empty(cli: &mut Config) {
+fn providers_from_env_if_empty(cli: &mut Config) -> Result<(), String> {
     if cli.providers.is_empty()
         && let Ok(s) = std::env::var("LYRIC_PROVIDERS")
     {
-        let parts: Vec<String> = s
-            .split(',')
-            .map(|p| p.trim().to_lowercase())
-            .filter(|p| !p.is_empty())
-            .collect();
+        let mut parts = Vec::new();
+        for p in s.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()) {
+            parts.push(parse_provider(p)?);
+        }
         if !parts.is_empty() {
             cli.providers = parts;
         }
     }
+    Ok(())
 }
 
 /// Initializes the database if a path is provided in the configuration.
@@ -148,7 +169,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     let mut cfg = Config::parse();
-    providers_from_env_if_empty(&mut cfg);
+    if let Err(err) = providers_from_env_if_empty(&mut cfg) {
+        eprintln!("error: {err}");
+        std::process::exit(1);
+    }
 
     set_isrc_enabled(cfg.isrc);
 
@@ -159,4 +183,57 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         tracing::error!(error = %e, "Application error");
         e
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_provider_valid() {
+        assert_eq!(parse_provider("lrclib").unwrap(), "lrclib");
+        assert_eq!(parse_provider("musixmatch").unwrap(), "musixmatch");
+        assert_eq!(parse_provider("LRCLIB").unwrap(), "lrclib");
+        assert_eq!(parse_provider(" MusixMatch ").unwrap(), "musixmatch");
+    }
+
+    #[test]
+    fn test_parse_provider_invalid() {
+        assert!(parse_provider("lyricmpris").is_err());
+        assert!(parse_provider("spotify").is_err());
+        assert!(parse_provider("").is_err());
+    }
+
+    #[test]
+    fn test_providers_from_env_valid() {
+        unsafe {
+            std::env::set_var("LYRIC_PROVIDERS", "lrclib, musixmatch");
+        }
+        let mut cfg = Config {
+            providers: vec![],
+            ..Default::default()
+        };
+        let res = providers_from_env_if_empty(&mut cfg);
+        assert!(res.is_ok());
+        assert_eq!(cfg.providers, vec!["lrclib", "musixmatch"]);
+        unsafe {
+            std::env::remove_var("LYRIC_PROVIDERS");
+        }
+    }
+
+    #[test]
+    fn test_providers_from_env_invalid() {
+        unsafe {
+            std::env::set_var("LYRIC_PROVIDERS", "lyricmpris");
+        }
+        let mut cfg = Config {
+            providers: vec![],
+            ..Default::default()
+        };
+        let res = providers_from_env_if_empty(&mut cfg);
+        assert!(res.is_err());
+        unsafe {
+            std::env::remove_var("LYRIC_PROVIDERS");
+        }
+    }
 }

@@ -1,6 +1,6 @@
 //! Multi-provider lyrics fetching and caching pipeline.
 
-use crate::lyrics::types::{LyricsError, is_retryable_status};
+use crate::lyrics::types::{LyricsError, ProviderResult, is_retryable_status};
 use crate::mpris::TrackMetadata;
 use crate::state::{Provider, StateBundle};
 
@@ -34,12 +34,55 @@ pub(crate) enum FetchSummary {
     Unavailable,
 }
 
+/// Returns true if the error is considered transient (temporary network issue, rate limit, server outage).
+fn is_transient(err: &LyricsError) -> bool {
+    match err {
+        LyricsError::Network(_) => true,
+        LyricsError::Http(code) if is_retryable_status(*code) => true,
+        _ => false,
+    }
+}
+
 /// Classifies a provider error into retryable vs fatal.
 fn classify_error(err: LyricsError) -> FetchResult {
-    match err {
-        LyricsError::Network(_) => FetchResult::Transient,
-        LyricsError::Http(code) if is_retryable_status(code) => FetchResult::Transient,
-        e => FetchResult::NonTransient(e),
+    if is_transient(&err) {
+        FetchResult::Transient
+    } else {
+        FetchResult::NonTransient(err)
+    }
+}
+
+/// Determines the final fetch summary when neither concurrent provider returned lyrics.
+///
+/// If at least one provider was reached cleanly and confirmed empty lyrics (i.e. `Ok`),
+/// network connectivity is operational (the track simply doesn't exist on those providers).
+/// Only if BOTH providers failed with transient network/retryable errors is the network
+/// classified as `Unavailable` to trigger background retry.
+fn resolve_failed_concurrent_fetch(
+    res_a: &ProviderResult,
+    res_b: &ProviderResult,
+    meta: &TrackMetadata,
+    state: &mut StateBundle,
+) -> FetchSummary {
+    if res_a.is_ok() || res_b.is_ok() {
+        state.update_lyrics(Vec::new(), meta, None, None);
+        return FetchSummary::Exhausted;
+    }
+
+    let a_transient = res_a.as_ref().err().is_some_and(is_transient);
+    let b_transient = res_b.as_ref().err().is_some_and(is_transient);
+
+    if a_transient && b_transient {
+        state.update_lyrics(
+            Vec::new(),
+            meta,
+            Some(NETWORK_RETRY_MESSAGE.to_string()),
+            None,
+        );
+        FetchSummary::Unavailable
+    } else {
+        state.update_lyrics(Vec::new(), meta, None, None);
+        FetchSummary::Exhausted
     }
 }
 
@@ -280,11 +323,14 @@ pub(crate) async fn fetch_api_lyrics(
     }
 
     let mut saw_transient = false;
+    let mut saw_not_found = false;
 
     for provider in providers {
         match try_provider(provider, meta, state).await {
             FetchResult::Success => return FetchSummary::Loaded,
-            FetchResult::NotFound => continue,
+            FetchResult::NotFound => {
+                saw_not_found = true;
+            }
             FetchResult::Transient => {
                 saw_transient = true;
             }
@@ -302,7 +348,7 @@ pub(crate) async fn fetch_api_lyrics(
         }
     }
 
-    if saw_transient {
+    if saw_transient && !saw_not_found {
         // Surface the outage so the UI can display it; the event loop schedules
         // a background retry with exponential backoff.
         state.update_lyrics(
@@ -363,9 +409,10 @@ async fn fetch_concurrent_hedged(
                     .await;
                     FetchSummary::Loaded
                 }
-                _ => {
+                mxm_other => {
                     // Musixmatch missed or errored; wait for in-flight LRCLIB
-                    match lrclib_fut.await {
+                    let lrc_res = lrclib_fut.await;
+                    match lrc_res {
                         Ok((lines, raw, ids)) if !lines.is_empty() => {
                             state.update_lyrics(lines, meta, None, Some(Provider::Lrclib));
                             store_lyrics_in_cache(
@@ -379,23 +426,8 @@ async fn fetch_concurrent_hedged(
                             .await;
                             FetchSummary::Loaded
                         }
-                        Ok(_) => {
-                            state.update_lyrics(Vec::new(), meta, None, None);
-                            FetchSummary::Exhausted
-                        }
-                        Err(e) => {
-                            if matches!(classify_error(e), FetchResult::Transient) {
-                                state.update_lyrics(
-                                    Vec::new(),
-                                    meta,
-                                    Some(NETWORK_RETRY_MESSAGE.to_string()),
-                                    None,
-                                );
-                                FetchSummary::Unavailable
-                            } else {
-                                state.update_lyrics(Vec::new(), meta, None, None);
-                                FetchSummary::Exhausted
-                            }
+                        lrc_other => {
+                            resolve_failed_concurrent_fetch(&mxm_other, &lrc_other, meta, state)
                         }
                     }
                 }
@@ -421,9 +453,10 @@ async fn fetch_concurrent_hedged(
 
                     FetchSummary::Loaded
                 }
-                _ => {
+                lrc_other => {
                     // LRCLIB missed or errored; wait for in-flight Musixmatch
-                    match mxm_fut.await {
+                    let mxm_res = mxm_fut.await;
+                    match mxm_res {
                         Ok((lines, raw, ids)) if !lines.is_empty() => {
                             let format = if lines.iter().any(|l| l.words.is_some()) {
                                 crate::lyrics::database::LyricsFormat::Richsync
@@ -443,23 +476,8 @@ async fn fetch_concurrent_hedged(
                             .await;
                             FetchSummary::Loaded
                         }
-                        Ok(_) => {
-                            state.update_lyrics(Vec::new(), meta, None, None);
-                            FetchSummary::Exhausted
-                        }
-                        Err(e) => {
-                            if matches!(classify_error(e), FetchResult::Transient) {
-                                state.update_lyrics(
-                                    Vec::new(),
-                                    meta,
-                                    Some(NETWORK_RETRY_MESSAGE.to_string()),
-                                    None,
-                                );
-                                FetchSummary::Unavailable
-                            } else {
-                                state.update_lyrics(Vec::new(), meta, None, None);
-                                FetchSummary::Exhausted
-                            }
+                        mxm_other => {
+                            resolve_failed_concurrent_fetch(&lrc_other, &mxm_other, meta, state)
                         }
                     }
                 }
@@ -643,6 +661,79 @@ mod tests {
         assert_eq!(
             determine_musixmatch_provider(&rich_lines),
             Provider::MusixmatchRichsync
+        );
+    }
+
+    #[test]
+    fn test_resolve_failed_concurrent_fetch_one_ok_one_transient() {
+        let mut state = StateBundle::new();
+        let meta = TrackMetadata {
+            title: "Test Song".into(),
+            artist: "Test Artist".into(),
+            ..Default::default()
+        };
+        let ok_empty: ProviderResult = Ok((
+            Vec::new(),
+            None,
+            crate::lyrics::types::TrackMatchInfo::default(),
+        ));
+        let transient_err: ProviderResult = Err(LyricsError::Http(503));
+
+        // When LRCLIB returns Ok (empty/404) and Musixmatch fails transiently
+        let outcome1 =
+            resolve_failed_concurrent_fetch(&ok_empty, &transient_err, &meta, &mut state);
+        assert_eq!(outcome1, FetchSummary::Exhausted);
+        assert_ne!(
+            state.player_state.err.as_deref(),
+            Some(NETWORK_RETRY_MESSAGE)
+        );
+
+        // When Musixmatch returns Ok (empty/not found) and LRCLIB fails transiently
+        let outcome2 =
+            resolve_failed_concurrent_fetch(&transient_err, &ok_empty, &meta, &mut state);
+        assert_eq!(outcome2, FetchSummary::Exhausted);
+        assert_ne!(
+            state.player_state.err.as_deref(),
+            Some(NETWORK_RETRY_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn test_resolve_failed_concurrent_fetch_both_transient() {
+        let mut state = StateBundle::new();
+        let meta = TrackMetadata {
+            title: "Test Song".into(),
+            artist: "Test Artist".into(),
+            ..Default::default()
+        };
+        let transient1: ProviderResult = Err(LyricsError::Http(500));
+        let transient2: ProviderResult = Err(LyricsError::Http(503));
+
+        let outcome = resolve_failed_concurrent_fetch(&transient1, &transient2, &meta, &mut state);
+        assert_eq!(outcome, FetchSummary::Unavailable);
+        assert_eq!(
+            state.player_state.err.as_deref(),
+            Some(NETWORK_RETRY_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn test_resolve_failed_concurrent_fetch_one_nontransient() {
+        let mut state = StateBundle::new();
+        let meta = TrackMetadata {
+            title: "Test Song".into(),
+            artist: "Test Artist".into(),
+            ..Default::default()
+        };
+        let non_transient: ProviderResult = Err(LyricsError::Http(400));
+        let transient: ProviderResult = Err(LyricsError::Http(503));
+
+        let outcome =
+            resolve_failed_concurrent_fetch(&non_transient, &transient, &meta, &mut state);
+        assert_eq!(outcome, FetchSummary::Exhausted);
+        assert_ne!(
+            state.player_state.err.as_deref(),
+            Some(NETWORK_RETRY_MESSAGE)
         );
     }
 }
