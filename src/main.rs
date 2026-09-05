@@ -204,8 +204,11 @@ mod tests {
         assert!(parse_provider("").is_err());
     }
 
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_providers_from_env_valid() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         unsafe {
             std::env::set_var("LYRIC_PROVIDERS", "lrclib, musixmatch");
         }
@@ -223,6 +226,7 @@ mod tests {
 
     #[test]
     fn test_providers_from_env_invalid() {
+        let _lock = ENV_MUTEX.lock().unwrap();
         unsafe {
             std::env::set_var("LYRIC_PROVIDERS", "lyricmpris");
         }
