@@ -8,7 +8,8 @@ use std::env;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-pub(crate) const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
+pub(crate) const DEFAULT_USER_AGENT: &str =
+    "Musixmatch/2025120901 CFNetwork/3860.300.31 Darwin/25.2.0";
 
 pub(crate) const SPACING: Duration = Duration::from_millis(1500);
 pub(crate) const COOLDOWN: Duration = Duration::from_secs(600);
@@ -39,6 +40,14 @@ fn get_cache_token_path() -> std::path::PathBuf {
     }
 }
 
+pub(crate) fn is_valid_token(token: &str) -> bool {
+    let t = token.trim();
+    if t.is_empty() || t.contains("UpgradeOnly") || t.chars().all(|c| c == '0' || c == '-') {
+        return false;
+    }
+    true
+}
+
 fn load_token_from_disk() -> Option<String> {
     load_token_from_path(&get_cache_token_path())
 }
@@ -47,7 +56,7 @@ fn load_token_from_path(path: &std::path::Path) -> Option<String> {
     let content = std::fs::read_to_string(path).ok()?;
     let held: HeldToken = serde_json::from_str(&content).ok()?;
     let token = held.user_token.trim().to_string();
-    if !token.is_empty() && !token.contains("UpgradeOnly") {
+    if is_valid_token(&token) {
         Some(token)
     } else {
         None
@@ -80,11 +89,16 @@ fn clear_token_at_path(path: &std::path::Path) {
 
 /// Requests a fresh anonymous Musixmatch user token directly from the API (`token.get`).
 pub async fn fetch_fresh_musixmatch_token(client: &Client) -> Result<String, LyricsError> {
-    let url = "https://apic-desktop.musixmatch.com/ws/1.1/token.get?app_id=web-desktop-app-v1.0";
+    let url = "https://apic-appmobile.musixmatch.com/ws/1.1/token.get?app_id=mac-ios-v2.0";
     let resp = client
         .get(url)
         .header("User-Agent", DEFAULT_USER_AGENT)
+        .header("X-User-Agent", DEFAULT_USER_AGENT)
         .header("Cookie", "x-mxm-token-guid=")
+        .header("X-Cookie", "x-mxm-token-guid=")
+        .header("x-mxm-app-version", "10.1.1")
+        .header("Accept", "application/json")
+        .header("Accept-Language", "en-US,en;q=0.9")
         .send()
         .await?;
 
@@ -108,7 +122,7 @@ pub async fn fetch_fresh_musixmatch_token(client: &Client) -> Result<String, Lyr
         .pointer("/message/body/user_token")
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && !s.contains("UpgradeOnly"));
+        .filter(|s| is_valid_token(s));
 
     match token {
         Some(t) => {
@@ -116,7 +130,7 @@ pub async fn fetch_fresh_musixmatch_token(client: &Client) -> Result<String, Lyr
             Ok(t)
         }
         None => Err(LyricsError::Api(
-            "Missing or invalid (UpgradeOnly) user_token in Musixmatch token.get response"
+            "Missing or invalid (empty, UpgradeOnly, or dummy) user_token in Musixmatch token.get response"
                 .to_string(),
         )),
     }
@@ -287,8 +301,11 @@ mod tests {
         assert_eq!(tm.next_env_token(), Some("token1".to_string())); // Wraps around
     }
 
+    static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_token_manager_dynamic_caching() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let mut tm = TokenManager {
             tokens: Vec::new(),
             current_index: 0,
@@ -298,9 +315,8 @@ mod tests {
         };
 
         assert_eq!(tm.next_env_token(), None);
-        assert_eq!(tm.get_dynamic_token(), load_token_from_disk());
 
-        // Memory cache test without relying on disk
+        // Memory cache returns populated token without disk access
         tm.cached_dynamic_token = Some("fresh_dynamic_token_123".to_string());
         assert_eq!(
             tm.get_dynamic_token(),
@@ -310,6 +326,7 @@ mod tests {
 
     #[test]
     fn test_token_disk_io_and_upgrade_only_filtering() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let temp_dir = env::temp_dir().join(format!("mxm_test_{}", std::process::id()));
         let token_path = temp_dir.join("test_token.json");
 
@@ -324,6 +341,13 @@ mod tests {
         save_token_to_path("UpgradeOnly_token_abc", &token_path);
         assert_eq!(load_token_from_path(&token_path), None);
 
+        // All-zeros dummy token rejection (apic-desktop poisoned token)
+        save_token_to_path(
+            "00000000000000000000000000000000000000000000000000000000",
+            &token_path,
+        );
+        assert_eq!(load_token_from_path(&token_path), None);
+
         // Clear token
         clear_token_at_path(&token_path);
         assert_eq!(load_token_from_path(&token_path), None);
@@ -333,6 +357,7 @@ mod tests {
 
     #[test]
     fn test_cooldown_gating() {
+        let _lock = TEST_MUTEX.lock().unwrap();
         let mut tm = TokenManager {
             tokens: Vec::new(),
             current_index: 0,

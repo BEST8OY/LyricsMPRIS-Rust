@@ -19,7 +19,7 @@ use crate::lyrics::types::{LyricsError, ProviderResult, TrackMatchInfo, http_cli
 use request::{FetchOutcome, fetch_lyrics_with_token};
 use token::{TOKEN_MANAGER, fetch_fresh_musixmatch_token as get_fresh_token};
 
-/// Fetch lyrics using Musixmatch desktop usertoken (apic-desktop.musixmatch.com).
+/// Fetch lyrics using Musixmatch mobile usertoken (apic-appmobile.musixmatch.com).
 ///
 /// Multi-tier token strategy:
 /// 1. Tries user-configured tokens from `MUSIXMATCH_USERTOKEN` env var in round-robin fashion.

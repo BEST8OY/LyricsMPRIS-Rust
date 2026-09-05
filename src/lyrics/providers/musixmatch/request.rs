@@ -77,7 +77,7 @@ pub(crate) async fn try_macro_for_lyrics(
     client: &Client,
     params: &[(String, String)],
 ) -> Result<FetchOutcome, LyricsError> {
-    let macro_base = "https://apic-desktop.musixmatch.com/ws/1.1/macro.subtitles.get?format=json&namespace=lyrics_richsynched&subtitle_format=mxm&optional_calls=track.richsync&app_id=web-desktop-app-v1.0&";
+    let macro_base = "https://apic-appmobile.musixmatch.com/ws/1.1/macro.subtitles.get?format=json&namespace=lyrics_richsynched&subtitle_format=mxm&optional_calls=track.richsync&app_id=mac-ios-v2.0&richsync_compact_type=words&";
     let macro_url = macro_base.to_string()
         + &params
             .iter()
@@ -88,7 +88,12 @@ pub(crate) async fn try_macro_for_lyrics(
     let macro_resp = client
         .get(&macro_url)
         .header("User-Agent", DEFAULT_USER_AGENT)
+        .header("X-User-Agent", DEFAULT_USER_AGENT)
         .header("Cookie", "x-mxm-token-guid=")
+        .header("X-Cookie", "x-mxm-token-guid=")
+        .header("x-mxm-app-version", "10.1.1")
+        .header("Accept", "application/json")
+        .header("Accept-Language", "en-US,en;q=0.9")
         .send()
         .await?;
 
@@ -177,78 +182,69 @@ pub(crate) async fn fetch_lyrics_with_token(
     track_isrc: Option<&str>,
     track_itunes_id: Option<&str>,
 ) -> Result<FetchOutcome, LyricsError> {
-    // Strategy 1: If we have track identifiers, try direct lookup first
-    // Try in order: Spotify ID, ISRC, iTunes ID
-    if let Some(sid) = track_spotify_id {
-        let mut params = vec![
-            ("track_spotify_id".to_string(), sid.to_string()),
-            ("usertoken".to_string(), token.to_string()),
-        ];
-        if let Some(len) = duration.map(|d| d.round() as i64) {
-            params.push(("q_duration".to_string(), len.to_string()));
-        }
-
-        match try_macro_for_lyrics(client, &params).await? {
-            FetchOutcome::Success(parsed, raw, ids) => {
-                return Ok(FetchOutcome::Success(parsed, raw, ids));
-            }
-            token_err @ FetchOutcome::TokenError { .. } => return Ok(token_err),
-            FetchOutcome::TrackNotFound => {} // fall through to next lookup
-        }
-    }
-
-    if let Some(isrc) = track_isrc {
-        let mut params = vec![
-            ("track_isrc".to_string(), isrc.to_string()),
-            ("usertoken".to_string(), token.to_string()),
-        ];
-        if let Some(len) = duration.map(|d| d.round() as i64) {
-            params.push(("q_duration".to_string(), len.to_string()));
-        }
-
-        match try_macro_for_lyrics(client, &params).await? {
-            FetchOutcome::Success(parsed, raw, ids) => {
-                return Ok(FetchOutcome::Success(parsed, raw, ids));
-            }
-            token_err @ FetchOutcome::TokenError { .. } => return Ok(token_err),
-            FetchOutcome::TrackNotFound => {} // fall through to next lookup
-        }
-    }
-
-    if let Some(itunes) = track_itunes_id {
-        let mut params = vec![
-            ("track_itunes_id".to_string(), itunes.to_string()),
-            ("usertoken".to_string(), token.to_string()),
-        ];
-        if let Some(len) = duration.map(|d| d.round() as i64) {
-            params.push(("q_duration".to_string(), len.to_string()));
-        }
-
-        match try_macro_for_lyrics(client, &params).await? {
-            FetchOutcome::Success(parsed, raw, ids) => {
-                return Ok(FetchOutcome::Success(parsed, raw, ids));
-            }
-            token_err @ FetchOutcome::TokenError { .. } => return Ok(token_err),
-            FetchOutcome::TrackNotFound => {} // fall through to search
-        }
-    }
-
-    // Strategy 2: Query macro.subtitles.get directly with q_track, q_artist, q_album, q_duration.
+    // Build unified single-shot query combining track identifiers and track metadata.
     // Musixmatch resolves matcher.track.get, track.richsync.get, and track.subtitles.get
-    // in a single macro call, cutting round-trips from 2 to 1.
-    let mut search_params = vec![
+    // in a single macro call, matching by ID if indexed and falling back seamlessly within
+    // the same round-trip.
+    let mut params = vec![
         ("q_artist".to_string(), artist.to_string()),
+        ("q_artists".to_string(), artist.to_string()),
         ("q_track".to_string(), title.to_string()),
         ("usertoken".to_string(), token.to_string()),
     ];
     if !album.is_empty() {
-        search_params.push(("q_album".to_string(), album.to_string()));
+        params.push(("q_album".to_string(), album.to_string()));
     }
     if let Some(d) = duration {
-        search_params.push(("q_duration".to_string(), (d.round() as i64).to_string()));
+        let secs = (d.round() as i64).to_string();
+        params.push(("q_duration".to_string(), secs.clone()));
+        params.push(("f_subtitle_length".to_string(), secs));
+        params.push((
+            "f_subtitle_length_max_deviation".to_string(),
+            "2".to_string(),
+        ));
     }
 
-    try_macro_for_lyrics(client, &search_params).await
+    let has_ids = track_spotify_id.is_some() || track_isrc.is_some() || track_itunes_id.is_some();
+    if let Some(sid) = track_spotify_id {
+        params.push(("track_spotify_id".to_string(), sid.to_string()));
+    }
+    if let Some(isrc) = track_isrc {
+        params.push(("track_isrc".to_string(), isrc.to_string()));
+    }
+    if let Some(itunes) = track_itunes_id {
+        params.push(("track_itunes_id".to_string(), itunes.to_string()));
+    }
+
+    let outcome = try_macro_for_lyrics(client, &params).await?;
+
+    // If an ID was supplied and the query resulted in TrackNotFound,
+    // execute a resilient fallback with pure metadata search (omitting IDs)
+    // in case the ID is unmapped or stale in Musixmatch's catalog.
+    if has_ids && matches!(outcome, FetchOutcome::TrackNotFound) {
+        let mut fallback_params = vec![
+            ("q_artist".to_string(), artist.to_string()),
+            ("q_artists".to_string(), artist.to_string()),
+            ("q_track".to_string(), title.to_string()),
+            ("usertoken".to_string(), token.to_string()),
+        ];
+        if !album.is_empty() {
+            fallback_params.push(("q_album".to_string(), album.to_string()));
+        }
+        if let Some(d) = duration {
+            let secs = (d.round() as i64).to_string();
+            fallback_params.push(("q_duration".to_string(), secs.clone()));
+            fallback_params.push(("f_subtitle_length".to_string(), secs));
+            fallback_params.push((
+                "f_subtitle_length_max_deviation".to_string(),
+                "2".to_string(),
+            ));
+        }
+
+        return try_macro_for_lyrics(client, &fallback_params).await;
+    }
+
+    Ok(outcome)
 }
 
 #[cfg(test)]
