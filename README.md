@@ -7,7 +7,7 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 [![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg?style=flat-sq&logo=linux)](https://kernel.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-sq)](LICENSE)
 
-`LyricsMPRIS-Rust` monitors your active media player in real-time using D-Bus, fetches synchronized lyrics automatically, and renders them beautifully in a modern Terminal User Interface (TUI) with word-level karaoke support. It also features a scriptable **Pipe Mode** for status bar integration, **ISRC tag reading** from local audio files, **multi-script Romanization** (Romaji, Pinyin, Cyrillic), and an optimized **local SQLite database** with Zstd compression for instant offline lookups.
+`LyricsMPRIS-Rust` monitors your active media player in real-time using D-Bus, fetches synchronized lyrics automatically, and renders them beautifully in a modern Terminal User Interface (TUI) with word-level karaoke support. It also features a scriptable **Pipe Mode** for status bar integration, **native D-Bus ISRC extraction** with local audio file tag fallback, **multi-script Romanization** (Romaji, Pinyin, Cyrillic), and an optimized **local SQLite database** with Zstd compression for instant offline lookups.
 
 ![LyricMPRIS-Rust](https://github.com/user-attachments/assets/501f224e-6c40-46cd-ac66-cd9ae4f927cf)
 
@@ -42,12 +42,14 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 * **Foreign Script Transliteration**: Automatically generates synchronized Romaji, Pinyin, Korean Hangul, and Cyrillic phonetic subtitles for non-Latin lyrics using `kakasi` and `deunicode`.
 * **Flexible Activation**: Enable at launch via `--romanize` or toggle interactively in the TUI with the `r` key.
 
-### 📚 Multiple Lyrics Providers
+### 📚 Multiple Lyrics Providers & Hedged Racing
 * **LRCLIB**: Fetches community-sourced, line-synced lyrics with support for both centisecond (`.xx`) and millisecond (`.xxx`) timestamp resolutions.
-* **Musixmatch**: Official desktop API integration supporting both word-level timing (**Richsync**) and line-level timing (**Subtitles**).
+* **Musixmatch**: Modern mobile API integration supporting word-level timing (**Richsync**) with compact word payloads and line-level timing (**Subtitles**).
+* **Hedged Concurrent Fetching**: Races Musixmatch and LRCLIB concurrently for instant line-level display (~100–150ms) while preserving in-flight tasks to seamlessly hot-swap to word-level Richsync karaoke upon arrival.
 
 ### 🔑 3-Tier Automatic Musixmatch Token Engine
-* **Zero Configuration Needed**: Automatically fetches a fresh anonymous usertoken directly from Musixmatch API if no user token is provided.
+* **Zero Configuration Needed**: Automatically fetches a fresh anonymous usertoken directly from the Musixmatch mobile API if no user token is provided.
+* **Dummy Token Filtering**: Automatically detects and rejects dummy all-zero tokens returned by rate-limited or blocked endpoints.
 * **Token Rotation**: Supports multiple custom usertokens in `MUSIXMATCH_USERTOKEN` env var, rotated in round-robin order.
 * **Auto-Renewal & Retry**: If a token encounters a rate limit (`429`) or auth error (`401`/`403`), the engine invalidates it, fetches a new token, and retries the request transparently.
 
@@ -55,19 +57,23 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 * **Transient Error Classification**: Automatically distinguishes between missing lyrics and temporary network/server outages (rate limits, DNS failures, 5xx errors).
 * **Exponential Backoff Loop**: Automatically schedules background retries with exponential backoff (up to 30s cap) when providers are temporarily unreachable without interrupting active playback.
 
-### 🏷️ Local File ISRC Extraction
-* Reads local audio file metadata (FLAC, MP3, M4A, OGG) via `lofty` when `--isrc` is enabled to perform pinpoint ISRC lookups.
+### 🏷️ Native D-Bus & Local File ISRC Extraction
+* **Native D-Bus Priority**: Automatically extracts `xesam:isrc` directly from player MPRIS metadata over D-Bus with zero flags, zero disk I/O, and instant precision lookups.
+* **Local File Fallback**: Reads audio file metadata (FLAC, MP3, M4A, OGG) via `lofty` when `--isrc` is enabled for players that do not expose ISRC over D-Bus.
 
 ### 💾 Optimized SQLite Persistence
-* Stores raw lyrics compressed with **zstd** level 3.
-* Multi-identifier indexing (ISRC, Spotify ID, iTunes ID, Artist/Title/Album) ensures instant offline hits without redundant network calls.
+* **Zstd Compression**: Stores raw lyrics compressed with **zstd** level 3.
+* **Typographic Canonicalization**: Canonicalizes smart single/double quotes, typographic dashes (en/em/horizontal), and non-breaking spaces to ASCII for resilient matching.
+* **Remaster Suffix Stripping & Aliasing**: Strips remaster tags (`- 2015 Remaster`, `(Remastered)`, etc.) with 2.0s duration gating, automatically registering aliases in `track_aliases` to self-heal lookups.
+* **Authoritative Identifier Caching**: Player-reported metadata (`meta.isrc`, `meta.spotify_id`, `meta.itunes_id`) is strictly used as query inputs; only verified identifiers returned directly by Musixmatch are persisted to `track_identifiers` to prevent cache pollution.
 
 ### 🚀 Ultra-Low Resource Footprint
-* **Single-Threaded Async Engine**: Utilizes Tokio `current_thread` runtime and asynchronous event streaming, reducing active thread count from N+2 threads down to just 1–2 lightweight threads.
+* **Single-Threaded Async Engine**: Utilizes Tokio `current_thread` runtime and asynchronous event streaming, reducing active thread count down to just 1–2 lightweight threads.
 * **Zero-Allocation Rendering**: Zero-copy span borrowing and chunk-reversed visible line collection eliminate frame-by-frame heap allocations.
-* **Dual-Tier Discovery & Playback Prioritization**: Prefers `playerctld` for recency-ordered player prioritization, with an intelligent, priority-ranked fallback (`Playing` > `Paused` > `Stopped`) via standard D-Bus discovery. Idle or stopped players will never shadow an actively playing player.
-* **Real-Time Lifecycle & Cross-Player Handoff**: 100% event-driven, instant response to player startup, exit, and playback handoff via D-Bus `NameOwnerChanged`, broker-level `PropertiesChanged` match rules, and optional `playerctld` signals. Works completely standalone without requiring `playerctld`.
-* **Pure Event-Driven Idle**: Consumes zero CPU and generates zero IPC traffic when players are inactive or paused, listening asynchronously for D-Bus `NameOwnerChanged`, broker-level `PropertiesChanged` match rules, and `playerctld` signals.
+* **D-Bus Query Timeouts**: Dynamic `Position` and `PlaybackStatus` queries are protected with a 150ms timeout (`DBUS_QUERY_TIMEOUT`), preventing frozen players from stalling the reactor.
+* **Dual-Tier Discovery & Playback Prioritization**: Prefers `playerctld` for recency-ordered player prioritization, with an intelligent fallback (`Playing` > `Paused` > `Stopped`) via standard D-Bus discovery.
+* **Real-Time Lifecycle & Cross-Player Handoff**: 100% event-driven cross-player handoff via D-Bus `NameOwnerChanged` and broker-level `PropertiesChanged` match rules.
+* **Pure Event-Driven Idle & Clean Shutdown**: Consumes zero CPU and generates zero IPC traffic when idle, with clean background task termination via Tokio watch channels.
 
 ---
 
@@ -101,7 +107,7 @@ The optimized executable binary will be created at `./target/release/lyricsmpris
 # Enable local SQLite database caching
 ./target/release/lyricsmpris --database ~/.local/share/lyricsmpris/cache.db
 
-# Enable ISRC extraction from local audio files
+# Enable local audio file tag reading fallback via lofty (native xesam:isrc from D-Bus is automatic)
 ./target/release/lyricsmpris --isrc
 
 # Enable phonetic Romanization subtitles (Romaji/Pinyin/Cyrillic)
@@ -131,7 +137,7 @@ The optimized executable binary will be created at `./target/release/lyricsmpris
 | `--database <PATH>` | Enable SQLite cache at specified file path | `--database ~/.cache/lyrics.db` |
 | `--providers <LIST>` | Comma-separated provider priority order (default: `musixmatch,lrclib`) | `--providers musixmatch,lrclib` |
 | `--visible-lines <COUNT>`| Limit maximum visible lyric lines in TUI | `--visible-lines 3` |
-| `--isrc` | Extract ISRC from local audio files via `lofty` | `--isrc` |
+| `--isrc` | Fallback: read ISRC tags from local audio files via `lofty` (native `xesam:isrc` is always active) | `--isrc` |
 | `--romanize` | Enable phonetic Romanization subtitles (Romaji/Pinyin) | `--romanize` |
 | `--no-karaoke` | Disable per-word karaoke highlighting | `--no-karaoke` |
 | `--pipe` | Output lyrics to `stdout` (no TUI) | `--pipe` |
@@ -224,24 +230,36 @@ CREATE TABLE IF NOT EXISTS track_identifiers (
     ordering INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (kind, value)
 ) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_track_identifiers_lyrics_id_ordering
+ON track_identifiers(lyrics_id, ordering);
 ```
+
+### 🔒 Identifier Separation: Querying vs. Caching
+
+`LyricsMPRIS-Rust` enforces strict separation between player-reported metadata and persistent cached identifiers:
+* **Query Inputs Only**: Player-reported IDs (`xesam:isrc`, `xesam:url`, `mpris:trackid`) and local file tags are used solely as search query inputs to look up existing cache entries or probe external APIs.
+* **No Cache Pollution**: To prevent incorrect, mislabeled, or spoofed user tags from corrupting the database, player-reported IDs are **never** stored into `track_identifiers`.
+* **Authoritative Musixmatch Caching**: Only authoritative identifiers returned directly by the Musixmatch API (`track_isrc`, `track_spotify_id`, `track_itunes_id`) are persisted into `track_identifiers`.
 
 ### Lookup Resolution Priority
 
 When looking up a track in the cache, queries execute in the following order:
 
 1. **ISRC Match** (`track_identifiers` where `kind = 'isrc'`) — Authoritative unique track identifier (punctuation-agnostic normalization).
-2. **Exact Track Alias Match** (`track_aliases` where `artist = ? AND title = ? AND album = ?`) — Case-insensitive multi-album mapping.
+2. **Exact Track Alias Match** (`track_aliases` where `artist = ? AND title = ? AND album = ?`) — Typographically normalized multi-album mapping.
 3. **Spotify ID Match** (`track_identifiers` where `kind = 'spotify'`) — Fallback via Spotify track ID.
 4. **iTunes ID Match** (`track_identifiers` where `kind = 'itunes'`) — Fallback via iTunes track ID.
-5. **Fuzzy Track Match** (`track_aliases` where `artist = ? AND title = ?`) — Resolves matches across compilations or remastered album tags.
+5. **Remaster Suffix Strip & Bidirectional Alias** — Automatically matches clean titles against remastered variants (`- 2015 Remaster`, `(Remastered)`, etc.) within 2.0s duration tolerance, self-healing new entries into `track_aliases`.
+6. **Fuzzy Track Match** (`track_aliases` where `artist = ? AND title = ?`) — Resolves matches across compilations or varying album tags.
 
 ### Compression, Fidelity & Concurrency
 
 - **Zstd Compression**: Raw lyrics payloads are stored as zstd-compressed blobs.
+- **Typographic Canonicalization**: Smart quotes (`’`, `“`), typographic dashes (`–`, `—`), and non-breaking spaces are canonicalized to standard ASCII for all string lookups.
 - **Duration Tolerance**: Clamped within a 2.0s tolerance window; duration-mismatched entries are retained (multi-version matching for live vs. studio recordings); only corrupt or unparseable payloads are purged.
 - **Format Fidelity Ranking**: Richsync (word-level, rank 3) > Subtitles (line-level, rank 2) > LRCLIB (LRC, rank 1). Incoming lower-fidelity fetches never downgrade higher-fidelity cached lyrics.
-- **Writer Concurrency**: Uses WAL journal mode with `BEGIN IMMEDIATE` and a busy timeout to serialize concurrent database transactions without lock contention.
+- **Writer Concurrency**: Uses WAL journal mode with `SqliteSynchronous::Normal`, `BEGIN IMMEDIATE`, and a 5-second busy timeout to serialize concurrent database transactions without lock contention.
 
 ---
 
