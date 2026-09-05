@@ -109,25 +109,9 @@ pub(crate) async fn store_lyrics_in_cache(
     provider_itunes_ids: &[String],
 ) {
     if let Some(raw_text) = raw {
-        // Note: meta.isrc from local file tags is intentionally NOT merged here
-        // to prevent saving incorrect or corrupted user file tags into the database.
-        // Only authoritative ISRCs returned directly by providers are stored.
-        let mut spotify_ids = provider_spotify_ids.to_vec();
-        if let Some(meta_sid) = &meta.spotify_id
-            && !spotify_ids.iter().any(|s| s.eq_ignore_ascii_case(meta_sid))
-        {
-            spotify_ids.push(meta_sid.clone());
-        }
-
-        let mut itunes_ids = provider_itunes_ids.to_vec();
-        if let Some(meta_itunes) = &meta.itunes_id
-            && !itunes_ids
-                .iter()
-                .any(|s| s.eq_ignore_ascii_case(meta_itunes))
-        {
-            itunes_ids.push(meta_itunes.clone());
-        }
-
+        // Note: Player/file reported identifiers (meta.isrc, meta.spotify_id, meta.itunes_id)
+        // are intentionally NOT cached here. We only cache authoritative identifiers
+        // reported directly by Musixmatch to prevent caching unverified or spoofed player metadata.
         crate::lyrics::database::store_in_database(
             &meta.artist,
             &meta.title,
@@ -136,8 +120,8 @@ pub(crate) async fn store_lyrics_in_cache(
             format,
             raw_text,
             provider_isrcs,
-            &spotify_ids,
-            &itunes_ids,
+            provider_spotify_ids,
+            provider_itunes_ids,
         )
         .await;
     }
