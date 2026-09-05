@@ -47,6 +47,13 @@ pub async fn initialize(path: PathBuf) {
     }
 }
 
+/// Returns true if the database connection pool has been initialized.
+#[allow(dead_code)]
+#[must_use]
+pub fn is_initialized() -> bool {
+    DB_POOL.get().is_some()
+}
+
 /// Attempts to fetch lyrics from the database cache.
 ///
 /// Uses indexed SQL query for fast lookup with minimal memory usage.

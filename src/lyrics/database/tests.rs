@@ -1,17 +1,28 @@
 //! Integration and unit tests for database CRUD operations, alias deduplication, and identifier indexing.
 
+use super::compress::{normalize, strip_remaster_suffix};
 use super::ops::{delete_cached_row, fetch_from_database_inner, store_in_database_inner};
 use super::schema::{LyricsFormat, create_schema};
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::SqlitePool;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use std::str::FromStr;
+
+pub(crate) async fn create_test_pool() -> SqlitePool {
+    let options = SqliteConnectOptions::from_str("sqlite::memory:")
+        .unwrap()
+        .foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    create_schema(&pool).await.unwrap();
+    pool
+}
 
 #[tokio::test]
 async fn test_database_crud_and_lookups() {
-    let pool = SqlitePoolOptions::new()
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-
-    create_schema(&pool).await.unwrap();
+    let pool = create_test_pool().await;
 
     let lrc_content = "[00:10.00]Test lyric line 1\n[00:20.00]Test lyric line 2";
     let isrcs = vec!["USUM71234567".to_string(), "ALTISRC99999".to_string()];
@@ -746,4 +757,505 @@ async fn test_database_isrc_normalization() {
     )
     .await;
     assert!(res_hyphen.is_some());
+}
+
+#[tokio::test]
+async fn test_database_stale_alias_update_on_duration_mismatch() {
+    let pool = create_test_pool().await;
+
+    // 1. Store 300s Live version under Album "Greatest Hits"
+    store_in_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Greatest Hits",
+        Some(300.0),
+        LyricsFormat::Lrclib,
+        "[00:10.00]Live version".to_string(),
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+
+    // 2. Store 180s Studio version under Album "Original Album"
+    store_in_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Original Album",
+        Some(180.0),
+        LyricsFormat::Lrclib,
+        "[00:10.00]Studio version".to_string(),
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+
+    // 3. User plays 180s Studio version labeled under "Greatest Hits".
+    // Initial alias for "Greatest Hits" pointed to 300s recording.
+    // Step 2 rejects due to duration mismatch.
+    // Step 5 matches "Artist", "Song" with duration 180s, and updates the alias to point to the 180s recording.
+    let res = fetch_from_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Greatest Hits",
+        Some(180.0),
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(res.is_some());
+    let (prov, _) = res.unwrap();
+    let (lines, _, _) = prov.unwrap();
+    assert_eq!(lines[0].text, "Studio version");
+
+    // 4. Verify that the alias was updated: next query for 180s on "Greatest Hits" hits directly
+    let res_subsequent = fetch_from_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Greatest Hits",
+        Some(180.0),
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(res_subsequent.is_some());
+    let (prov2, _) = res_subsequent.unwrap();
+    let (lines2, _, _) = prov2.unwrap();
+    assert_eq!(lines2[0].text, "Studio version");
+}
+
+#[tokio::test]
+async fn test_database_empty_and_corrupt_lyrics_purging() {
+    let pool = create_test_pool().await;
+
+    // 1. Attempt to store empty / whitespace-only raw lyrics -> should not insert row
+    store_in_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Album",
+        Some(180.0),
+        LyricsFormat::Lrclib,
+        "   \n\t  ".to_string(),
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM lyrics")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 0);
+
+    // 2. Store valid raw lyrics
+    store_in_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Album",
+        Some(180.0),
+        LyricsFormat::Lrclib,
+        "[00:10.00]Valid line".to_string(),
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM lyrics")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count.0, 1);
+
+    // 3. Corrupt raw_lyrics with non-decompressable junk bytes in the database
+    sqlx::query("UPDATE lyrics SET raw_lyrics = X'12345678'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Fetch should detect decompression failure, purge the row, and return None
+    let res = fetch_from_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Album",
+        Some(180.0),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(res.is_none());
+
+    // Row should have been purged
+    let count_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM lyrics")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count_after.0, 0);
+}
+
+#[tokio::test]
+async fn test_database_duration_zero_unknown_tolerance() {
+    let pool = create_test_pool().await;
+
+    // Store track with known length 200.0s
+    store_in_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Album",
+        Some(200.0),
+        LyricsFormat::Lrclib,
+        "[00:10.00]Line 1".to_string(),
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+
+    // Query with length 0.0s (e.g., streaming radio or player metadata not yet loaded)
+    // Should be treated as unknown duration and match instead of rejecting as 200s difference
+    let res_zero = fetch_from_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Album",
+        Some(0.0),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(res_zero.is_some());
+}
+
+#[tokio::test]
+async fn test_database_consolidated_identifier_ordering() {
+    let pool = create_test_pool().await;
+
+    let isrcs = vec![
+        "ISRC11111111".to_string(),
+        "ISRC22222222".to_string(),
+        "ISRC33333333".to_string(),
+    ];
+    let spot_ids = vec!["spot_1".to_string(), "spot_2".to_string()];
+    let itunes_ids = vec!["itunes_1".to_string(), "itunes_2".to_string()];
+
+    store_in_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Album",
+        Some(180.0),
+        LyricsFormat::Lrclib,
+        "[00:10.00]Line".to_string(),
+        &isrcs,
+        &spot_ids,
+        &itunes_ids,
+    )
+    .await;
+
+    // Fetch and check all identifiers are preserved in order
+    let res = fetch_from_database_inner(
+        &pool,
+        "Artist",
+        "Song",
+        "Album",
+        Some(180.0),
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(res.is_some());
+    let (prov, _) = res.unwrap();
+    let (_, _, ids) = prov.unwrap();
+
+    assert_eq!(ids.track_isrcs, isrcs);
+    assert_eq!(ids.track_spotify_ids, spot_ids);
+    assert_eq!(ids.track_itunes_ids, itunes_ids);
+}
+
+#[test]
+fn test_database_punctuation_canonicalization() {
+    // Smart apostrophes & backticks
+    assert_eq!(normalize("Don’t Stop"), "don't stop");
+    assert_eq!(normalize("‘Don’t’"), "'don't'");
+    assert_eq!(normalize("Don`t Stop"), "don't stop");
+
+    // Smart double quotes
+    assert_eq!(normalize("“Heroes”"), "\"heroes\"");
+    assert_eq!(normalize("„Heroes‟"), "\"heroes\"");
+
+    // Dashes (en-dash, em-dash, horizontal bar)
+    assert_eq!(normalize("Artist – Song"), "artist - song");
+    assert_eq!(normalize("Artist — Song"), "artist - song");
+    assert_eq!(normalize("Artist ― Song"), "artist - song");
+
+    // Non-breaking & zero-width spaces
+    assert_eq!(normalize("Song\u{00A0}Title"), "song title");
+    assert_eq!(normalize("Song\u{200B}Title"), "songtitle");
+    assert_eq!(normalize("Song\u{FEFF}Title"), "songtitle");
+}
+
+#[test]
+fn test_database_strip_remaster_suffix() {
+    // Standard hyphen remasters
+    assert_eq!(
+        strip_remaster_suffix("Heroes - 2015 Remaster"),
+        Some("Heroes".to_string())
+    );
+    assert_eq!(
+        strip_remaster_suffix("Heroes - Remastered"),
+        Some("Heroes".to_string())
+    );
+    assert_eq!(
+        strip_remaster_suffix("Heroes - Remaster"),
+        Some("Heroes".to_string())
+    );
+    assert_eq!(
+        strip_remaster_suffix("Heroes - 2011 - Remaster"),
+        Some("Heroes".to_string())
+    );
+    assert_eq!(
+        strip_remaster_suffix("Heroes - 2009 Digital Remaster"),
+        Some("Heroes".to_string())
+    );
+    assert_eq!(
+        strip_remaster_suffix("Heroes - Digital Remaster"),
+        Some("Heroes".to_string())
+    );
+
+    // Parentheses and brackets
+    assert_eq!(
+        strip_remaster_suffix("Heroes (2015 Remastered Version)"),
+        Some("Heroes".to_string())
+    );
+    assert_eq!(
+        strip_remaster_suffix("Heroes [2011 Remaster]"),
+        Some("Heroes".to_string())
+    );
+    assert_eq!(
+        strip_remaster_suffix("Heroes (Remastered 2011)"),
+        Some("Heroes".to_string())
+    );
+    assert_eq!(
+        strip_remaster_suffix("Heroes (40th Anniversary Remaster)"),
+        Some("Heroes".to_string())
+    );
+
+    // Should NOT strip semantic versions
+    assert_eq!(strip_remaster_suffix("Heroes (Live at Wembley)"), None);
+    assert_eq!(strip_remaster_suffix("Heroes (feat. Brian Eno)"), None);
+    assert_eq!(strip_remaster_suffix("Heroes (Radio Edit)"), None);
+    assert_eq!(strip_remaster_suffix("Heroes"), None);
+    assert_eq!(strip_remaster_suffix("Remaster"), None);
+}
+
+#[tokio::test]
+async fn test_database_punctuation_store_and_query() {
+    let pool = create_test_pool().await;
+
+    // Store with smart apostrophe and typographic dash
+    store_in_database_inner(
+        &pool,
+        "Fleetwood Mac",
+        "Don’t Stop — Remastered",
+        "Rumours",
+        Some(193.0),
+        LyricsFormat::Lrclib,
+        "[00:10.00]Don't stop thinking about tomorrow".to_string(),
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+
+    // Query with straight apostrophe and ASCII hyphen
+    let res = fetch_from_database_inner(
+        &pool,
+        "Fleetwood Mac",
+        "Don't Stop - Remastered",
+        "Rumours",
+        Some(193.0),
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(res.is_some());
+    let (prov, _) = res.unwrap();
+    let (lines, _, _) = prov.unwrap();
+    assert_eq!(lines[0].text, "Don't stop thinking about tomorrow");
+}
+
+#[tokio::test]
+async fn test_database_remaster_bidirectional_aliasing() {
+    let pool = create_test_pool().await;
+
+    // 1. Store clean title in DB
+    store_in_database_inner(
+        &pool,
+        "David Bowie",
+        "Heroes",
+        "Heroes",
+        Some(360.0),
+        LyricsFormat::Lrclib,
+        "[00:10.00]I will be king".to_string(),
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+
+    // 2. Query with player's remaster title: "Heroes - 2015 Remaster"
+    // Should match via fallback and self-heal
+    let res_remaster = fetch_from_database_inner(
+        &pool,
+        "David Bowie",
+        "Heroes - 2015 Remaster",
+        "Heroes",
+        Some(360.0),
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(res_remaster.is_some());
+    let (prov, _) = res_remaster.unwrap();
+    let (lines, _, _) = prov.unwrap();
+    assert_eq!(lines[0].text, "I will be king");
+
+    // Verify self-healing alias exists in DB
+    let alias_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM track_aliases WHERE artist = 'david bowie' AND title = 'heroes - 2015 remaster'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(alias_count.0, 1);
+
+    // 3. Second track: Store with remaster annotation in title
+    store_in_database_inner(
+        &pool,
+        "Queen",
+        "Bohemian Rhapsody (2011 Remaster)",
+        "A Night at the Opera",
+        Some(354.0),
+        LyricsFormat::Lrclib,
+        "[00:10.00]Is this the real life".to_string(),
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+
+    // Both "bohemian rhapsody (2011 remaster)" AND "bohemian rhapsody" should be in track_aliases
+    let aliases: Vec<(String,)> =
+        sqlx::query_as("SELECT title FROM track_aliases WHERE artist = 'queen' ORDER BY title ASC")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(aliases.len(), 2);
+    assert_eq!(aliases[0].0, "bohemian rhapsody");
+    assert_eq!(aliases[1].0, "bohemian rhapsody (2011 remaster)");
+
+    // Query clean title: "Bohemian Rhapsody"
+    let res_clean = fetch_from_database_inner(
+        &pool,
+        "Queen",
+        "Bohemian Rhapsody",
+        "A Night at the Opera",
+        Some(354.0),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(res_clean.is_some());
+
+    // Query another remaster variation: "Bohemian Rhapsody - 2015 Remaster"
+    let res_other_remaster = fetch_from_database_inner(
+        &pool,
+        "Queen",
+        "Bohemian Rhapsody - 2015 Remaster",
+        "A Night at the Opera",
+        Some(354.0),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(res_other_remaster.is_some());
+
+    // Verify canonical lyrics table has exactly 2 rows (one for David Bowie, one for Queen)
+    let total_lyrics: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM lyrics")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(total_lyrics.0, 2);
+}
+
+#[tokio::test]
+async fn test_database_remaster_duration_gating() {
+    let pool = create_test_pool().await;
+
+    // Store track with length 360.0s
+    store_in_database_inner(
+        &pool,
+        "David Bowie",
+        "Heroes",
+        "Heroes",
+        Some(360.0),
+        LyricsFormat::Lrclib,
+        "[00:10.00]Full album version".to_string(),
+        &[],
+        &[],
+        &[],
+    )
+    .await;
+
+    // Query with single edit / different version length (180.0s) -> should NOT match
+    let res_mismatch = fetch_from_database_inner(
+        &pool,
+        "David Bowie",
+        "Heroes - 2015 Remaster",
+        "Heroes",
+        Some(180.0),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(res_mismatch.is_none());
+
+    // Query with matching length (361.0s, within 2.0s tolerance) -> should match
+    let res_match = fetch_from_database_inner(
+        &pool,
+        "David Bowie",
+        "Heroes - 2015 Remaster",
+        "Heroes",
+        Some(361.0),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(res_match.is_some());
 }

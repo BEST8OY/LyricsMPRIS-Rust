@@ -3,7 +3,6 @@
 use crate::lyrics::types::TrackMatchInfo;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
-use std::str::FromStr;
 
 /// Maximum allowable duration difference (in seconds) between the queried track
 /// and the cached entry before invalidating and purging the cache row.
@@ -126,8 +125,8 @@ pub(crate) async fn create_schema(pool: &SqlitePool) -> Result<(), sqlx::Error> 
 
     sqlx::query(
         r#"
-        CREATE INDEX IF NOT EXISTS idx_track_identifiers_lyrics_id
-        ON track_identifiers(lyrics_id)
+        CREATE INDEX IF NOT EXISTS idx_track_identifiers_lyrics_id_ordering
+        ON track_identifiers(lyrics_id, ordering)
         "#,
     )
     .execute(pool)
@@ -144,11 +143,13 @@ pub(crate) async fn open_database(path: &Path) -> Result<SqlitePool, sqlx::Error
     }
 
     // Configure SQLite connection
-    let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))?
+    let options = SqliteConnectOptions::new()
+        .filename(path)
         .create_if_missing(true)
         .foreign_keys(true)
         .busy_timeout(std::time::Duration::from_secs(5))
-        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal); // Write-Ahead Logging for better concurrency
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal) // Write-Ahead Logging for better concurrency
+        .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
 
     // Create connection pool (max 2 connections)
     let pool = SqlitePoolOptions::new()
