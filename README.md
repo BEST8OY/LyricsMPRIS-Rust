@@ -7,7 +7,7 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 [![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg?style=flat-sq&logo=linux)](https://kernel.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-sq)](LICENSE)
 
-`LyricsMPRIS-Rust` monitors your active media player in real-time using D-Bus, fetches synchronized lyrics automatically, and renders them beautifully in a modern Terminal User Interface (TUI) with word-level karaoke support. It also features a scriptable **Pipe Mode** for status bar integration, **native D-Bus ISRC extraction** with local audio file tag fallback, **multi-script Romanization** (Romaji, Pinyin, Cyrillic), and an optimized **local SQLite database** with Zstd compression for instant offline lookups.
+`LyricsMPRIS-Rust` monitors your active media player in real-time using D-Bus, fetches synchronized lyrics automatically, and renders them beautifully in a modern Terminal User Interface (TUI) with word-level karaoke support. It also features a scriptable **Pipe Mode** for status bar integration, **ISRC tag reading** from local audio files, **multi-script Romanization** (Romaji, Pinyin, Cyrillic), and an optimized **local SQLite database** with Zstd compression for instant offline lookups.
 
 ![LyricMPRIS-Rust](https://github.com/user-attachments/assets/501f224e-6c40-46cd-ac66-cd9ae4f927cf)
 
@@ -57,9 +57,8 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 * **Transient Error Classification**: Automatically distinguishes between missing lyrics and temporary network/server outages (rate limits, DNS failures, 5xx errors).
 * **Exponential Backoff Loop**: Automatically schedules background retries with exponential backoff (up to 30s cap) when providers are temporarily unreachable without interrupting active playback.
 
-### 🏷️ Native D-Bus & Local File ISRC Extraction
-* **Native D-Bus Priority**: Automatically extracts `xesam:isrc` directly from player MPRIS metadata over D-Bus with zero flags, zero disk I/O, and instant precision lookups.
-* **Local File Fallback**: Reads audio file metadata (FLAC, MP3, M4A, OGG) via `lofty` when `--isrc` is enabled for players that do not expose ISRC over D-Bus.
+### 🏷️ Local File ISRC Extraction
+* Reads local audio file metadata (FLAC, MP3, M4A, OGG) via `lofty` when `--isrc` is enabled to perform pinpoint ISRC lookups.
 
 ### 💾 Optimized SQLite Persistence
 * **Zstd Compression**: Stores raw lyrics compressed with **zstd** level 3.
@@ -107,7 +106,7 @@ The optimized executable binary will be created at `./target/release/lyricsmpris
 # Enable local SQLite database caching
 ./target/release/lyricsmpris --database ~/.local/share/lyricsmpris/cache.db
 
-# Enable local audio file tag reading fallback via lofty (native xesam:isrc from D-Bus is automatic)
+# Enable ISRC extraction from local audio files via lofty
 ./target/release/lyricsmpris --isrc
 
 # Enable phonetic Romanization subtitles (Romaji/Pinyin/Cyrillic)
@@ -137,7 +136,7 @@ The optimized executable binary will be created at `./target/release/lyricsmpris
 | `--database <PATH>` | Enable SQLite cache at specified file path | `--database ~/.cache/lyrics.db` |
 | `--providers <LIST>` | Comma-separated provider priority order (default: `musixmatch,lrclib`) | `--providers musixmatch,lrclib` |
 | `--visible-lines <COUNT>`| Limit maximum visible lyric lines in TUI | `--visible-lines 3` |
-| `--isrc` | Fallback: read ISRC tags from local audio files via `lofty` (native `xesam:isrc` is always active) | `--isrc` |
+| `--isrc` | Extract ISRC from local audio files via `lofty` | `--isrc` |
 | `--romanize` | Enable phonetic Romanization subtitles (Romaji/Pinyin) | `--romanize` |
 | `--no-karaoke` | Disable per-word karaoke highlighting | `--no-karaoke` |
 | `--pipe` | Output lyrics to `stdout` (no TUI) | `--pipe` |
@@ -238,7 +237,7 @@ ON track_identifiers(lyrics_id, ordering);
 ### 🔒 Identifier Separation: Querying vs. Caching
 
 `LyricsMPRIS-Rust` enforces strict separation between player-reported metadata and persistent cached identifiers:
-* **Query Inputs Only**: Player-reported IDs (`xesam:isrc`, `xesam:url`, `mpris:trackid`) and local file tags are used solely as search query inputs to look up existing cache entries or probe external APIs.
+* **Query Inputs Only**: Player-reported IDs (`xesam:url`, `mpris:trackid`) and local audio file tags (when `--isrc` is enabled) are used solely as search query inputs to look up existing cache entries or probe external APIs.
 * **No Cache Pollution**: To prevent incorrect, mislabeled, or spoofed user tags from corrupting the database, player-reported IDs are **never** stored into `track_identifiers`.
 * **Authoritative Musixmatch Caching**: Only authoritative identifiers returned directly by the Musixmatch API (`track_isrc`, `track_spotify_id`, `track_itunes_id`) are persisted into `track_identifiers`.
 
