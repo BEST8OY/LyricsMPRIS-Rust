@@ -86,8 +86,8 @@ pub(crate) async fn handle_mpris_event(
                 return RetryDirective::Keep;
             }
 
-            // Compensate for any time the event spent waiting in the channel queue
-            let queue_latency = sampled_at.elapsed().as_secs_f64();
+            // Compensate for any time the event spent waiting in the channel queue (capped at 2.0s)
+            let queue_latency = sampled_at.elapsed().as_secs_f64().min(2.0);
             let effective_pos = position + queue_latency;
 
             handle_state_update(effective_pos, None, state, update_tx).await;
@@ -203,7 +203,7 @@ pub(crate) async fn handle_mpris_event(
 }
 
 /// Clears state when no player is active.
-pub(crate) async fn handle_no_player(state: &mut StateBundle, update_tx: &mpsc::Sender<Update>) {
+pub async fn handle_no_player(state: &mut StateBundle, update_tx: &mpsc::Sender<Update>) {
     state.clear_lyrics();
     state.player_state = Default::default();
     send_update(state, update_tx, true).await;
@@ -304,7 +304,7 @@ pub(crate) async fn handle_state_update(
         state.update_playback_and_position(playing, effective_position);
 
     if playing_changed || changed_index || position_jumped {
-        send_update(state, update_tx, position_jumped).await;
+        send_update(state, update_tx, playing_changed || position_jumped).await;
     }
 }
 

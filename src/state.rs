@@ -198,23 +198,12 @@ impl PlayerState {
     /// * `playing` - True if the player is playing, false if paused
     /// * `position` - Current playback position in seconds
     pub fn update_playback_dbus(&mut self, playing: bool, position: f64) {
-        let timer_position = self.estimate_position();
         self.set_position(position);
 
         if playing {
             self.start_playing();
-            tracing::debug!(
-                timer_pos = timer_position,
-                mpris_pos = position,
-                "Playback resumed"
-            );
         } else {
             self.pause();
-            tracing::debug!(
-                timer_pos = timer_position,
-                mpris_pos = position,
-                "Playback paused"
-            );
         }
     }
 
@@ -277,6 +266,7 @@ impl PlayerState {
         if !self.playing {
             self.playing = true;
             self.timer.mark_playing();
+            tracing::debug!(pos = self.position, "Playback resumed");
         }
     }
 
@@ -287,6 +277,7 @@ impl PlayerState {
         if self.playing {
             self.playing = false;
             self.timer.mark_paused();
+            tracing::debug!(pos = self.position, "Playback paused");
         }
     }
 }
@@ -476,7 +467,9 @@ impl StateBundle {
         }
 
         // Only send updates when there's something worth showing to the UI
-        self.has_lyrics() || self.player_state.err.is_some()
+        self.has_lyrics()
+            || self.player_state.err.is_some()
+            || self.player_state.playing != self.last_sent_playing
     }
 
     /// Marks the current state as sent to prevent redundant updates.
@@ -585,7 +578,7 @@ impl StateBundle {
         let playing_changed = prev_playing != self.player_state.playing;
         let position_jumped = (current_position - prev_position).abs() > 0.5;
 
-        if playing_changed || position_jumped {
+        if !changed_index && (playing_changed || position_jumped) {
             self.increment_version();
         }
 
@@ -668,5 +661,35 @@ mod tests {
 
         assert_eq!(state.get_index(15.0), Some(0));
         assert_eq!(state.get_index(25.0), Some(1));
+    }
+
+    #[test]
+    fn test_update_playback_and_position_version_increment() {
+        let mut bundle = StateBundle::new();
+        bundle.lyric_state.update_lines(vec![
+            LyricLine::new(10.0, "Line 1"),
+            LyricLine::new(20.0, "Line 2"),
+        ]);
+        let base_version = bundle.version;
+
+        // Position jump + index change should increment version by exactly 1
+        let (playing_changed, index_changed, position_jumped) =
+            bundle.update_playback_and_position(true, 15.0);
+
+        assert!(playing_changed);
+        assert!(index_changed);
+        assert!(position_jumped);
+        assert_eq!(bundle.version, base_version + 1);
+    }
+
+    #[test]
+    fn test_should_send_update_on_playback_change_without_lyrics() {
+        let mut bundle = StateBundle::new();
+        // Initially no lyrics, not playing, version 0
+        bundle.mark_state_sent();
+
+        // Not playing -> playing without lyrics should still trigger update
+        bundle.player_state.playing = true;
+        assert!(bundle.should_send_update(false));
     }
 }

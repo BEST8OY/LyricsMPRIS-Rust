@@ -164,8 +164,15 @@ pub async fn listen(
 ) {
     let loop_config = LoopConfig::new(config);
     let mut loop_state = LoopState::new();
+    let (watcher_shutdown_tx, watcher_shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let (event_tx, event_rx) = initialize_loop(&mut loop_state, &update_tx, &loop_config).await;
+    let (event_tx, event_rx) = initialize_loop(
+        &mut loop_state,
+        &update_tx,
+        &loop_config,
+        watcher_shutdown_rx,
+    )
+    .await;
 
     run_event_loop(
         loop_state,
@@ -173,6 +180,7 @@ pub async fn listen(
         event_rx,
         update_tx,
         shutdown_rx,
+        watcher_shutdown_tx,
         loop_config,
     )
     .await;
@@ -193,6 +201,7 @@ async fn initialize_loop(
     loop_state: &mut LoopState,
     update_tx: &mpsc::Sender<Update>,
     config: &LoopConfig,
+    watcher_shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> (mpsc::Sender<Event>, mpsc::Receiver<Event>) {
     tracing::debug!("Initializing event loop");
     let (event_tx, event_rx) = mpsc::channel::<Event>(16);
@@ -205,10 +214,10 @@ async fn initialize_loop(
         send_update(&mut loop_state.state_bundle, update_tx, true).await;
     } else {
         tracing::debug!("No active player found");
-        handle_no_player(loop_state, update_tx).await;
+        crate::event::handle_no_player(&mut loop_state.state_bundle, update_tx).await;
     }
 
-    spawn_mpris_watcher(event_tx.clone(), config);
+    spawn_mpris_watcher(event_tx.clone(), config, watcher_shutdown_rx);
 
     (event_tx, event_rx)
 }
@@ -271,15 +280,6 @@ async fn discover_active_player(config: &LoopConfig) -> Option<String> {
             None
         }
     }
-}
-
-/// Handles the case where no active player is found.
-///
-/// Clears all state and notifies the UI to display an empty state.
-async fn handle_no_player(loop_state: &mut LoopState, update_tx: &mpsc::Sender<Update>) {
-    loop_state.state_bundle.clear_lyrics();
-    loop_state.state_bundle.player_state = Default::default();
-    send_update(&mut loop_state.state_bundle, update_tx, true).await;
 }
 
 /// Fetches initial metadata for the discovered player service.
@@ -360,7 +360,11 @@ async fn initialize_lyrics_state(
 /// If initialization fails or the D-Bus connection is lost, the watcher automatically
 /// retries with exponential backoff (500 ms up to 30 s). Backoff is reset to 500 ms
 /// only after sustained uptime (>= 5 seconds).
-fn spawn_mpris_watcher(event_tx: mpsc::Sender<Event>, config: &LoopConfig) {
+fn spawn_mpris_watcher(
+    event_tx: mpsc::Sender<Event>,
+    config: &LoopConfig,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
     tracing::debug!("Spawning MPRIS event watcher");
     let block_list = config.block_list().to_vec();
     let target_list = config.target_list().to_vec();
@@ -368,6 +372,11 @@ fn spawn_mpris_watcher(event_tx: mpsc::Sender<Event>, config: &LoopConfig) {
     tokio::spawn(async move {
         let mut backoff = std::time::Duration::from_millis(500);
         loop {
+            if *shutdown_rx.borrow() || event_tx.is_closed() {
+                tracing::debug!("MPRIS event watcher terminating on shutdown");
+                break;
+            }
+
             let handler_result =
                 MprisEventHandler::new(event_tx.clone(), block_list.clone(), target_list.clone())
                     .await;
@@ -375,11 +384,19 @@ fn spawn_mpris_watcher(event_tx: mpsc::Sender<Event>, config: &LoopConfig) {
             match handler_result {
                 Ok(mut handler) => {
                     let start = std::time::Instant::now();
-                    if let Err(e) = handler.handle_events().await {
-                        tracing::warn!(
-                            error = %e,
-                            "MPRIS event handler terminated, retrying..."
-                        );
+                    tokio::select! {
+                        res = handler.handle_events() => {
+                            if let Err(e) = res {
+                                tracing::warn!(
+                                    error = %e,
+                                    "MPRIS event handler terminated, retrying..."
+                                );
+                            }
+                        }
+                        _ = shutdown_rx.changed() => {
+                            tracing::debug!("MPRIS event watcher received shutdown signal");
+                            break;
+                        }
                     }
                     if start.elapsed() >= std::time::Duration::from_secs(5) {
                         backoff = std::time::Duration::from_millis(500);
@@ -394,7 +411,13 @@ fn spawn_mpris_watcher(event_tx: mpsc::Sender<Event>, config: &LoopConfig) {
                 }
             }
 
-            tokio::time::sleep(backoff).await;
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = shutdown_rx.changed() => {
+                    tracing::debug!("MPRIS event watcher received shutdown during backoff");
+                    break;
+                }
+            }
             backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
         }
     });
@@ -420,12 +443,14 @@ async fn run_event_loop(
     mut event_rx: mpsc::Receiver<Event>,
     update_tx: mpsc::Sender<Update>,
     mut shutdown_rx: mpsc::Receiver<()>,
+    watcher_shutdown_tx: tokio::sync::watch::Sender<bool>,
     config: LoopConfig,
 ) {
     loop {
         tokio::select! {
             // Shutdown signal received - clean up and terminate
             _ = shutdown_rx.recv() => {
+                let _ = watcher_shutdown_tx.send(true);
                 handle_shutdown(&mut loop_state, &update_tx).await;
                 break;
             }
@@ -438,6 +463,7 @@ async fn run_event_loop(
                     apply_retry_directive(&mut loop_state, directive);
                 } else {
                     tracing::warn!("MPRIS event channel closed, terminating event loop");
+                    let _ = watcher_shutdown_tx.send(true);
                     break;
                 }
             }

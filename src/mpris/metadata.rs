@@ -90,7 +90,13 @@ fn normalize_spotify_trackid(trackid: &str) -> Option<String> {
     {
         return Some(norm);
     }
-    if let Some(id) = trackid.rsplit('/').next().filter(|id| !id.is_empty())
+    if let Some(idx) = trackid.find("/com/spotify/track/")
+        && let Some(norm) = normalize_spotify_id(&trackid[idx + "/com/spotify/track/".len()..])
+    {
+        return Some(norm);
+    }
+    if trackid.contains("spotify")
+        && let Some(id) = trackid.rsplit('/').next().filter(|id| !id.is_empty())
         && let Some(norm) = normalize_spotify_id(id)
     {
         return Some(norm);
@@ -213,11 +219,18 @@ pub fn extract_metadata(map: &HashMap<String, OwnedValue>) -> TrackMetadata {
         .and_then(normalize_spotify_url)
         .or_else(|| trackid.as_deref().and_then(normalize_spotify_trackid));
 
-    let isrc = if isrc_enabled() {
-        isrc_from_metadata(url.as_deref())
-    } else {
-        None
-    };
+    // Extract ISRC — prioritize direct xesam:isrc in D-Bus metadata map;
+    // fall back to reading file tags via lofty if --isrc is enabled.
+    let isrc = map
+        .get("xesam:isrc")
+        .and_then(extract_string_or_first_item)
+        .or_else(|| {
+            if isrc_enabled() {
+                isrc_from_metadata(url.as_deref())
+            } else {
+                None
+            }
+        });
 
     TrackMetadata {
         title,
@@ -383,5 +396,33 @@ mod tests {
         assert_eq!(track.artist, "Artist A");
         assert_eq!(track.album, "Album Name");
         assert_eq!(track.length, Some(210.0));
+    }
+
+    #[test]
+    fn test_non_spotify_trackid_rejected() {
+        // A 22-character trailing segment on a non-Spotify path must NOT be parsed as Spotify ID
+        assert_eq!(
+            normalize_spotify_trackid("/org/mpris/MediaPlayer2/Track/1234567890123456789012"),
+            None
+        );
+        assert_eq!(
+            normalize_spotify_trackid("/org/videolan/vlc/track/1234567890123456789012"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_metadata_with_xesam_isrc() {
+        let mut map = HashMap::new();
+        map.insert(
+            "xesam:title".to_string(),
+            OwnedValue::try_from(zvariant::Value::from("ISRC Song")).unwrap(),
+        );
+        map.insert(
+            "xesam:isrc".to_string(),
+            OwnedValue::try_from(zvariant::Value::from("USRC17607839")).unwrap(),
+        );
+        let track = extract_metadata(&map);
+        assert_eq!(track.isrc.as_deref(), Some("USRC17607839"));
     }
 }

@@ -152,13 +152,15 @@ impl MprisEventCallback for tokio::sync::mpsc::Sender<crate::event::Event> {
         playback_status: Option<String>,
         sampled_at: std::time::Instant,
     ) {
-        let _ = self.try_send(crate::event::Event::PlayerUpdate(
+        if let Err(e) = self.try_send(crate::event::Event::PlayerUpdate(
             metadata,
             position,
             service,
             playback_status,
             sampled_at,
-        ));
+        )) {
+            tracing::warn!(error = %e, "Failed to send PlayerUpdate event to event loop channel");
+        }
     }
 
     fn on_seek(
@@ -168,16 +170,20 @@ impl MprisEventCallback for tokio::sync::mpsc::Sender<crate::event::Event> {
         service: String,
         sampled_at: std::time::Instant,
     ) {
-        let _ = self.try_send(crate::event::Event::Seeked(
+        if let Err(e) = self.try_send(crate::event::Event::Seeked(
             metadata, position, service, sampled_at,
-        ));
+        )) {
+            tracing::warn!(error = %e, "Failed to send Seeked event to event loop channel");
+        }
     }
 
     fn on_calibrate(&mut self, position: f64, sampled_at: std::time::Instant) {
-        let _ = self.try_send(crate::event::Event::Calibrated {
+        if let Err(e) = self.try_send(crate::event::Event::Calibrated {
             position,
             sampled_at,
-        });
+        }) {
+            tracing::warn!(error = %e, "Failed to send Calibrated event to event loop channel");
+        }
     }
 }
 
@@ -413,7 +419,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                     if let Ok(args) = signal.args() {
                         tracing::debug!(service = %service, position = args.position, "Seeked signal received");
                         let pos_sec = args.position as f64 / 1_000_000.0;
-                        if pos_sec <= 0.0 && self.state.playback_status == "Playing" {
+                        if self.state.playback_status == "Playing" {
                             tracker.arm(pos_sec);
                         } else {
                             tracker.disarm();
@@ -560,38 +566,45 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             None
         };
 
-        tokio::select! {
-            // playerctld notification of active player
-            Some(_) = async {
-                if let Some(ref mut stream) = playerctld_stream {
-                    stream.next().await
-                } else {
-                    futures_util::future::pending().await
+        while !self.state.is_active() {
+            tokio::select! {
+                // playerctld notification of active player
+                Some(_) = async {
+                    if let Some(ref mut stream) = playerctld_stream {
+                        stream.next().await
+                    } else {
+                        futures_util::future::pending().await
+                    }
+                } => {
+                    tracing::debug!("playerctld player list changed while idle");
+                    let _ = self.discover_active_player().await;
                 }
-            } => {
-                tracing::debug!("playerctld player list changed while idle");
-                let _ = self.discover_active_player().await;
-            }
 
-            // D-Bus NameOwnerChanged for new MPRIS player
-            Some(signal) = name_owner_stream.next() => {
-                if let Ok(args) = signal.args() {
-                    let name = args.name.as_str();
-                    let old_owner = args.old_owner.as_deref().unwrap_or("");
-                    let new_owner = args.new_owner.as_deref().unwrap_or("");
-                    if name.starts_with("org.mpris.MediaPlayer2.") && old_owner != new_owner && !new_owner.is_empty() {
-                        tracing::debug!(name = %name, "New or updated MPRIS player appeared while idle");
-                        let _ = self.discover_active_player().await;
+                // D-Bus NameOwnerChanged for new MPRIS player
+                Some(signal) = name_owner_stream.next() => {
+                    if let Ok(args) = signal.args() {
+                        let name = args.name.as_str();
+                        let old_owner = args.old_owner.as_deref().unwrap_or("");
+                        let new_owner = args.new_owner.as_deref().unwrap_or("");
+                        if name.starts_with("org.mpris.MediaPlayer2.") && old_owner != new_owner && !new_owner.is_empty() {
+                            tracing::debug!(name = %name, "New or updated MPRIS player appeared while idle");
+                            let _ = self.discover_active_player().await;
+                        }
                     }
                 }
-            }
 
-            // Broker-level MPRIS PropertiesChanged (player was already running and started playing)
-            Some(Ok(msg)) = global_prop_stream.next() => {
-                let header = msg.header();
-                let sender_unique = header.sender().map(|u| u.as_str());
-                tracing::debug!(sender = ?sender_unique, "Global MPRIS PropertiesChanged received while idle");
-                let _ = self.discover_active_player_with_hint(sender_unique).await;
+                // Broker-level MPRIS PropertiesChanged (player was already running and started playing or changed track)
+                Some(Ok(msg)) = global_prop_stream.next() => {
+                    if let Ok((_iface, changed, _invalidated)) =
+                        msg.body().deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+                        && (changed.contains_key("PlaybackStatus") || changed.contains_key("Metadata"))
+                    {
+                        let header = msg.header();
+                        let sender_unique = header.sender().map(|u| u.as_str());
+                        tracing::debug!(sender = ?sender_unique, "Relevant global MPRIS PropertiesChanged received while idle");
+                        let _ = self.discover_active_player_with_hint(sender_unique).await;
+                    }
+                }
             }
         }
 
@@ -643,9 +656,8 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
         &mut self,
         proxy: &MediaPlayer2PlayerProxy<'_>,
     ) -> Result<bool, MprisError> {
-        if let Ok(status) = proxy.playback_status().await
-            && status != self.state.playback_status
-        {
+        let status = proxy.playback_status().await?;
+        if status != self.state.playback_status {
             tracing::debug!(
                 service = %self.state.service,
                 old_status = %self.state.playback_status,

@@ -16,6 +16,8 @@ pub enum MprisError {
     Fdo(#[from] zbus::fdo::Error),
     #[error("Failed to establish D-Bus connection: {0}")]
     NoConnection(zbus::Error),
+    #[error("D-Bus operation timed out")]
+    Timeout,
 }
 
 /// Global D-Bus connection singleton
@@ -173,7 +175,9 @@ pub async fn find_best_active_service(
         let dbus_proxy = &dbus_proxy;
         async move {
             let priority = query_player_priority(&conn, svc).await;
-            let is_preferred = if let Some(target_unique) = preferred_sender_unique {
+            let is_preferred = if let Some(target_unique) = preferred_sender_unique
+                && priority == PlaybackPriority::Playing
+            {
                 if let Ok(bus_name) = BusName::try_from(svc.as_str()) {
                     dbus_proxy
                         .get_name_owner(bus_name)
@@ -238,41 +242,35 @@ pub async fn find_active_service(
     find_best_active_service(block, target, None, None).await
 }
 
+/// Case-insensitive ASCII substring search helper.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let h_bytes = haystack.as_bytes();
+    let n_bytes = needle.as_bytes();
+    if n_bytes.is_empty() {
+        return false;
+    }
+    h_bytes
+        .windows(n_bytes.len())
+        .any(|window| window.eq_ignore_ascii_case(n_bytes))
+}
+
 /// Check if a player service name should be blocked
 ///
 /// Returns true if the service name (case-insensitive) contains any blocked string.
 pub fn is_blocked(service: &str, block_list: &[String]) -> bool {
-    let s_bytes = service.as_bytes();
-    block_list.iter().any(|blocked| {
-        let b_bytes = blocked.as_bytes();
-        if b_bytes.is_empty() {
-            return false;
-        }
-        s_bytes
-            .windows(b_bytes.len())
-            .any(|window| window.eq_ignore_ascii_case(b_bytes))
-    })
+    block_list
+        .iter()
+        .any(|blocked| contains_ignore_ascii_case(service, blocked))
 }
 
 /// Check if a player service is targeted, and should be listened to
 ///
 /// Returns true if the service name (case-insensitive) is wanted by the target flag
 pub fn is_targeted(service: &str, target_list: &[String]) -> bool {
-    // If target_list is empty, return true
-    if target_list.is_empty() {
-        return true;
-    }
-
-    let s_bytes = service.as_bytes();
-    target_list.iter().any(|target| {
-        let t_bytes = target.as_bytes();
-        if t_bytes.is_empty() {
-            return false;
-        }
-        s_bytes
-            .windows(t_bytes.len())
-            .any(|window| window.eq_ignore_ascii_case(t_bytes))
-    })
+    target_list.is_empty()
+        || target_list
+            .iter()
+            .any(|target| contains_ignore_ascii_case(service, target))
 }
 
 #[cfg(test)]

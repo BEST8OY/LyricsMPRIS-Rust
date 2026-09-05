@@ -7,7 +7,7 @@ pub mod fetch;
 pub mod handlers;
 
 pub use fetch::fetch_and_update_lyrics;
-pub use handlers::RetryDirective;
+pub use handlers::{RetryDirective, handle_no_player};
 
 use crate::mpris::TrackMetadata;
 use crate::state::{StateBundle, Update};
