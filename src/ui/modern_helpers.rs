@@ -17,31 +17,65 @@ use ratatui::{
     widgets::Paragraph,
 };
 use std::error::Error;
-/// A wrapped lyric line block containing primary text lines and optional romanized lines.
+/// A wrapped lyric line block containing primary text lines, background vocal lines, and optional romanized lines.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WrappedBlock {
     pub primary: Vec<String>,
+    pub background: Vec<String>,
     pub romanized: Vec<String>,
 }
 
 impl WrappedBlock {
     pub fn len(&self) -> usize {
-        self.primary.len() + self.romanized.len()
+        self.primary.len() + self.background.len() + self.romanized.len()
     }
 
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.primary.is_empty() && self.romanized.is_empty()
+        self.primary.is_empty() && self.background.is_empty() && self.romanized.is_empty()
     }
 
+    #[cfg(test)]
     pub fn styled_lines<'a>(
         &'a self,
         style: ratatui::style::Style,
+        bg_style: ratatui::style::Style,
     ) -> impl Iterator<Item = Line<'a>> {
         let rom_style = style.add_modifier(ratatui::style::Modifier::ITALIC);
         self.primary
             .iter()
             .map(move |l| Line::from(Span::styled(l.as_str(), style)))
+            .chain(
+                self.background
+                    .iter()
+                    .map(move |l| Line::from(Span::styled(l.as_str(), bg_style))),
+            )
+            .chain(
+                self.romanized
+                    .iter()
+                    .map(move |l| Line::from(Span::styled(l.as_str(), rom_style))),
+            )
+    }
+
+    pub fn styled_lines_primary_only<'a>(
+        &'a self,
+        style: ratatui::style::Style,
+        bg_style: ratatui::style::Style,
+    ) -> impl Iterator<Item = Line<'a>> {
+        let rom_style = style.add_modifier(ratatui::style::Modifier::ITALIC);
+        let use_bg_as_primary = self.primary.is_empty();
+        self.primary
+            .iter()
+            .map(move |l| Line::from(Span::styled(l.as_str(), style)))
+            .chain(
+                if use_bg_as_primary {
+                    self.background.as_slice()
+                } else {
+                    &[]
+                }
+                .iter()
+                .map(move |l| Line::from(Span::styled(l.as_str(), bg_style))),
+            )
             .chain(
                 self.romanized
                     .iter()
@@ -161,13 +195,27 @@ fn ensure_wrapped_cache<'a>(
         let new_blocks: Vec<WrappedBlock> = lines
             .iter()
             .map(|l| {
-                let primary = wrap_text(&l.text, width);
+                let (main_text, bg_text) = split_line_main_and_background(&l.text);
+                let primary = if let Some(m) = main_text {
+                    wrap_text(&m, width)
+                } else {
+                    Vec::new()
+                };
+                let background = if let Some(b) = bg_text {
+                    wrap_text(&b, width)
+                } else {
+                    Vec::new()
+                };
                 let romanized = if romanize_enabled && let Some(ref rom) = l.romanized {
                     wrap_text(rom, width)
                 } else {
                     Vec::new()
                 };
-                WrappedBlock { primary, romanized }
+                WrappedBlock {
+                    primary,
+                    background,
+                    romanized,
+                }
             })
             .collect();
         *wrapped_cache = Some((width, romanize_enabled, new_blocks));
@@ -236,8 +284,9 @@ fn collect_before_spans<'a>(
         i -= 1;
         let dist = current_index - i;
         let style = styles.get_line_style_by_distance(dist, true);
+        let bg_style = styles.get_background_style_by_distance(dist, true);
         let block = &wrapped_blocks[i];
-        let block_lines: Vec<Line<'a>> = block.styled_lines(style).collect();
+        let block_lines: Vec<Line<'a>> = block.styled_lines_primary_only(style, bg_style).collect();
         let take = block_lines.len().min(lines_needed);
         let start = block_lines.len() - take;
         chunks.push(block_lines[start..].to_vec());
@@ -260,8 +309,9 @@ fn collect_after_spans<'a>(
     while j < wrapped_blocks.len() && lines_needed > 0 {
         let dist = j - current_index;
         let style = styles.get_line_style_by_distance(dist, false);
+        let bg_style = styles.get_background_style_by_distance(dist, false);
         let block = &wrapped_blocks[j];
-        let block_lines: Vec<Line<'a>> = block.styled_lines(style).collect();
+        let block_lines: Vec<Line<'a>> = block.styled_lines_primary_only(style, bg_style).collect();
         let take = block_lines.len().min(lines_needed);
         for line in block_lines.into_iter().take(take) {
             result.push(line);
@@ -287,7 +337,12 @@ fn collect_before_blocks<'a>(
     for block_idx in (start_index..current_index).rev() {
         let dist = current_index - block_idx;
         let style = styles.get_line_style_by_distance(dist, true);
-        chunks.push(wrapped_blocks[block_idx].styled_lines(style).collect());
+        let bg_style = styles.get_background_style_by_distance(dist, true);
+        chunks.push(
+            wrapped_blocks[block_idx]
+                .styled_lines_primary_only(style, bg_style)
+                .collect(),
+        );
     }
 
     chunks.reverse();
@@ -313,7 +368,8 @@ fn collect_after_blocks<'a>(
     {
         let dist = block_idx - current_index;
         let style = styles.get_line_style_by_distance(dist, false);
-        result.extend(block.styled_lines(style));
+        let bg_style = styles.get_background_style_by_distance(dist, false);
+        result.extend(block.styled_lines_primary_only(style, bg_style));
     }
 
     result
@@ -321,14 +377,14 @@ fn collect_after_blocks<'a>(
 
 /// Split a slice of WordTiming into visual lines that fit into `width` characters.
 fn split_words_into_lines<'b>(
-    words: &'b [crate::lyrics::types::WordTiming],
+    words: &[&'b crate::lyrics::types::WordTiming],
     width: usize,
 ) -> Vec<Vec<&'b crate::lyrics::types::WordTiming>> {
     let mut lines: Vec<Vec<&'b crate::lyrics::types::WordTiming>> = Vec::new();
     let mut current: Vec<&'b crate::lyrics::types::WordTiming> = Vec::new();
     let mut cur_len: usize = 0;
 
-    for w in words {
+    for &w in words {
         let wlen = w.text.chars().count();
         let candidate = if current.is_empty() {
             wlen
@@ -474,15 +530,22 @@ fn build_current_spans<'a>(
     {
         spans
     } else {
-        let style = if update.index.is_some() {
-            styles.current
+        let (style, bg_style) = if update.index.is_some() {
+            (styles.current, styles.background_current)
         } else {
-            styles.after
+            (styles.after, styles.background_after)
         };
+
         current_block
             .primary
             .iter()
             .map(|line| Line::from(Span::styled(line.as_str(), style)))
+            .chain(
+                current_block
+                    .background
+                    .iter()
+                    .map(|line| Line::from(Span::styled(line.as_str(), bg_style))),
+            )
             .collect()
     };
 
@@ -493,6 +556,37 @@ fn build_current_spans<'a>(
     }
 
     lines
+}
+
+/// Partitions word timings into main vocal words and background vocal words based on parentheses.
+pub fn split_words_main_and_background(
+    words: &[crate::lyrics::types::WordTiming],
+) -> (
+    Vec<&crate::lyrics::types::WordTiming>,
+    Vec<&crate::lyrics::types::WordTiming>,
+) {
+    let mut main_words = Vec::new();
+    let mut bg_words = Vec::new();
+    let mut in_bg = false;
+
+    for word in words {
+        let has_open = word.text.contains('(');
+        let has_close = word.text.contains(')');
+
+        if has_open {
+            in_bg = true;
+        }
+        if in_bg {
+            bg_words.push(word);
+        } else {
+            main_words.push(word);
+        }
+        if has_close {
+            in_bg = false;
+        }
+    }
+
+    (main_words, bg_words)
 }
 
 /// Try to build per-word karaoke spans for richsync lyrics.
@@ -506,12 +600,23 @@ fn try_build_karaoke_spans<'a>(
     let line = update.lines.get(idx)?;
     let words = line.words.as_ref()?;
 
-    let word_lines = split_words_into_lines(words, width);
+    let (main_words, bg_words) = split_words_main_and_background(words);
     let mut result = Vec::new();
 
-    for word_line in word_lines {
-        let line_spans = build_word_line_spans(&word_line, position, styles);
-        result.push(Line::from(line_spans));
+    if !main_words.is_empty() {
+        let word_lines = split_words_into_lines(&main_words, width);
+        for word_line in word_lines {
+            let line_spans = build_word_line_spans(&word_line, position, styles, false);
+            result.push(Line::from(line_spans));
+        }
+    }
+
+    if !bg_words.is_empty() {
+        let word_lines = split_words_into_lines(&bg_words, width);
+        for word_line in word_lines {
+            let line_spans = build_word_line_spans(&word_line, position, styles, true);
+            result.push(Line::from(line_spans));
+        }
     }
 
     Some(result)
@@ -522,12 +627,13 @@ fn build_word_line_spans<'a>(
     words: &[&'a crate::lyrics::types::WordTiming],
     position: f64,
     styles: &'a LyricStyles,
+    is_background: bool,
 ) -> Vec<Span<'a>> {
     let mut spans = Vec::new();
 
     for (i, word) in words.iter().enumerate() {
         let is_last = i + 1 >= words.len();
-        let word_spans = build_word_spans(word, position, styles, is_last);
+        let word_spans = build_word_spans(word, position, styles, is_last, is_background);
         spans.extend(word_spans);
     }
 
@@ -543,26 +649,34 @@ fn styled_word<'a>(text: &'a str, suffix: &str, style: ratatui::style::Style) ->
     }
 }
 
-/// Build spans for a single word with partial grapheme highlighting.
-///
-/// Word text is borrowed whenever possible; allocation only occurs for the
-/// partially highlighted remainder followed by an inter-word space.
+/// Build spans for a single word with partial grapheme highlighting and background vocal support.
 fn build_word_spans<'a>(
     word: &'a crate::lyrics::types::WordTiming,
     position: f64,
     styles: &'a LyricStyles,
     is_last_in_line: bool,
+    is_background: bool,
 ) -> Vec<Span<'a>> {
     let suffix = if is_last_in_line { "" } else { " " };
+    let current_style = if is_background {
+        styles.background_current
+    } else {
+        styles.current
+    };
+    let after_style = if is_background {
+        styles.background_after
+    } else {
+        styles.after
+    };
 
     // Word not yet reached
     if position < word.start {
-        return vec![styled_word(&word.text, suffix, styles.after)];
+        return vec![styled_word(&word.text, suffix, after_style)];
     }
 
     // Word fully passed
     if position >= word.end {
-        return vec![styled_word(&word.text, suffix, styles.current)];
+        return vec![styled_word(&word.text, suffix, current_style)];
     }
 
     // Word partially highlighted
@@ -573,11 +687,11 @@ fn build_word_spans<'a>(
         ((fraction * total_graphemes as f64).floor() as usize).min(total_graphemes);
 
     if highlighted_count == 0 {
-        return vec![styled_word(&word.text, suffix, styles.after)];
+        return vec![styled_word(&word.text, suffix, after_style)];
     }
 
     if highlighted_count >= total_graphemes {
-        return vec![styled_word(&word.text, suffix, styles.current)];
+        return vec![styled_word(&word.text, suffix, current_style)];
     }
 
     // Split at grapheme boundary using the precomputed boundaries
@@ -585,9 +699,97 @@ fn build_word_spans<'a>(
     let remaining = &word.text[split_byte..];
 
     vec![
-        Span::styled(&word.text[..split_byte], styles.current),
-        styled_word(remaining, suffix, styles.after),
+        Span::styled(&word.text[..split_byte], current_style),
+        styled_word(remaining, suffix, after_style),
     ]
+}
+
+/// Extracts main text and parenthetical background vocals from a lyric line.
+///
+/// Returns `(main_text, background_text)`:
+/// - If line contains no parentheses: `(Some(text.to_string()), None)`
+/// - If line contains only parentheses: `(None, Some(text.to_string()))`
+/// - If line contains both: `(Some(main), Some(bg))`
+pub fn split_line_main_and_background(text: &str) -> (Option<String>, Option<String>) {
+    if !text.contains('(') || !text.contains(')') {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return (None, None);
+        }
+        return (Some(trimmed.to_string()), None);
+    }
+
+    let mut main_parts = Vec::new();
+    let mut bg_parts = Vec::new();
+    let mut current_idx = 0;
+
+    while current_idx < text.len() {
+        if let Some(open_rel) = text[current_idx..].find('(') {
+            let open_idx = current_idx + open_rel;
+            if open_idx > current_idx {
+                let part = text[current_idx..open_idx].trim();
+                if !part.is_empty() {
+                    main_parts.push(part);
+                }
+            }
+
+            if let Some(close_rel) = text[open_idx..].find(')') {
+                let close_idx = open_idx + close_rel + 1;
+                let bg_part = text[open_idx..close_idx].trim();
+                if !bg_part.is_empty() {
+                    bg_parts.push(bg_part);
+                }
+                current_idx = close_idx;
+            } else {
+                let bg_part = text[open_idx..].trim();
+                if !bg_part.is_empty() {
+                    bg_parts.push(bg_part);
+                }
+                break;
+            }
+        } else {
+            let part = text[current_idx..].trim();
+            if !part.is_empty() {
+                main_parts.push(part);
+            }
+            break;
+        }
+    }
+
+    let main_text = if main_parts.is_empty() {
+        None
+    } else {
+        let mut stitched = String::new();
+        for part in main_parts {
+            if stitched.is_empty()
+                || part.starts_with(',')
+                || part.starts_with('.')
+                || part.starts_with(';')
+                || part.starts_with(':')
+                || part.starts_with('!')
+                || part.starts_with('?')
+            {
+                stitched.push_str(part);
+            } else {
+                stitched.push(' ');
+                stitched.push_str(part);
+            }
+        }
+        let trimmed = stitched.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    };
+
+    let bg_text = if bg_parts.is_empty() {
+        None
+    } else {
+        Some(bg_parts.join(" "))
+    };
+
+    (main_text, bg_text)
 }
 
 #[cfg(test)]
@@ -598,6 +800,7 @@ mod tests {
     fn test_wrapped_block_styled_lines() {
         let block = WrappedBlock {
             primary: vec!["こんにちは".to_string()],
+            background: Vec::new(),
             romanized: vec!["konnichiwa".to_string()],
         };
 
@@ -605,8 +808,35 @@ mod tests {
         assert!(!block.is_empty());
 
         let styles = LyricStyles::default();
-        let lines: Vec<Line> = block.styled_lines(styles.current).collect();
+        let lines: Vec<Line> = block
+            .styled_lines(styles.current, styles.background_current)
+            .collect();
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn test_split_line_main_and_background() {
+        let (main, bg) = split_line_main_and_background(
+            "'Cause all I need (all I need is love) is a beauty and a beat",
+        );
+        assert_eq!(
+            main.as_deref(),
+            Some("'Cause all I need is a beauty and a beat")
+        );
+        assert_eq!(bg.as_deref(), Some("(all I need is love)"));
+
+        let (main, bg) =
+            split_line_main_and_background("Baby, do it like you do (uh, uh), 'cause all");
+        assert_eq!(main.as_deref(), Some("Baby, do it like you do, 'cause all"));
+        assert_eq!(bg.as_deref(), Some("(uh, uh)"));
+
+        let (main, bg) = split_line_main_and_background("(yeah, yeah, yeah)");
+        assert_eq!(main, None);
+        assert_eq!(bg.as_deref(), Some("(yeah, yeah, yeah)"));
+
+        let (main, bg) = split_line_main_and_background("In time, ink lines");
+        assert_eq!(main.as_deref(), Some("In time, ink lines"));
+        assert_eq!(bg, None);
     }
 
     #[test]
@@ -621,13 +851,82 @@ mod tests {
         let blocks = ensure_wrapped_cache(&mut cache, &lines, 80, false);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].primary.len(), 1);
+        assert!(blocks[0].background.is_empty());
         assert!(blocks[0].romanized.is_empty());
 
         // Romanize enabled (cache invalidates and rebuilds)
         let blocks = ensure_wrapped_cache(&mut cache, &lines, 80, true);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].primary.len(), 1);
+        assert!(blocks[0].background.is_empty());
         assert_eq!(blocks[0].romanized.len(), 1);
         assert_eq!(blocks[0].romanized[0], "konnichiwa");
+    }
+
+    #[test]
+    fn test_karaoke_word_spans_with_background_vocals() {
+        let styles = LyricStyles::default();
+        let words = vec![
+            crate::lyrics::types::WordTiming {
+                start: 0.0,
+                end: 0.4,
+                text: "you".to_string(),
+                grapheme_boundaries: vec![0, 3],
+                grapheme_times: vec![],
+            },
+            crate::lyrics::types::WordTiming {
+                start: 1.2,
+                end: 1.6,
+                text: "(all".to_string(),
+                grapheme_boundaries: vec![0, 1, 2, 3, 4],
+                grapheme_times: vec![],
+            },
+            crate::lyrics::types::WordTiming {
+                start: 2.0,
+                end: 2.5,
+                text: "you)".to_string(),
+                grapheme_boundaries: vec![0, 1, 2, 3, 4],
+                grapheme_times: vec![],
+            },
+        ];
+
+        let line = crate::lyrics::LyricLine::new(0.0, "you (all you)").with_words(Some(words));
+        let update = Update {
+            lines: std::sync::Arc::new(vec![line]),
+            index: Some(0),
+            position: 1.7,
+            playing: true,
+            provider: Some(crate::state::Provider::MusixmatchRichsync),
+            ..Default::default()
+        };
+
+        // At position 0.5s (before background vocal starts at 1.5s):
+        // Main line + Background sub-line are both shown immediately (length 2)
+        // Main line: "you" is active -> styles.current (Green)
+        // Background sub-line: "(all" and "you)" have not started yet -> styles.background_after (Dim Italic)
+        let lines_early =
+            try_build_karaoke_spans(&update, 0, 80, &styles, 0.5).expect("should build spans");
+        assert_eq!(lines_early.len(), 2);
+        assert_eq!(lines_early[0].spans[0].content, "you");
+        assert_eq!(lines_early[0].spans[0].style, styles.current);
+        assert_eq!(lines_early[1].spans[0].content, "(all ");
+        assert_eq!(lines_early[1].spans[0].style, styles.background_after);
+        assert_eq!(lines_early[1].spans[1].content, "you)");
+        assert_eq!(lines_early[1].spans[1].style, styles.background_after);
+
+        // At position 1.7s (after background vocal started at 1.5s):
+        // Main line + Background sub-line are shown (length 2)
+        // Main line: "you" has passed -> styles.current (Green)
+        // Background sub-line: "(all" is active (1.5s to 2.0s) -> styles.background_current (Cyan)
+        // "you)" has not been reached -> styles.background_after (Dim Italic)
+        let lines =
+            try_build_karaoke_spans(&update, 0, 80, &styles, 1.7).expect("should build spans");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].spans[0].content, "you");
+        assert_eq!(lines[0].spans[0].style, styles.current);
+        assert_eq!(lines[1].spans[0].content, "(all ");
+        assert_eq!(lines[1].spans[0].style, styles.background_current);
+        assert_eq!(lines[1].spans[1].content, "you)");
+        assert_eq!(lines[1].spans[1].style, styles.background_after);
     }
 }

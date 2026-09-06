@@ -15,6 +15,10 @@ pub struct LyricStyles {
     pub current: Style,
     /// Style for upcoming lines (normal text)
     pub after: Style,
+    /// Style for active background vocals in parentheses (italic, cyan, bold)
+    pub background_current: Style,
+    /// Style for upcoming/inactive background vocals in parentheses (italic, dim)
+    pub background_after: Style,
 }
 
 impl Default for LyricStyles {
@@ -28,6 +32,12 @@ impl Default for LyricStyles {
                 .add_modifier(Modifier::BOLD),
             // Future lines: normal terminal theme styling
             after: Style::default(),
+            // Active background vocals: secondary vocal harmony style (Cyan, Italic, Bold)
+            background_current: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::ITALIC | Modifier::BOLD),
+            // Inactive background vocals: subtle dimmed italics
+            background_after: Style::default().add_modifier(Modifier::ITALIC | Modifier::DIM),
         }
     }
 }
@@ -47,6 +57,19 @@ impl LyricStyles {
             self.after.add_modifier(Modifier::DIM)
         }
     }
+
+    /// Compute distance-faded background vocal style based on vertical distance `dist` from current active index.
+    pub fn get_background_style_by_distance(&self, dist: usize, is_before: bool) -> Style {
+        if dist == 0 {
+            return self.background_current;
+        }
+
+        if is_before {
+            self.before.add_modifier(Modifier::ITALIC)
+        } else {
+            self.background_after
+        }
+    }
 }
 
 #[cfg(test)]
@@ -61,5 +84,8 @@ mod tests {
 
         let dist1_before = styles.get_line_style_by_distance(1, true);
         assert!(dist1_before.add_modifier.contains(Modifier::ITALIC));
+
+        let bg_dist0 = styles.get_background_style_by_distance(0, false);
+        assert_eq!(bg_dist0, styles.background_current);
     }
 }
