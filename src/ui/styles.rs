@@ -66,8 +66,10 @@ impl LyricStyles {
 
         if is_before {
             self.before.add_modifier(Modifier::ITALIC)
-        } else {
+        } else if dist == 1 {
             self.background_after
+        } else {
+            self.background_after.add_modifier(Modifier::DIM)
         }
     }
 }

@@ -71,6 +71,10 @@ fn schedule_next_richsync_boundary(upd: &Update) -> Option<Pin<Box<Sleep>>> {
 
     // Scan from current line forward for the nearest future boundary
     for line in upd.lines.iter().skip(current_idx) {
+        if line.time.is_finite() && line.time > upd.position {
+            update_best_delay(&mut best_delay, line.time, upd.position);
+        }
+
         let Some(words) = &line.words else {
             continue;
         };
@@ -172,4 +176,47 @@ fn compute_line_index(update: &Update) -> Option<usize> {
     }
 
     crate::lyrics::types::active_line_index(&update.lines, update.position)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_richsync_schedules_line_time_when_before_first_word() {
+        // Line 0 is active from 0.0 to 10.0, but its words already passed by 8.0s
+        // Line 1 starts at 10.0s, but its first word starts at 12.0s
+        let line0 = crate::lyrics::LyricLine::new(0.0, "Line 0").with_words(Some(vec![
+            crate::lyrics::types::WordTiming {
+                start: 1.0,
+                end: 2.0,
+                text: "Hello".into(),
+                grapheme_boundaries: vec![0, 5],
+                grapheme_times: vec![],
+            },
+        ]));
+        let line1 = crate::lyrics::LyricLine::new(10.0, "Line 1").with_words(Some(vec![
+            crate::lyrics::types::WordTiming {
+                start: 12.0,
+                end: 13.0,
+                text: "World".into(),
+                grapheme_boundaries: vec![0, 5],
+                grapheme_times: vec![],
+            },
+        ]));
+
+        let update = Update {
+            lines: Arc::new(vec![line0, line1]),
+            index: Some(0),
+            position: 8.5,
+            playing: true,
+            provider: Some(crate::state::Provider::MusixmatchRichsync),
+            ..Default::default()
+        };
+
+        // At position 8.5, next boundary should be line 1 start at 10.0s (delay = 1.5s), NOT 12.0s!
+        let sleep = compute_next_word_sleep_from_update(&update);
+        assert!(sleep.is_some(), "Should schedule wakeup for line 1 start");
+    }
 }
