@@ -27,6 +27,7 @@ zstd = "0.13"
 lofty = "0.25"
 deunicode = "1.6"
 kakasi = "0.1.0"
+uuid = { version = "1", features = ["v4"] }
 
 # [profile.release]
 # opt-level = "s"

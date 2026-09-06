@@ -1616,6 +1616,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-segmentation",
  "urlencoding",
+ "uuid",
  "zbus",
  "zstd",
  "zvariant",

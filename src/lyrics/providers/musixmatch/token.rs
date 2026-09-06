@@ -89,13 +89,16 @@ fn clear_token_at_path(path: &std::path::Path) {
 
 /// Requests a fresh anonymous Musixmatch user token directly from the API (`token.get`).
 pub async fn fetch_fresh_musixmatch_token(client: &Client) -> Result<String, LyricsError> {
-    let url = "https://apic-appmobile.musixmatch.com/ws/1.1/token.get?app_id=mac-ios-v2.0";
+    let guid = uuid::Uuid::new_v4().to_string();
+    let url = format!(
+        "https://apic-appmobile.musixmatch.com/ws/1.1/token.get?app_id=mac-ios-v2.0&guid={guid}"
+    );
     let resp = client
-        .get(url)
+        .get(&url)
         .header("User-Agent", DEFAULT_USER_AGENT)
         .header("X-User-Agent", DEFAULT_USER_AGENT)
-        .header("Cookie", "x-mxm-token-guid=")
-        .header("X-Cookie", "x-mxm-token-guid=")
+        .header("Cookie", format!("x-mxm-token-guid={guid}"))
+        .header("X-Cookie", format!("x-mxm-token-guid={guid}"))
         .header("x-mxm-app-version", "10.1.1")
         .header("Accept", "application/json")
         .header("Accept-Language", "en-US,en;q=0.9")
