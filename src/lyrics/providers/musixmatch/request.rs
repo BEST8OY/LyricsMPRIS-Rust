@@ -1,5 +1,7 @@
 //! HTTP request execution and response handling for Musixmatch API.
 
+use std::sync::LazyLock;
+
 use super::extract::{extract_track_ids_from_macro, get_root_hint, get_root_status_code};
 use super::token::DEFAULT_USER_AGENT;
 use crate::lyrics::database::DURATION_TOLERANCE_SECS;
@@ -274,17 +276,110 @@ pub(crate) async fn fetch_lyrics_with_token(
     Ok(FetchOutcome::TrackNotFound)
 }
 
+static VERSION_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?i)(?:\s*[-–—/:]\s*|\s*[\(\[])(?:[^\(\)\[\]]*\b)?(live|en vivo|dal vivo|acoustic|ac[uú]stico|acustico|unplugged|stripped|remix|re-mix|dub mix|club mix|extended mix|dance mix|vip mix|demo|early version|commentary|interview|track by track|instrumental|karaoke|backing track)\b[^\)\]]*[\)\]]?"#,
+    )
+    .unwrap()
+});
+
+fn extract_version_and_base(title: &str) -> (Vec<&'static str>, String) {
+    let mut versions = Vec::new();
+    for cap in VERSION_RE.captures_iter(title) {
+        if let Some(m) = cap.get(1) {
+            let lower = m.as_str().to_lowercase();
+            let v = if lower.contains("live") || lower.contains("vivo") {
+                "live"
+            } else if lower.contains("acoust")
+                || lower.contains("acúst")
+                || lower.contains("acust")
+                || lower.contains("unplugged")
+                || lower.contains("stripped")
+            {
+                "acoustic"
+            } else if lower.contains("mix") {
+                "remix"
+            } else if lower.contains("demo") || lower.contains("early version") {
+                "demo"
+            } else if lower.contains("commentary")
+                || lower.contains("interview")
+                || lower.contains("track by track")
+            {
+                "commentary"
+            } else if lower.contains("instrumental")
+                || lower.contains("karaoke")
+                || lower.contains("backing track")
+            {
+                "instrumental"
+            } else {
+                "other"
+            };
+            if !versions.contains(&v) {
+                versions.push(v);
+            }
+        }
+    }
+    let base = VERSION_RE.replace_all(title, "").trim().to_string();
+    (versions, base)
+}
+
+fn strip_punctuation(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub(crate) fn is_title_compatible(query_title: &str, candidate_title: &str) -> bool {
+    let (query_versions, query_base) = extract_version_and_base(query_title);
+    let (cand_versions, cand_base) = extract_version_and_base(candidate_title);
+
+    // 1. Candidate must not introduce any version tag (e.g. "live", "acoustic")
+    // that was not requested in the query title.
+    for v in &cand_versions {
+        if !query_versions.contains(v) {
+            return false;
+        }
+    }
+
+    // 2. Compare clean base titles (stripping remasters, feats, and normalizing)
+    let norm_query = normalize(&query_base);
+    let clean_query = clean_title_annotations(&norm_query).unwrap_or(norm_query);
+
+    let norm_cand = normalize(&cand_base);
+    let clean_cand = clean_title_annotations(&norm_cand).unwrap_or(norm_cand);
+
+    if clean_query == clean_cand {
+        return true;
+    }
+
+    // 3. Punctuation-insensitive fallback (e.g., "Don't" vs "Dont")
+    let punct_query = strip_punctuation(&clean_query);
+    let punct_cand = strip_punctuation(&clean_cand);
+    if !punct_query.is_empty() && punct_query == punct_cand {
+        return true;
+    }
+
+    false
+}
+
 /// Helper: selects the best candidate track ID from a track.search result list.
 ///
 /// Filters out tracks without synchronized/plain lyrics or instrumentals, filters by duration tolerance (±2.0s),
-/// and scores candidates by album match, richsync presence, duration closeness, and rating.
+/// checks title compatibility and version tag parity (avoiding live/acoustic/remix pollution for studio tracks),
+/// and scores candidates by album match, exact title match, richsync presence, duration closeness, and rating.
 pub(crate) fn select_best_candidate_track_id(
     track_list: &[Value],
+    title: &str,
     album: &str,
     duration: Option<f64>,
 ) -> Option<i64> {
     let mut best_id = None;
     let mut highest_score = f64::NEG_INFINITY;
+
+    let norm_title = normalize(title);
 
     for item in track_list {
         let Some(track) = item.get("track") else {
@@ -293,6 +388,10 @@ pub(crate) fn select_best_candidate_track_id(
         let Some(track_id) = track.get("track_id").and_then(|v| v.as_i64()) else {
             continue;
         };
+        let track_name = track
+            .get("track_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let track_length = track
             .get("track_length")
             .and_then(|v| v.as_f64())
@@ -323,13 +422,23 @@ pub(crate) fn select_best_candidate_track_id(
             continue;
         }
 
+        // Candidate title must be compatible with the requested track title
+        if !is_title_compatible(title, track_name) {
+            continue;
+        }
+
         // Check duration tolerance if duration is known
         if let Some(target_dur) = duration
             && target_dur > 0.0
-            && track_length > 0.0
         {
-            let diff = (track_length - target_dur).abs();
-            if diff > DURATION_TOLERANCE_SECS {
+            if track_length > 0.0 {
+                let diff = (track_length - target_dur).abs();
+                if diff > DURATION_TOLERANCE_SECS {
+                    continue;
+                }
+            } else {
+                // If caller provided an authoritative target duration, a candidate
+                // with unknown length (0.0) cannot satisfy the duration tolerance window.
                 continue;
             }
         }
@@ -339,6 +448,11 @@ pub(crate) fn select_best_candidate_track_id(
             score += 50.0;
         } else if has_subtitles == 1 {
             score += 25.0;
+        }
+
+        let norm_cand_title = normalize(track_name);
+        if norm_cand_title == norm_title {
+            score += 30.0;
         }
 
         if !album.is_empty() && !album_name.is_empty() {
@@ -428,7 +542,9 @@ pub(crate) async fn search_and_fetch_best_candidate(
         let Some(track_list) = track_list else {
             continue;
         };
-        if let Some(best_track_id) = select_best_candidate_track_id(track_list, album, duration) {
+        if let Some(best_track_id) =
+            select_best_candidate_track_id(track_list, title, album, duration)
+        {
             let id_params = vec![
                 ("track_id".to_string(), best_track_id.to_string()),
                 ("usertoken".to_string(), token.to_string()),
@@ -589,16 +705,128 @@ mod tests {
         let track_list: Vec<Value> = serde_json::from_str(json_str).unwrap();
 
         // Should select track 103: duration matches 228.0 ± 2.0s, album matches "Believe", and has richsync
-        let best_id = select_best_candidate_track_id(&track_list, "Believe", Some(228.0));
+        let best_id = select_best_candidate_track_id(
+            &track_list,
+            "Beauty And A Beat",
+            "Believe",
+            Some(228.0),
+        );
         assert_eq!(best_id, Some(103));
 
         // When duration is 145.0, should select track 102
-        let best_145 =
-            select_best_candidate_track_id(&track_list, "Simplemente Acústico", Some(145.0));
+        let best_145 = select_best_candidate_track_id(
+            &track_list,
+            "Beauty And A Beat",
+            "Simplemente Acústico",
+            Some(145.0),
+        );
         assert_eq!(best_145, Some(102));
 
         // When duration is 300.0 (no candidate within 2.0s), should return None
-        let none_id = select_best_candidate_track_id(&track_list, "Believe", Some(300.0));
+        let none_id = select_best_candidate_track_id(
+            &track_list,
+            "Beauty And A Beat",
+            "Believe",
+            Some(300.0),
+        );
         assert_eq!(none_id, None);
+    }
+
+    #[test]
+    fn test_is_title_compatible() {
+        assert!(is_title_compatible("Red Flag", "Red Flag"));
+        assert!(is_title_compatible("Red Flag", "Red Flag [2009 Remaster]"));
+        assert!(is_title_compatible("Heroes (feat. Brian Eno)", "Heroes"));
+        assert!(is_title_compatible(
+            "Hotel California (Live)",
+            "Hotel California - Live On MTV 1994"
+        ));
+
+        // Version tags present in candidate but NOT in query title must be rejected
+        assert!(!is_title_compatible(
+            "Red Flag",
+            "Red Flag (Live at Nova Rock Festival)"
+        ));
+        assert!(!is_title_compatible(
+            "Red Flag",
+            "Red Flag - Live At MTV Campus Invasion Germany"
+        ));
+        assert!(!is_title_compatible("Red Flag", "Red Flag (Live)"));
+        assert!(!is_title_compatible("Creep", "Creep (Acoustic Version)"));
+        assert!(!is_title_compatible("Song", "Song (Remix)"));
+        assert!(!is_title_compatible("Song", "Song (Demo)"));
+
+        // Different songs entirely
+        assert!(!is_title_compatible("Red Flag", "The Red Flag"));
+        assert!(!is_title_compatible("Red Flag", "Billy Talent on Red Flag"));
+    }
+
+    #[test]
+    fn test_select_best_candidate_rejects_live_and_zero_duration() {
+        let json_str = r#"[
+            {
+                "track": {
+                    "track_id": 1,
+                    "track_name": "Red Flag",
+                    "album_name": "Red Flag",
+                    "track_length": 200,
+                    "has_richsync": 0,
+                    "has_subtitles": 0,
+                    "has_lyrics": 0,
+                    "instrumental": 0
+                }
+            },
+            {
+                "track": {
+                    "track_id": 2,
+                    "track_name": "Red Flag (Live at Nova Rock Festival)",
+                    "album_name": "666 Live",
+                    "track_length": 0,
+                    "has_richsync": 1,
+                    "has_subtitles": 1,
+                    "has_lyrics": 1,
+                    "instrumental": 0
+                }
+            },
+            {
+                "track": {
+                    "track_id": 3,
+                    "track_name": "Red Flag - Live at the Horseshoe Tavern",
+                    "album_name": "Billy Talent II",
+                    "track_length": 222,
+                    "has_richsync": 1,
+                    "has_subtitles": 1,
+                    "has_lyrics": 1,
+                    "instrumental": 0
+                }
+            },
+            {
+                "track": {
+                    "track_id": 4,
+                    "track_name": "The Red Flag",
+                    "album_name": "The Internationale",
+                    "track_length": 198,
+                    "has_richsync": 1,
+                    "has_subtitles": 1,
+                    "has_lyrics": 1,
+                    "instrumental": 0
+                }
+            }
+        ]"#;
+
+        let track_list: Vec<Value> = serde_json::from_str(json_str).unwrap();
+
+        // For studio "Red Flag" (length 198.173s), none of the candidates should be accepted:
+        // Track 1 has no lyrics
+        // Track 2 is Live and has length 0
+        // Track 3 is Live and length is 222s (out of tolerance)
+        // Track 4 is a different song ("The Red Flag")
+        let result = select_best_candidate_track_id(
+            &track_list,
+            "Red Flag",
+            "Billy Talent II",
+            Some(198.173),
+        );
+        assert_eq!(result, None);
     }
 }
