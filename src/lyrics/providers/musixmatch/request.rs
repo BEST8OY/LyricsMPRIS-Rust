@@ -199,12 +199,7 @@ pub(crate) async fn fetch_lyrics_with_token(
     }
     if let Some(d) = duration {
         let secs = (d.round() as i64).to_string();
-        params.push(("q_duration".to_string(), secs.clone()));
-        params.push(("f_subtitle_length".to_string(), secs.clone()));
-        params.push((
-            "f_subtitle_length_max_deviation".to_string(),
-            DURATION_TOLERANCE_SECS.to_string(),
-        ));
+        params.push(("q_duration".to_string(), secs));
     }
 
     let has_ids = track_spotify_id.is_some() || track_isrc.is_some() || track_itunes_id.is_some();
@@ -235,12 +230,7 @@ pub(crate) async fn fetch_lyrics_with_token(
         }
         if let Some(d) = duration {
             let secs = (d.round() as i64).to_string();
-            fallback_params.push(("q_duration".to_string(), secs.clone()));
-            fallback_params.push(("f_subtitle_length".to_string(), secs));
-            fallback_params.push((
-                "f_subtitle_length_max_deviation".to_string(),
-                DURATION_TOLERANCE_SECS.to_string(),
-            ));
+            fallback_params.push(("q_duration".to_string(), secs));
         }
 
         try_macro_for_lyrics(client, &fallback_params).await?
