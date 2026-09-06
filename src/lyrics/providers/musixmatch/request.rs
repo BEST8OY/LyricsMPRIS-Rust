@@ -496,6 +496,30 @@ mod tests {
     }
 
     #[test]
+    fn test_evaluate_token_outcome_captcha_throttled() {
+        let json: Value = serde_json::from_str(
+            r#"{
+            "message": {
+                "header": {
+                    "status_code": 401,
+                    "hint": "captcha"
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let outcome = evaluate_token_outcome(reqwest::StatusCode::OK, Some(&json));
+        assert_eq!(
+            outcome,
+            Some(FetchOutcome::TokenError {
+                reason: "API Status 401 (hint: captcha)".to_string(),
+                is_renewable: false,
+            })
+        );
+    }
+
+    #[test]
     fn test_evaluate_token_outcome_http_fallback() {
         let outcome = evaluate_token_outcome(reqwest::StatusCode::FORBIDDEN, None);
         assert_eq!(

@@ -374,4 +374,46 @@ mod tests {
         assert!(tm.is_cooling_down());
         assert!(tm.cached_dynamic_token.is_none());
     }
+
+    #[test]
+    fn test_token_parsing_missing_user_token_rejected() {
+        // Response without user_token (body is null, as returned by Musixmatch when guid is missing)
+        let json_without_guid: Value = serde_json::from_str(
+            r#"{
+            "message": {
+                "header": {
+                    "status_code": 200,
+                    "execute_time": 0.014
+                },
+                "body": null
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let extracted = json_without_guid
+            .pointer("/message/body/user_token")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| is_valid_token(s));
+
+        assert_eq!(extracted, None);
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_gate_blocks_under_cooldown() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        // Trigger cooldown on global TOKEN_MANAGER
+        trigger_gate_cooldown();
+        assert!(is_gate_cooling_down());
+
+        // Under cooldown, wait_for_gate immediately returns false without making network requests
+        let gate_opened = wait_for_gate().await;
+        assert!(!gate_opened, "Gate must remain closed when under cooldown");
+
+        // Clean up cooldown so other tests aren't affected
+        if let Ok(mut mgr) = TOKEN_MANAGER.lock() {
+            mgr.blocked_until = None;
+        }
+    }
 }
