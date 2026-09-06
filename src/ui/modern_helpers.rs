@@ -96,16 +96,7 @@ impl WrappedBlock {
         let rom_bg_style = bg_style.add_modifier(ratatui::style::Modifier::ITALIC);
         self.primary
             .iter()
-            .map(move |l| {
-                let s = if is_non_vocal_annotation(l) {
-                    style.add_modifier(
-                        ratatui::style::Modifier::DIM | ratatui::style::Modifier::ITALIC,
-                    )
-                } else {
-                    style
-                };
-                Line::from(Span::styled(l.as_str(), s))
-            })
+            .map(move |l| Line::from(Span::styled(l.as_str(), style)))
             .chain(
                 self.romanized_primary
                     .iter()
@@ -694,14 +685,7 @@ fn build_current_spans<'a>(
 
         let mut lines = Vec::new();
         for line in &current_block.primary {
-            let s = if is_non_vocal_annotation(line) {
-                styles
-                    .after
-                    .add_modifier(ratatui::style::Modifier::DIM | ratatui::style::Modifier::ITALIC)
-            } else {
-                style
-            };
-            lines.push(Line::from(Span::styled(line.as_str(), s)));
+            lines.push(Line::from(Span::styled(line.as_str(), style)));
         }
         for rom in &current_block.romanized_primary {
             lines.push(Line::from(Span::styled(rom.as_str(), rom_style)));
@@ -825,15 +809,6 @@ fn build_word_spans<'a>(
 ) -> Vec<Span<'a>> {
     let suffix = if has_trailing_space { " " } else { "" };
 
-    // If the word represents a non-vocal structural annotation (e.g. "(Chorus)"),
-    // do not wipe it as sung lyrics; render as a subtle, dimmed annotation badge.
-    if is_non_vocal_annotation(&word.text) {
-        let annot_style = styles
-            .after
-            .add_modifier(ratatui::style::Modifier::DIM | ratatui::style::Modifier::ITALIC);
-        return vec![styled_word(&word.text, suffix, annot_style)];
-    }
-
     let current_style = if is_background {
         styles.background_current
     } else {
@@ -914,63 +889,7 @@ pub fn matching_close_paren(c: char) -> Option<char> {
     }
 }
 
-/// Determines if a parenthesized text string represents a non-vocal structural annotation
-/// (e.g., "(chorus)", "(verse 1)", "(intro)", "(solo)", "(x2)", "(2x)") rather than
-/// actual sung backing vocals.
-pub fn is_non_vocal_annotation(text: &str) -> bool {
-    let trimmed = text
-        .trim()
-        .trim_matches(|c| is_open_paren(c) || is_close_paren(c))
-        .trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    let lower = trimmed.to_lowercase();
-
-    match lower.as_str() {
-        "intro" | "outro" | "chorus" | "bridge" | "hook" | "interlude" | "instrumental"
-        | "solo" | "guitar solo" | "guitar-solo" | "drum solo" | "sax solo" | "piano solo"
-        | "break" | "breakdown" | "drop" | "refrain" | "pre-chorus" | "pre chorus"
-        | "post-chorus" | "post chorus" => return true,
-        _ => {}
-    }
-
-    // Check verse variations: "verse", "verse 1", "verse 2", "v1", "v2"
-    if lower == "verse"
-        || (lower.starts_with("verse ") && lower[6..].trim().chars().all(|c| c.is_ascii_digit()))
-        || (lower.starts_with('v')
-            && lower.len() > 1
-            && lower[1..].chars().all(|c| c.is_ascii_digit()))
-    {
-        return true;
-    }
-
-    // Check repetition counters: "x2", "x3", "2x", "3x", "2 times", etc.
-    if is_repetition_marker(&lower) {
-        return true;
-    }
-
-    false
-}
-
-fn is_repetition_marker(s: &str) -> bool {
-    if s.starts_with('x') && s.len() > 1 && s[1..].chars().all(|c| c.is_ascii_digit()) {
-        return true;
-    }
-    if s.ends_with('x') && s.len() > 1 && s[..s.len() - 1].chars().all(|c| c.is_ascii_digit()) {
-        return true;
-    }
-    if let Some(rest) = s.strip_suffix(" times")
-        && !rest.is_empty()
-        && rest.chars().all(|c| c.is_ascii_digit())
-    {
-        return true;
-    }
-    false
-}
-
-/// Returns the byte ranges within `text` that represent parenthetical background vocals
-/// (excluding non-vocal annotations like "(Chorus)").
+/// Returns the byte ranges within `text` that represent parenthetical background vocals.
 pub fn get_background_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
     let mut ranges = Vec::new();
     let char_indices: Vec<(usize, char)> = text.char_indices().collect();
@@ -998,16 +917,10 @@ pub fn get_background_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
             }
 
             if let Some((close_byte, close_len, close_j)) = close_info {
-                let inner = &text[byte_pos + ch.len_utf8()..close_byte];
-                if !is_non_vocal_annotation(inner) {
-                    ranges.push(byte_pos..close_byte + close_len);
-                }
+                ranges.push(byte_pos..close_byte + close_len);
                 i = close_j + 1;
             } else {
-                let inner = &text[byte_pos + ch.len_utf8()..];
-                if !is_non_vocal_annotation(inner) {
-                    ranges.push(byte_pos..text.len());
-                }
+                ranges.push(byte_pos..text.len());
                 break;
             }
         } else {
@@ -1105,7 +1018,7 @@ pub fn wrap_inline_segments(text: &str, width: usize) -> Vec<Vec<InlineSegment>>
 }
 
 /// Partitions word timings into main vocal words and background vocal words based on parentheses.
-/// Supports ASCII `()` `[]` and CJK `（）` `【】` `「」`, while ignoring non-vocal annotations.
+/// Supports ASCII `()` `[]` and CJK `（）` `【】` `「」`.
 pub fn split_words_main_and_background(
     words: &[crate::lyrics::types::WordTiming],
 ) -> (
@@ -1130,20 +1043,8 @@ pub fn split_words_main_and_background(
             }
             let end_idx = if found_close { j } else { words.len() - 1 };
 
-            let combined: String = words[i..=end_idx]
-                .iter()
-                .map(|w| w.text.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-
-            if is_non_vocal_annotation(&combined) {
-                for word in &words[i..=end_idx] {
-                    main_words.push(word);
-                }
-            } else {
-                for word in &words[i..=end_idx] {
-                    bg_words.push(word);
-                }
+            for word in &words[i..=end_idx] {
+                bg_words.push(word);
             }
             i = end_idx + 1;
         } else {
@@ -1157,7 +1058,6 @@ pub fn split_words_main_and_background(
 
 /// Extracts main text and parenthetical background vocals from a lyric line.
 /// Supports standard parentheses `()`, square brackets `[]`, and CJK brackets `（）`, `【】`, `「」`.
-/// Non-vocal structural annotations (e.g. `(Chorus)`, `(x2)`) are preserved as main text.
 ///
 /// Returns `(main_text, background_text)`:
 /// - If line contains no background vocals: `(Some(text.to_string()), None)`
@@ -1209,28 +1109,16 @@ pub fn split_line_main_and_background(text: &str) -> (Option<String>, Option<Str
             }
 
             if let Some((close_byte, close_len, close_j)) = close_info {
-                let inner = &text[byte_pos + ch.len_utf8()..close_byte];
                 let paren_slice = text[byte_pos..close_byte + close_len].trim();
-
-                if is_non_vocal_annotation(inner) {
-                    if !paren_slice.is_empty() {
-                        main_parts.push(paren_slice);
-                    }
-                } else if !paren_slice.is_empty() {
+                if !paren_slice.is_empty() {
                     bg_parts.push(paren_slice);
                 }
 
                 current_idx = close_byte + close_len;
                 i = close_j + 1;
             } else {
-                let inner = &text[byte_pos + ch.len_utf8()..];
                 let paren_slice = text[byte_pos..].trim();
-
-                if is_non_vocal_annotation(inner) {
-                    if !paren_slice.is_empty() {
-                        main_parts.push(paren_slice);
-                    }
-                } else if !paren_slice.is_empty() {
+                if !paren_slice.is_empty() {
                     bg_parts.push(paren_slice);
                 }
 
@@ -1353,31 +1241,22 @@ mod tests {
     }
 
     #[test]
-    fn test_split_line_non_vocal_annotations() {
-        // Structural annotations should not be treated as background vocals
-        let (main, bg) = split_line_main_and_background("Take me home (Chorus)");
-        assert_eq!(main.as_deref(), Some("Take me home (Chorus)"));
-        assert_eq!(bg, None);
-
-        let (main, bg) = split_line_main_and_background("(Intro)");
-        assert_eq!(main.as_deref(), Some("(Intro)"));
-        assert_eq!(bg, None);
-
-        let (main, bg) = split_line_main_and_background("I love you (x2)");
-        assert_eq!(main.as_deref(), Some("I love you (x2)"));
-        assert_eq!(bg, None);
-
-        let (main, bg) = split_line_main_and_background("Don't stop (Verse 1) (yeah yeah)");
-        assert_eq!(main.as_deref(), Some("Don't stop (Verse 1)"));
+    fn test_split_line_parentheses_background() {
+        let (main, bg) = split_line_main_and_background("Take me home (yeah yeah)");
+        assert_eq!(main.as_deref(), Some("Take me home"));
         assert_eq!(bg.as_deref(), Some("(yeah yeah)"));
 
-        let (main, bg) = split_line_main_and_background("Solo guitar (Guitar Solo)");
-        assert_eq!(main.as_deref(), Some("Solo guitar (Guitar Solo)"));
-        assert_eq!(bg, None);
+        let (main, bg) = split_line_main_and_background("I love you (so much)");
+        assert_eq!(main.as_deref(), Some("I love you"));
+        assert_eq!(bg.as_deref(), Some("(so much)"));
+
+        let (main, bg) = split_line_main_and_background("Don't stop (ooh) (yeah yeah)");
+        assert_eq!(main.as_deref(), Some("Don't stop"));
+        assert_eq!(bg.as_deref(), Some("(ooh) (yeah yeah)"));
     }
 
     #[test]
-    fn test_split_words_main_and_background_annotations_and_cjk() {
+    fn test_split_words_main_and_background_ascii_and_cjk() {
         let words = vec![
             crate::lyrics::types::WordTiming {
                 start: 0.0,
@@ -1389,8 +1268,8 @@ mod tests {
             crate::lyrics::types::WordTiming {
                 start: 0.6,
                 end: 1.0,
-                text: "(Chorus)".to_string(),
-                grapheme_boundaries: vec![0, 8],
+                text: "(yeah)".to_string(),
+                grapheme_boundaries: vec![0, 6],
                 grapheme_times: vec![],
             },
             crate::lyrics::types::WordTiming {
@@ -1403,14 +1282,12 @@ mod tests {
         ];
 
         let (main, bg) = split_words_main_and_background(&words);
-        // "Sing" and "(Chorus)" are main vocals (Chorus is non-vocal annotation)
-        assert_eq!(main.len(), 2);
+        assert_eq!(main.len(), 1);
         assert_eq!(main[0].text, "Sing");
-        assert_eq!(main[1].text, "(Chorus)");
 
-        // "（星のように）" is backing vocal
-        assert_eq!(bg.len(), 1);
-        assert_eq!(bg[0].text, "（星のように）");
+        assert_eq!(bg.len(), 2);
+        assert_eq!(bg[0].text, "(yeah)");
+        assert_eq!(bg[1].text, "（星のように）");
     }
 
     #[test]
@@ -1688,26 +1565,31 @@ mod tests {
     }
 
     #[test]
-    fn test_structural_annotation_styling_and_karaoke_bypass() {
+    fn test_sung_word_highlighting_break_and_common_words() {
         let styles = LyricStyles::default();
-        let annot_word = crate::lyrics::types::WordTiming {
+        let break_word = crate::lyrics::types::WordTiming {
             start: 1.0,
             end: 2.0,
-            text: "(Chorus)".to_string(),
-            grapheme_boundaries: vec![0, 8],
+            text: "break".to_string(),
+            grapheme_boundaries: vec![0, 1, 2, 3, 4, 5],
             grapheme_times: vec![],
         };
 
-        // Structural annotation should not wipe in karaoke; stays dimmed/italic
-        let spans = build_word_spans(&annot_word, 1.5, &styles, false, false);
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].content, "(Chorus)");
-        assert_eq!(
-            spans[0].style,
-            styles
-                .after
-                .add_modifier(ratatui::style::Modifier::DIM | ratatui::style::Modifier::ITALIC)
-        );
+        // Before start: unhighlighted (after style)
+        let spans_before = build_word_spans(&break_word, 0.5, &styles, false, false);
+        assert_eq!(spans_before[0].style, styles.after);
+
+        // While active: highlighted!
+        let spans_active = build_word_spans(&break_word, 1.5, &styles, false, false);
+        assert_eq!(spans_active[0].style, styles.current);
+
+        // While passed: highlighted!
+        let spans_passed = build_word_spans(&break_word, 2.5, &styles, false, false);
+        assert_eq!(spans_passed[0].style, styles.current);
+
+        // In background vocals: uses background_current when active
+        let bg_spans_active = build_word_spans(&break_word, 1.5, &styles, false, true);
+        assert_eq!(bg_spans_active[0].style, styles.background_current);
     }
 
     #[test]
