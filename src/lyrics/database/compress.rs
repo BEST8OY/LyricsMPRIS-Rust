@@ -10,6 +10,13 @@ static REMASTER_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
+static FEAT_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r#"(?i)(?:\s+[\(\[](?:feat\.?|ft\.?|featuring|with)\s+[^()\[\]]+[\)\]]|\s*[-–—]\s*(?:feat\.?|ft\.?|featuring|with)\s+[^()\[\]]+$|\s+(?:feat\.?|ft\.?|featuring)\s+[^()\[\]]+$)"#,
+    )
+    .unwrap()
+});
+
 /// Canonicalizes typographic characters (smart quotes, dashes, non-breaking spaces)
 /// and converts to lowercase trimmed string for resilient indexing.
 pub(crate) fn normalize(s: &str) -> String {
@@ -42,6 +49,56 @@ pub(crate) fn strip_remaster_suffix(title: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Strips common featured artist annotations from titles or artists, returning the clean string if modified.
+///
+/// Handles:
+/// - `(feat. ...)`, `(ft. ...)`, `(featuring ...)`, `(with ...)`
+/// - `[feat. ...]`, `[ft. ...]`, `[featuring ...]`, `[with ...]`
+/// - ` - feat. ...`, ` - ft. ...`, ` - with ...`
+/// - ` feat. ...`, ` ft. ...`, ` featuring ...`
+pub(crate) fn strip_feat_suffix(title: &str) -> Option<String> {
+    if FEAT_RE.is_match(title) {
+        let stripped = FEAT_RE.replace(title, "");
+        let clean = stripped.trim();
+        if !clean.is_empty() && clean != title {
+            return Some(clean.to_string());
+        }
+    }
+    None
+}
+
+/// Strips all common title annotations (remaster versions, anniversary editions, and featured artists).
+///
+/// Loops up to 3 passes to handle nested or combined annotations such as:
+/// `"Song (feat. Artist) - 2015 Remaster"` or `"Song - 2015 Remaster (feat. Artist)"`.
+pub(crate) fn clean_title_annotations(title: &str) -> Option<String> {
+    let mut current = title.to_string();
+    let mut changed = false;
+
+    for _ in 0..3 {
+        let mut round_changed = false;
+        if let Some(clean) = strip_remaster_suffix(&current) {
+            current = clean;
+            changed = true;
+            round_changed = true;
+        }
+        if let Some(clean) = strip_feat_suffix(&current) {
+            current = clean;
+            changed = true;
+            round_changed = true;
+        }
+        if !round_changed {
+            break;
+        }
+    }
+
+    if changed && !current.is_empty() && current != title {
+        Some(current)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn normalize_isrc(s: &str) -> Option<String> {

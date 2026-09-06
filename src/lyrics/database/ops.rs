@@ -1,8 +1,8 @@
 //! CRUD operations and query logic for normalized lyrics caching.
 
 use super::compress::{
-    compress_raw_lyrics, decompress_raw_lyrics, normalize, normalize_isrc, normalize_track_id,
-    strip_remaster_suffix,
+    clean_title_annotations, compress_raw_lyrics, decompress_raw_lyrics, normalize, normalize_isrc,
+    normalize_track_id, strip_feat_suffix, strip_remaster_suffix,
 };
 use super::schema::{DURATION_TOLERANCE_SECS, LyricsFormat};
 use crate::lyrics::parse::{parse_richsync_body, parse_subtitle_body, parse_synced_lyrics};
@@ -212,75 +212,40 @@ pub async fn fetch_from_database_inner(
         }
     }
 
-    // 6. Fallback: Remaster annotation tolerance
+    // 6. Fallback: Remaster and featured artist annotation tolerance
     if !artist_norm.is_empty() && !title_norm.is_empty() {
-        let clean_query_title = strip_remaster_suffix(&title_norm);
+        let clean_query_title = clean_title_annotations(&title_norm);
+        let effective_artist =
+            strip_feat_suffix(&artist_norm).unwrap_or_else(|| artist_norm.clone());
+        let mut candidate_artists = vec![&artist_norm];
+        if effective_artist != artist_norm {
+            candidate_artists.push(&effective_artist);
+        }
 
-        // Case A: Query has remaster suffix (e.g. "Heroes - 2015 Remaster") -> look for clean title in DB
+        // Case A: Query has remaster or feat suffix (e.g. "Heroes - 2015 Remaster" or "Beauty And A Beat (feat. Nicki Minaj)") -> look for clean title in DB
         if let Some(clean_title) = clean_query_title.as_ref() {
             // 6a. Exact match on clean title + exact album
-            if let Ok(Some(row)) = sqlx::query(
-                r#"
-                SELECT l.id, l.artist, l.title, l.duration, l.format, l.raw_lyrics
-                FROM lyrics l
-                JOIN track_aliases ta ON l.id = ta.lyrics_id
-                WHERE ta.artist = ? AND ta.title = ? AND ta.album = ?
-                LIMIT 1
-                "#,
-            )
-            .bind(&artist_norm)
-            .bind(clean_title)
-            .bind(&album_norm)
-            .fetch_optional(pool)
-            .await
-            {
-                let entry_dur: Option<f64> = row.try_get("duration").ok();
-                if duration_matches(duration, entry_dur)
-                    && let Some(result) = process_db_row(&row, pool).await
+            for search_artist in &candidate_artists {
+                if let Ok(Some(row)) = sqlx::query(
+                    r#"
+                    SELECT l.id, l.artist, l.title, l.duration, l.format, l.raw_lyrics
+                    FROM lyrics l
+                    JOIN track_aliases ta ON l.id = ta.lyrics_id
+                    WHERE ta.artist = ? AND ta.title = ? AND ta.album = ?
+                    LIMIT 1
+                    "#,
+                )
+                .bind(search_artist)
+                .bind(clean_title)
+                .bind(&album_norm)
+                .fetch_optional(pool)
+                .await
                 {
-                    // Self-healing: register the player's exact remaster query alias
-                    let target_id: i64 = row.try_get("id").unwrap_or_default();
-                    if target_id > 0 {
-                        let _ = sqlx::query(
-                            r#"
-                            INSERT INTO track_aliases (artist, title, album, lyrics_id)
-                            VALUES (?, ?, ?, ?)
-                            ON CONFLICT(artist, title, album) DO UPDATE SET
-                                lyrics_id = excluded.lyrics_id
-                            "#,
-                        )
-                        .bind(&artist_norm)
-                        .bind(&title_norm)
-                        .bind(&album_norm)
-                        .bind(target_id)
-                        .execute(pool)
-                        .await;
-                    }
-                    return Some(result);
-                }
-            }
-
-            // 6b. Clean title across any album
-            if let Ok(rows) = sqlx::query(
-                r#"
-                SELECT DISTINCT l.id, l.artist, l.title, l.duration, l.format, l.raw_lyrics
-                FROM lyrics l
-                JOIN track_aliases ta ON l.id = ta.lyrics_id
-                WHERE ta.artist = ? AND ta.title = ?
-                LIMIT 5
-                "#,
-            )
-            .bind(&artist_norm)
-            .bind(clean_title)
-            .fetch_all(pool)
-            .await
-            {
-                for row in rows {
                     let entry_dur: Option<f64> = row.try_get("duration").ok();
                     if duration_matches(duration, entry_dur)
                         && let Some(result) = process_db_row(&row, pool).await
                     {
-                        // Self-healing: register the player's exact remaster query alias
+                        // Self-healing: register the player's exact query alias
                         let target_id: i64 = row.try_get("id").unwrap_or_default();
                         if target_id > 0 {
                             let _ = sqlx::query(
@@ -302,9 +267,54 @@ pub async fn fetch_from_database_inner(
                     }
                 }
             }
+
+            // 6b. Clean title across any album
+            for search_artist in &candidate_artists {
+                if let Ok(rows) = sqlx::query(
+                    r#"
+                    SELECT DISTINCT l.id, l.artist, l.title, l.duration, l.format, l.raw_lyrics
+                    FROM lyrics l
+                    JOIN track_aliases ta ON l.id = ta.lyrics_id
+                    WHERE ta.artist = ? AND ta.title = ?
+                    LIMIT 5
+                    "#,
+                )
+                .bind(search_artist)
+                .bind(clean_title)
+                .fetch_all(pool)
+                .await
+                {
+                    for row in rows {
+                        let entry_dur: Option<f64> = row.try_get("duration").ok();
+                        if duration_matches(duration, entry_dur)
+                            && let Some(result) = process_db_row(&row, pool).await
+                        {
+                            // Self-healing: register the player's exact query alias
+                            let target_id: i64 = row.try_get("id").unwrap_or_default();
+                            if target_id > 0 {
+                                let _ = sqlx::query(
+                                    r#"
+                                    INSERT INTO track_aliases (artist, title, album, lyrics_id)
+                                    VALUES (?, ?, ?, ?)
+                                    ON CONFLICT(artist, title, album) DO UPDATE SET
+                                        lyrics_id = excluded.lyrics_id
+                                    "#,
+                                )
+                                .bind(&artist_norm)
+                                .bind(&title_norm)
+                                .bind(&album_norm)
+                                .bind(target_id)
+                                .execute(pool)
+                                .await;
+                            }
+                            return Some(result);
+                        }
+                    }
+                }
+            }
         }
 
-        // Case B: DB has remaster suffix (or alternate remaster), while query is clean (or has a different remaster)
+        // Case B: DB has remaster/feat suffix (or alternate annotations), while query is clean (or has different annotations)
         let clean_target = clean_query_title.as_deref().unwrap_or(&title_norm);
         let escaped_clean = clean_target
             .replace('\\', "\\\\")
@@ -312,46 +322,48 @@ pub async fn fetch_from_database_inner(
             .replace('_', "\\_");
         let prefix_pattern = format!("{escaped_clean}%");
 
-        if let Ok(rows) = sqlx::query(
-            r#"
-            SELECT DISTINCT ta.title AS alias_title, l.id, l.artist, l.title, l.duration, l.format, l.raw_lyrics
-            FROM lyrics l
-            JOIN track_aliases ta ON l.id = ta.lyrics_id
-            WHERE ta.artist = ? AND ta.title LIKE ? ESCAPE '\'
-            LIMIT 10
-            "#,
-        )
-        .bind(&artist_norm)
-        .bind(&prefix_pattern)
-        .fetch_all(pool)
-        .await
-        {
-            for row in rows {
-                let alias_title: String = row.try_get("alias_title").unwrap_or_default();
-                if strip_remaster_suffix(&alias_title).as_deref() == Some(clean_target) {
-                    let entry_dur: Option<f64> = row.try_get("duration").ok();
-                    if duration_matches(duration, entry_dur)
-                        && let Some(result) = process_db_row(&row, pool).await
-                    {
-                        // Self-healing: register query alias so subsequent lookups hit step 2 immediately
-                        let target_id: i64 = row.try_get("id").unwrap_or_default();
-                        if target_id > 0 {
-                            let _ = sqlx::query(
-                                r#"
-                                INSERT INTO track_aliases (artist, title, album, lyrics_id)
-                                VALUES (?, ?, ?, ?)
-                                ON CONFLICT(artist, title, album) DO UPDATE SET
-                                    lyrics_id = excluded.lyrics_id
-                                "#,
-                            )
-                            .bind(&artist_norm)
-                            .bind(&title_norm)
-                            .bind(&album_norm)
-                            .bind(target_id)
-                            .execute(pool)
-                            .await;
+        for search_artist in &candidate_artists {
+            if let Ok(rows) = sqlx::query(
+                r#"
+                SELECT DISTINCT ta.title AS alias_title, l.id, l.artist, l.title, l.duration, l.format, l.raw_lyrics
+                FROM lyrics l
+                JOIN track_aliases ta ON l.id = ta.lyrics_id
+                WHERE ta.artist = ? AND ta.title LIKE ? ESCAPE '\'
+                LIMIT 10
+                "#,
+            )
+            .bind(search_artist)
+            .bind(&prefix_pattern)
+            .fetch_all(pool)
+            .await
+            {
+                for row in rows {
+                    let alias_title: String = row.try_get("alias_title").unwrap_or_default();
+                    if clean_title_annotations(&alias_title).as_deref() == Some(clean_target) {
+                        let entry_dur: Option<f64> = row.try_get("duration").ok();
+                        if duration_matches(duration, entry_dur)
+                            && let Some(result) = process_db_row(&row, pool).await
+                        {
+                            // Self-healing: register query alias so subsequent lookups hit step 2 immediately
+                            let target_id: i64 = row.try_get("id").unwrap_or_default();
+                            if target_id > 0 {
+                                let _ = sqlx::query(
+                                    r#"
+                                    INSERT INTO track_aliases (artist, title, album, lyrics_id)
+                                    VALUES (?, ?, ?, ?)
+                                    ON CONFLICT(artist, title, album) DO UPDATE SET
+                                        lyrics_id = excluded.lyrics_id
+                                    "#,
+                                )
+                                .bind(&artist_norm)
+                                .bind(&title_norm)
+                                .bind(&album_norm)
+                                .bind(target_id)
+                                .execute(pool)
+                                .await;
+                            }
+                            return Some(result);
                         }
-                        return Some(result);
                     }
                 }
             }

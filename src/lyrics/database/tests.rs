@@ -1,6 +1,8 @@
 //! Integration and unit tests for database CRUD operations, alias deduplication, and identifier indexing.
 
-use super::compress::{normalize, strip_remaster_suffix};
+use super::compress::{
+    clean_title_annotations, normalize, strip_feat_suffix, strip_remaster_suffix,
+};
 use super::ops::{delete_cached_row, fetch_from_database_inner, store_in_database_inner};
 use super::schema::{LyricsFormat, create_schema};
 use sqlx::SqlitePool;
@@ -1258,4 +1260,124 @@ async fn test_database_remaster_duration_gating() {
     )
     .await;
     assert!(res_match.is_some());
+}
+
+#[test]
+fn test_strip_feat_suffix_and_clean_annotations() {
+    assert_eq!(
+        strip_feat_suffix("Beauty And A Beat (feat. Nicki Minaj)"),
+        Some("Beauty And A Beat".to_string())
+    );
+    assert_eq!(
+        strip_feat_suffix("Beauty And A Beat (ft. Nicki Minaj)"),
+        Some("Beauty And A Beat".to_string())
+    );
+    assert_eq!(
+        strip_feat_suffix("Beauty And A Beat [feat. Nicki Minaj]"),
+        Some("Beauty And A Beat".to_string())
+    );
+    assert_eq!(
+        strip_feat_suffix("Beauty And A Beat (with Nicki Minaj)"),
+        Some("Beauty And A Beat".to_string())
+    );
+    assert_eq!(
+        strip_feat_suffix("Beauty And A Beat - feat. Nicki Minaj"),
+        Some("Beauty And A Beat".to_string())
+    );
+    assert_eq!(
+        strip_feat_suffix("Beauty And A Beat feat. Nicki Minaj"),
+        Some("Beauty And A Beat".to_string())
+    );
+
+    // Words with "with" in regular title should NOT be stripped
+    assert_eq!(strip_feat_suffix("Dancing with a Stranger"), None);
+    assert_eq!(strip_feat_suffix("Stay With Me"), None);
+    assert_eq!(strip_feat_suffix("Gone with the Wind"), None);
+
+    // Combined feat and remaster in clean_title_annotations
+    assert_eq!(
+        clean_title_annotations("Heroes (feat. Brian Eno) [2011 Remaster]"),
+        Some("Heroes".to_string())
+    );
+    assert_eq!(
+        clean_title_annotations("Heroes - 2015 Remaster (feat. Brian Eno)"),
+        Some("Heroes".to_string())
+    );
+}
+
+#[tokio::test]
+async fn test_database_feat_annotation_tolerance_and_self_healing() {
+    let pool = create_test_pool().await;
+
+    // 1. Store clean title in DB
+    store_in_database_inner(
+        &pool,
+        "Justin Bieber",
+        "Beauty And A Beat",
+        "Believe",
+        Some(228.0),
+        LyricsFormat::Lrclib,
+        "[00:10.00]Yeah! Young Money Nicki Minaj".to_string(),
+        &["USUM71205367".to_string()],
+        &[],
+        &[],
+    )
+    .await;
+
+    // 2. Query with featured artist in title -> should match via clean title fallback
+    let res = fetch_from_database_inner(
+        &pool,
+        "Justin Bieber",
+        "Beauty And A Beat (feat. Nicki Minaj)",
+        "Believe",
+        Some(228.0),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(res.is_some(), "Expected match for query with (feat. ...)");
+
+    // 3. Verify self-healing alias exists in DB for the exact query
+    let self_healed_row = sqlx::query(
+        "SELECT lyrics_id FROM track_aliases WHERE artist = ? AND title = ? AND album = ?",
+    )
+    .bind("justin bieber")
+    .bind("beauty and a beat (feat. nicki minaj)")
+    .bind("believe")
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert!(self_healed_row.is_some());
+
+    // 4. Subsequent lookup should hit Step 2 exact alias match directly
+    let res_cached = fetch_from_database_inner(
+        &pool,
+        "Justin Bieber",
+        "Beauty And A Beat (feat. Nicki Minaj)",
+        "Believe",
+        Some(228.0),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(res_cached.is_some());
+
+    // 5. Query with featured artist in artist name
+    let res_artist_feat = fetch_from_database_inner(
+        &pool,
+        "Justin Bieber feat. Nicki Minaj",
+        "Beauty And A Beat",
+        "Believe",
+        Some(228.0),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert!(
+        res_artist_feat.is_some(),
+        "Expected match for query with feat in artist name"
+    );
 }
