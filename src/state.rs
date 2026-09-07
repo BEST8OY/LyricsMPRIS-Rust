@@ -255,7 +255,11 @@ impl PlayerState {
     /// The position is automatically sanitized (no NaN, no negatives).
     pub fn set_position(&mut self, position: f64) {
         let pos = sanitize_position(position);
-        self.timer.set_position(pos);
+        if self.playing {
+            self.timer.set_position(pos);
+        } else {
+            self.timer.reset(pos);
+        }
         self.position = pos;
     }
 
@@ -556,10 +560,17 @@ impl StateBundle {
         changed
     }
 
-    /// Updates playback state (playing/paused) and position anchor with seek detection.
+    /// Maximum allowable discrepancy between estimated playback position and authoritative D-Bus position
+    /// before forcing a state synchronization update to observers (in seconds).
     ///
-    /// Detects position jumps (|observed_pos - estimated_pos| > 0.5s) and increments `version`
-    /// so that change detection automatically notifies subscribers of seek events (even if line index does not change).
+    /// Discrepancies larger than 30ms (such as post-buffering audio alignment or seeks)
+    /// produce perceptible desynchronization in richsync word-level karaoke.
+    pub const POSITION_DRIFT_THRESHOLD_SECS: f64 = 0.03;
+
+    /// Updates playback state (playing/paused) and position anchor with seek and drift detection.
+    ///
+    /// Detects position jumps (|observed_pos - estimated_pos| > [`POSITION_DRIFT_THRESHOLD_SECS`]) and increments `version`
+    /// so that change detection automatically notifies subscribers of calibration/seek events (even if line index does not change).
     ///
     /// # Returns
     /// Returns `(playing_changed, index_changed, position_jumped)`.
@@ -576,7 +587,8 @@ impl StateBundle {
         let current_position = self.player_state.estimate_position();
         let changed_index = self.update_index(current_position);
         let playing_changed = prev_playing != self.player_state.playing;
-        let position_jumped = (current_position - prev_position).abs() > 0.5;
+        let position_jumped =
+            (current_position - prev_position).abs() > Self::POSITION_DRIFT_THRESHOLD_SECS;
 
         if !changed_index && (playing_changed || position_jumped) {
             self.increment_version();
@@ -691,5 +703,16 @@ mod tests {
         // Not playing -> playing without lyrics should still trigger update
         bundle.player_state.playing = true;
         assert!(bundle.should_send_update(false));
+    }
+
+    #[test]
+    fn test_player_state_set_position_paused_resets_instant() {
+        let mut player = PlayerState::default();
+        player.set_position(10.0);
+        // Player is paused by default
+        assert!(!player.playing);
+        // While paused, estimation remains frozen at 10.0
+        assert_eq!(player.estimate_position(), 10.0);
+        assert_eq!(player.timer.estimate(true), 10.0);
     }
 }
