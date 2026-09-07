@@ -43,7 +43,7 @@ pub fn apply_romanization(lines: &mut [LyricLine]) {
 }
 
 /// Converts a single line of text to its Romanized form if non-Latin.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn romanize_text(text: &str) -> Option<String> {
     let system = detect(std::iter::once(text))?;
     convert(text, system)

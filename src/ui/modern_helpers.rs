@@ -60,10 +60,10 @@ pub fn determine_background_first(
 ) -> bool {
     if let Some(words) = words {
         let (main_words, bg_words) = split_words_main_and_background(words);
-        if let (Some(first_bg), Some(first_main)) = (bg_words.first(), main_words.first()) {
-            if (first_bg.start - first_main.start).abs() > f64::EPSILON {
-                return first_bg.start < first_main.start;
-            }
+        if let (Some(first_bg), Some(first_main)) = (bg_words.first(), main_words.first())
+            && (first_bg.start - first_main.start).abs() > f64::EPSILON
+        {
+            return first_bg.start < first_main.start;
         }
     }
     is_line_background_first(line_text)
@@ -99,12 +99,7 @@ impl WrappedBlock {
             + self.romanized_background.len()
     }
 
-    #[allow(dead_code)]
-    pub fn inline_len(&self) -> usize {
-        self.inline_lines.len() + self.inline_romanized.len()
-    }
-
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.primary.is_empty()
             && self.background.is_empty()
@@ -155,6 +150,7 @@ impl WrappedBlock {
 
     /// Renders lines with parenthetical background vocals inline (dimmed italic),
     /// used for inactive lines (before / after) to prevent vertical shifting and jumping.
+    #[cfg(test)]
     pub fn styled_lines_inline<'a>(
         &'a self,
         style: ratatui::style::Style,
@@ -193,15 +189,6 @@ impl WrappedBlock {
             .collect();
 
         lines.into_iter()
-    }
-
-    #[allow(dead_code)]
-    pub fn styled_lines_primary_only<'a>(
-        &'a self,
-        style: ratatui::style::Style,
-        bg_style: ratatui::style::Style,
-    ) -> impl Iterator<Item = Line<'a>> {
-        self.styled_lines_inline(style, bg_style)
     }
 }
 

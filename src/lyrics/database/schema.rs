@@ -1,6 +1,5 @@
 //! Database schema definition, types, and connection setup.
 
-use crate::lyrics::types::TrackMatchInfo;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 
@@ -47,19 +46,6 @@ impl LyricsFormat {
             _ => None,
         }
     }
-}
-
-/// Database entry for a single track's lyrics (from SQL query).
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct LyricsEntry {
-    pub id: i64,
-    pub artist: String,
-    pub title: String,
-    pub duration: Option<f64>,
-    pub format: LyricsFormat,
-    pub raw_lyrics: String,
-    pub track_ids: TrackMatchInfo,
 }
 
 /// Creates the database schema and indexes if they don't exist.

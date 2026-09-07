@@ -10,10 +10,7 @@ pub mod schema;
 #[cfg(test)]
 mod tests;
 
-#[allow(unused_imports)]
-pub use ops::{fetch_from_database_inner, store_in_database_inner};
-#[allow(unused_imports)]
-pub use schema::{DURATION_TOLERANCE_SECS, LyricsEntry, LyricsFormat};
+pub use schema::{DURATION_TOLERANCE_SECS, LyricsFormat};
 
 use crate::lyrics::types::ProviderResult;
 use schema::open_database;
@@ -45,13 +42,6 @@ pub async fn initialize(path: PathBuf) {
             );
         }
     }
-}
-
-/// Returns true if the database connection pool has been initialized.
-#[allow(dead_code)]
-#[must_use]
-pub fn is_initialized() -> bool {
-    DB_POOL.get().is_some()
 }
 
 /// Attempts to fetch lyrics from the database cache.

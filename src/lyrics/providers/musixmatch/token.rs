@@ -214,6 +214,7 @@ impl TokenManager {
     }
 
     /// Returns true if currently in throttling cooldown.
+    #[cfg(test)]
     pub(crate) fn is_cooling_down(&self) -> bool {
         self.blocked_until
             .is_some_and(|until| Instant::now() < until)
@@ -271,7 +272,7 @@ pub(crate) fn trigger_gate_cooldown() {
 }
 
 /// Checks if cooldown is currently active.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn is_gate_cooling_down() -> bool {
     if let Ok(mgr) = TOKEN_MANAGER.lock() {
         mgr.is_cooling_down()
