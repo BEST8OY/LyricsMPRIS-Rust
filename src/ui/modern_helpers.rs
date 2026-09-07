@@ -45,6 +45,30 @@ pub fn should_add_space_between(curr: &str, next: &str) -> bool {
     }
 }
 
+/// Returns true if the background vocal segment appears before any primary vocal text in `text`.
+pub fn is_line_background_first(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.chars().next().map(is_open_paren).unwrap_or(false)
+}
+
+/// Determines whether background vocals precede primary vocals chronologically.
+/// In richsync (when word timings are present), uses authoritative word start timestamps.
+/// In text/LRC lines, checks whether the line starts with an opening parenthesis or bracket.
+pub fn determine_background_first(
+    line_text: &str,
+    words: Option<&[crate::lyrics::types::WordTiming]>,
+) -> bool {
+    if let Some(words) = words {
+        let (main_words, bg_words) = split_words_main_and_background(words);
+        if let (Some(first_bg), Some(first_main)) = (bg_words.first(), main_words.first()) {
+            if (first_bg.start - first_main.start).abs() > f64::EPSILON {
+                return first_bg.start < first_main.start;
+            }
+        }
+    }
+    is_line_background_first(line_text)
+}
+
 /// A segment of text within an inline line, indicating whether it represents background vocals.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InlineSegment {
@@ -63,6 +87,8 @@ pub struct WrappedBlock {
     pub inline_lines: Vec<Vec<InlineSegment>>,
     /// Wrapped romanized lines for inline inactive rendering
     pub inline_romanized: Vec<Vec<InlineSegment>>,
+    /// Whether background vocals precede primary vocals chronologically
+    pub bg_first: bool,
 }
 
 impl WrappedBlock {
@@ -94,24 +120,37 @@ impl WrappedBlock {
     ) -> impl Iterator<Item = Line<'a>> {
         let rom_style = style.add_modifier(ratatui::style::Modifier::ITALIC);
         let rom_bg_style = bg_style.add_modifier(ratatui::style::Modifier::ITALIC);
-        self.primary
-            .iter()
-            .map(move |l| Line::from(Span::styled(l.as_str(), style)))
-            .chain(
-                self.romanized_primary
-                    .iter()
-                    .map(move |l| Line::from(Span::styled(l.as_str(), rom_style))),
-            )
-            .chain(
-                self.background
-                    .iter()
-                    .map(move |l| Line::from(Span::styled(l.as_str(), bg_style))),
-            )
-            .chain(
-                self.romanized_background
-                    .iter()
-                    .map(move |l| Line::from(Span::styled(l.as_str(), rom_bg_style))),
-            )
+
+        let mut lines = Vec::with_capacity(self.len());
+        if self.bg_first {
+            for l in &self.background {
+                lines.push(Line::from(Span::styled(l.as_str(), bg_style)));
+            }
+            for l in &self.romanized_background {
+                lines.push(Line::from(Span::styled(l.as_str(), rom_bg_style)));
+            }
+            for l in &self.primary {
+                lines.push(Line::from(Span::styled(l.as_str(), style)));
+            }
+            for l in &self.romanized_primary {
+                lines.push(Line::from(Span::styled(l.as_str(), rom_style)));
+            }
+        } else {
+            for l in &self.primary {
+                lines.push(Line::from(Span::styled(l.as_str(), style)));
+            }
+            for l in &self.romanized_primary {
+                lines.push(Line::from(Span::styled(l.as_str(), rom_style)));
+            }
+            for l in &self.background {
+                lines.push(Line::from(Span::styled(l.as_str(), bg_style)));
+            }
+            for l in &self.romanized_background {
+                lines.push(Line::from(Span::styled(l.as_str(), rom_bg_style)));
+            }
+        }
+
+        lines.into_iter()
     }
 
     /// Renders lines with parenthetical background vocals inline (dimmed italic),
@@ -324,6 +363,8 @@ fn ensure_wrapped_cache<'a>(
                     Vec::new()
                 };
 
+                let bg_first = determine_background_first(&l.text, l.words.as_deref());
+
                 WrappedBlock {
                     primary,
                     background,
@@ -331,6 +372,7 @@ fn ensure_wrapped_cache<'a>(
                     romanized_background,
                     inline_lines,
                     inline_romanized,
+                    bg_first,
                 }
             })
             .collect();
@@ -663,16 +705,31 @@ fn build_current_spans<'a>(
             try_build_karaoke_spans_split(update, idx, width, styles, position)
     {
         let mut lines = Vec::new();
-        if let Some(ms) = main_spans {
-            lines.extend(ms);
-            for rom in &current_block.romanized_primary {
-                lines.push(Line::from(Span::styled(rom.as_str(), rom_style)));
+        if current_block.bg_first {
+            if let Some(bs) = bg_spans {
+                lines.extend(bs);
+                for rom in &current_block.romanized_background {
+                    lines.push(Line::from(Span::styled(rom.as_str(), rom_bg_style)));
+                }
             }
-        }
-        if let Some(bs) = bg_spans {
-            lines.extend(bs);
-            for rom in &current_block.romanized_background {
-                lines.push(Line::from(Span::styled(rom.as_str(), rom_bg_style)));
+            if let Some(ms) = main_spans {
+                lines.extend(ms);
+                for rom in &current_block.romanized_primary {
+                    lines.push(Line::from(Span::styled(rom.as_str(), rom_style)));
+                }
+            }
+        } else {
+            if let Some(ms) = main_spans {
+                lines.extend(ms);
+                for rom in &current_block.romanized_primary {
+                    lines.push(Line::from(Span::styled(rom.as_str(), rom_style)));
+                }
+            }
+            if let Some(bs) = bg_spans {
+                lines.extend(bs);
+                for rom in &current_block.romanized_background {
+                    lines.push(Line::from(Span::styled(rom.as_str(), rom_bg_style)));
+                }
             }
         }
         lines
@@ -684,17 +741,32 @@ fn build_current_spans<'a>(
         };
 
         let mut lines = Vec::new();
-        for line in &current_block.primary {
-            lines.push(Line::from(Span::styled(line.as_str(), style)));
-        }
-        for rom in &current_block.romanized_primary {
-            lines.push(Line::from(Span::styled(rom.as_str(), rom_style)));
-        }
-        for line in &current_block.background {
-            lines.push(Line::from(Span::styled(line.as_str(), bg_style)));
-        }
-        for rom in &current_block.romanized_background {
-            lines.push(Line::from(Span::styled(rom.as_str(), rom_bg_style)));
+        if current_block.bg_first {
+            for line in &current_block.background {
+                lines.push(Line::from(Span::styled(line.as_str(), bg_style)));
+            }
+            for rom in &current_block.romanized_background {
+                lines.push(Line::from(Span::styled(rom.as_str(), rom_bg_style)));
+            }
+            for line in &current_block.primary {
+                lines.push(Line::from(Span::styled(line.as_str(), style)));
+            }
+            for rom in &current_block.romanized_primary {
+                lines.push(Line::from(Span::styled(rom.as_str(), rom_style)));
+            }
+        } else {
+            for line in &current_block.primary {
+                lines.push(Line::from(Span::styled(line.as_str(), style)));
+            }
+            for rom in &current_block.romanized_primary {
+                lines.push(Line::from(Span::styled(rom.as_str(), rom_style)));
+            }
+            for line in &current_block.background {
+                lines.push(Line::from(Span::styled(line.as_str(), bg_style)));
+            }
+            for rom in &current_block.romanized_background {
+                lines.push(Line::from(Span::styled(rom.as_str(), rom_bg_style)));
+            }
         }
         lines
     }
@@ -757,12 +829,24 @@ fn try_build_karaoke_spans<'a>(
 ) -> Option<Vec<Line<'a>>> {
     let (main_lines, bg_lines) =
         try_build_karaoke_spans_split(update, idx, width, styles, position)?;
+    let line = update.lines.get(idx)?;
+    let bg_first = determine_background_first(&line.text, line.words.as_deref());
+
     let mut result = Vec::new();
-    if let Some(m) = main_lines {
-        result.extend(m);
-    }
-    if let Some(b) = bg_lines {
-        result.extend(b);
+    if bg_first {
+        if let Some(b) = bg_lines {
+            result.extend(b);
+        }
+        if let Some(m) = main_lines {
+            result.extend(m);
+        }
+    } else {
+        if let Some(m) = main_lines {
+            result.extend(m);
+        }
+        if let Some(b) = bg_lines {
+            result.extend(b);
+        }
     }
     Some(result)
 }
@@ -1192,6 +1276,7 @@ mod tests {
                 text: "konnichiwa".to_string(),
                 is_background: false,
             }]],
+            bg_first: false,
         };
 
         assert_eq!(block.len(), 2);
@@ -1310,6 +1395,7 @@ mod tests {
             romanized_background: Vec::new(),
             inline_lines: segments,
             inline_romanized: Vec::new(),
+            bg_first: false,
         };
 
         let styles = LyricStyles::default();
@@ -1601,6 +1687,7 @@ mod tests {
             romanized_background: Vec::new(),
             inline_lines: Vec::new(),
             inline_romanized: Vec::new(),
+            bg_first: false,
         };
 
         let styles = LyricStyles::default();
@@ -1618,5 +1705,91 @@ mod tests {
 
         // Block height matches across all states
         assert_eq!(block.len(), 2);
+    }
+
+    #[test]
+    fn test_chronological_background_first_ordering() {
+        let styles = LyricStyles::default();
+
+        // 1. Line string begins with background vocal: "(Look out for yourself) but I'm ready"
+        assert!(is_line_background_first(
+            "(Look out for yourself) but I'm ready"
+        ));
+        assert!(!is_line_background_first(
+            "but I'm ready (Look out for yourself)"
+        ));
+
+        // 2. Richsync word timings: background words start earlier than main words
+        let bg_word = crate::lyrics::types::WordTiming {
+            start: 54.16,
+            end: 54.30,
+            text: "(Look)".to_string(),
+            grapheme_boundaries: vec![0, 6],
+            grapheme_times: vec![],
+        };
+        let main_word = crate::lyrics::types::WordTiming {
+            start: 54.31,
+            end: 54.49,
+            text: "ready".to_string(),
+            grapheme_boundaries: vec![0, 5],
+            grapheme_times: vec![],
+        };
+        assert!(determine_background_first(
+            "(Look out for yourself) but I'm ready",
+            Some(&[bg_word.clone(), main_word.clone()])
+        ));
+        let later_bg_word = crate::lyrics::types::WordTiming {
+            start: 54.50,
+            end: 54.70,
+            text: "(free)".to_string(),
+            grapheme_boundaries: vec![0, 6],
+            grapheme_times: vec![],
+        };
+        assert!(!determine_background_first(
+            "but I'm ready (free)",
+            Some(&[main_word.clone(), later_bg_word])
+        ));
+
+        // 3. WrappedBlock styling: background appears on line 0, primary on line 1
+        let block = WrappedBlock {
+            primary: vec!["but I'm ready".to_string()],
+            background: vec!["(Look out for yourself)".to_string()],
+            romanized_primary: Vec::new(),
+            romanized_background: Vec::new(),
+            inline_lines: Vec::new(),
+            inline_romanized: Vec::new(),
+            bg_first: true,
+        };
+
+        let rendered: Vec<Line> = block
+            .styled_lines(styles.current, styles.background_current)
+            .collect();
+        assert_eq!(rendered.len(), 2);
+        assert_eq!(rendered[0].spans[0].content, "(Look out for yourself)");
+        assert_eq!(rendered[0].spans[0].style, styles.background_current);
+        assert_eq!(rendered[1].spans[0].content, "but I'm ready");
+        assert_eq!(rendered[1].spans[0].style, styles.current);
+
+        // 4. Karaoke spans ordering: background line is index 0, main line is index 1
+        let line = crate::lyrics::LyricLine::new(54.16, "(Look out for yourself) but I'm ready")
+            .with_words(Some(vec![bg_word, main_word]));
+        let update = Update {
+            lines: std::sync::Arc::new(vec![line]),
+            index: Some(0),
+            position: 54.20,
+            playing: true,
+            provider: Some(crate::state::Provider::MusixmatchRichsync),
+            ..Default::default()
+        };
+
+        let spans = try_build_karaoke_spans(&update, 0, 80, &styles, 54.20)
+            .expect("should build karaoke spans");
+        assert_eq!(spans.len(), 2);
+        // First line is background vocal, currently active (cyan)
+        assert_eq!(spans[0].spans[0].content, "(Look)");
+        assert_eq!(spans[0].spans[0].style, styles.background_current);
+        // Second line is lead vocal, not yet reached (dim)
+        assert_eq!(spans[1].spans[0].content, "ready");
+        assert_eq!(spans[1].spans[0].style, styles.after);
     }
 }
