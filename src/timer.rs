@@ -40,13 +40,25 @@ use std::time::Instant;
 /// // ... time passes ...
 /// let estimated = timer.estimate(true); // > 10.0
 /// ```
-#[derive(Debug, PartialEq, Default)]
+#[derive(Debug, PartialEq)]
 pub struct PlaybackTimer {
     /// Anchor position in seconds (sanitized: finite, >= 0).
     anchor_position: f64,
     /// Monotonic instant corresponding to `anchor_position`.
     /// `None` when paused or before first playback start.
     anchor_instant: Option<Instant>,
+    /// Playback rate (e.g. 1.0 = normal, 1.5 = 1.5x speed).
+    rate: f64,
+}
+
+impl Default for PlaybackTimer {
+    fn default() -> Self {
+        Self {
+            anchor_position: 0.0,
+            anchor_instant: None,
+            rate: 1.0,
+        }
+    }
 }
 
 impl PlaybackTimer {
@@ -163,6 +175,7 @@ impl PlaybackTimer {
     /// timer.mark_paused();
     /// // Now estimate() returns the anchor position, frozen in time
     /// ```
+    #[cfg(test)]
     pub fn mark_paused(&mut self) {
         // When paused, clear the monotonic anchor so calls to `estimate()`
         // will return only the anchor position. Clearing prevents paused
@@ -204,6 +217,37 @@ impl PlaybackTimer {
     /// sleep(Duration::from_millis(10));
     /// assert!(timer.estimate(true) > 5.0);
     /// ```
+    /// Returns the current playback rate.
+    #[must_use]
+    #[cfg(test)]
+    pub fn rate(&self) -> f64 {
+        self.rate
+    }
+
+    /// Sets the playback rate (e.g. 1.0 = 100%, 1.5 = 150%).
+    /// Automatically realigns the anchor position if currently playing.
+    #[cfg(test)]
+    pub fn set_rate(&mut self, rate: f64) {
+        if rate.is_finite() && rate > 0.0 {
+            if self.anchor_instant.is_some() {
+                let current = self.estimate(true);
+                self.set_position(current);
+            }
+            self.rate = rate;
+        }
+    }
+
+    /// Creates an immutable, lightweight [`TimeAnchor`] snapshot of the current timer state.
+    #[must_use]
+    pub fn time_anchor(&self, playing: bool) -> TimeAnchor {
+        TimeAnchor::new(
+            self.anchor_position,
+            if playing { self.anchor_instant } else { None },
+            playing,
+            self.rate,
+        )
+    }
+
     #[must_use]
     pub fn estimate(&self, playing: bool) -> f64 {
         let base = self.anchor_position;
@@ -216,7 +260,7 @@ impl PlaybackTimer {
             return base;
         };
 
-        let elapsed = instant.elapsed().as_secs_f64();
+        let elapsed = instant.elapsed().as_secs_f64() * self.rate;
         let estimated = base + elapsed;
 
         // Fallback to base if arithmetic produces invalid result
@@ -224,6 +268,60 @@ impl PlaybackTimer {
             estimated
         } else {
             base
+        }
+    }
+}
+
+/// An immutable, copyable projection anchor for deterministic playback position calculation across threads.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TimeAnchor {
+    pub position: f64,
+    pub instant: Option<Instant>,
+    pub playing: bool,
+    pub rate: f64,
+}
+
+impl Default for TimeAnchor {
+    fn default() -> Self {
+        Self {
+            position: 0.0,
+            instant: None,
+            playing: false,
+            rate: 1.0,
+        }
+    }
+}
+
+impl TimeAnchor {
+    /// Creates a new sanitized time anchor.
+    pub fn new(position: f64, instant: Option<Instant>, playing: bool, rate: f64) -> Self {
+        Self {
+            position: sanitize_position(position),
+            instant,
+            playing,
+            rate: if rate.is_finite() && rate > 0.0 {
+                rate
+            } else {
+                1.0
+            },
+        }
+    }
+
+    /// Projects the current playback position at a specific monotonic timestamp `now`.
+    #[must_use]
+    pub fn current_position_at(&self, now: Instant) -> f64 {
+        if !self.playing {
+            return self.position;
+        }
+        let Some(t0) = self.instant else {
+            return self.position;
+        };
+        let elapsed = now.saturating_duration_since(t0).as_secs_f64() * self.rate;
+        let estimated = self.position + elapsed;
+        if estimated.is_finite() {
+            estimated.max(0.0)
+        } else {
+            self.position
         }
     }
 }
@@ -333,6 +431,40 @@ mod tests {
         // Infinity should be sanitized to 0.0
         timer.set_position(f64::INFINITY);
         assert_eq!(timer.estimate(false), 0.0);
+    }
+
+    #[test]
+    fn test_timer_rate_projection() {
+        let mut timer = PlaybackTimer::default();
+        timer.set_position(10.0);
+        timer.set_rate(2.0);
+        assert_eq!(timer.rate(), 2.0);
+        timer.mark_playing();
+
+        sleep(Duration::from_millis(20));
+        let est = timer.estimate(true);
+        // At 2.0x rate, 20ms elapsed = ~40ms advancement
+        assert!(
+            est >= 10.035,
+            "Expected >= 10.035 with 2.0x speed, got {est}"
+        );
+
+        let anchor = timer.time_anchor(true);
+        assert_eq!(anchor.rate, 2.0);
+        assert!(anchor.playing);
+    }
+
+    #[test]
+    fn test_time_anchor_current_position_at() {
+        let t0 = Instant::now();
+        let anchor = TimeAnchor::new(5.0, Some(t0), true, 1.5);
+
+        let t1 = t0 + Duration::from_millis(100);
+        let pos = anchor.current_position_at(t1);
+        assert!((pos - 5.15).abs() < 1e-4, "Expected ~5.15, got {pos}");
+
+        let paused_anchor = TimeAnchor::new(5.0, Some(t0), false, 1.5);
+        assert_eq!(paused_anchor.current_position_at(t1), 5.0);
     }
 
     #[tokio::test]

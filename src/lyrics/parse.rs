@@ -118,7 +118,11 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<Vec<LyricLine>> {
         // Parse word-level timings (if available)
         let words = parse_word_timings(line, line_start, line_end);
 
-        parsed.push(LyricLine::new(line_start, text).with_words(words));
+        parsed.push(
+            LyricLine::new(line_start, text)
+                .with_end(Some(line_end))
+                .with_words(words),
+        );
     }
 
     Some(parsed)

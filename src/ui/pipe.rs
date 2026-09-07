@@ -29,6 +29,8 @@ struct PipeState {
     next_sleep: Option<Pin<Box<Sleep>>>,
     /// Whether to output romanized subtitles when available
     romanize: bool,
+    /// O(1) sequential line progress tracker
+    sync_tracker: crate::lyrics::types::SyncTracker,
 }
 
 impl PipeState {
@@ -41,6 +43,7 @@ impl PipeState {
             last_update_instant: None,
             next_sleep: None,
             romanize: false,
+            sync_tracker: crate::lyrics::types::SyncTracker::new(),
         }
     }
 
@@ -95,6 +98,7 @@ impl PipeState {
         self.last_update = None;
         self.last_line_idx = None;
         self.last_track_had_lyric = false;
+        self.sync_tracker.reset();
     }
 
     /// Print the current line from an update.
@@ -119,7 +123,12 @@ impl PipeState {
         let (maybe_estimated, next) =
             estimate_update_and_next_sleep(&self.last_update, self.last_update_instant, true);
 
-        if let Some(estimated) = maybe_estimated {
+        if let Some(mut estimated) = maybe_estimated {
+            let (tracked_idx, _) = self
+                .sync_tracker
+                .update(&estimated.lines, estimated.position);
+            estimated.index = tracked_idx;
+
             // Print if line index has advanced
             if estimated.index != self.last_line_idx {
                 match estimated.index {
@@ -224,6 +233,7 @@ mod tests {
             title: "Title".to_string(),
             artist: "Artist".to_string(),
             album: "Album".to_string(),
+            ..Default::default()
         };
 
         pipe_state.update_from_mpris(update_60s);
@@ -241,6 +251,7 @@ mod tests {
             title: "Title".to_string(),
             artist: "Artist".to_string(),
             album: "Album".to_string(),
+            ..Default::default()
         };
 
         pipe_state.update_from_mpris(update_2s);
@@ -258,6 +269,7 @@ mod tests {
             title: "Title".to_string(),
             artist: "Artist".to_string(),
             album: "Album".to_string(),
+            ..Default::default()
         };
 
         pipe_state.update_from_mpris(update_25s);
@@ -285,6 +297,7 @@ mod tests {
             title: "Title".to_string(),
             artist: "Artist".to_string(),
             album: "Album".to_string(),
+            ..Default::default()
         };
 
         pipe_state.update_from_mpris(update);

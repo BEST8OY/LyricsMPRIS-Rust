@@ -18,7 +18,7 @@
 
 use crate::lyrics::LyricLine;
 use crate::mpris::TrackMetadata;
-use crate::timer::{PlaybackTimer, sanitize_position};
+use crate::timer::{PlaybackTimer, TimeAnchor, sanitize_position};
 use std::sync::Arc;
 
 // ============================================================================
@@ -66,6 +66,7 @@ pub enum Provider {
 /// - `version`: Monotonic counter for change detection
 /// - `err`: Error message from the most recent operation
 /// - `provider`: Source of the current lyrics
+/// - `time_anchor`: Monotonic projection anchor for deterministic position calculation
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Update {
     /// Lyrics lines (shared via Arc for efficient cloning)
@@ -97,6 +98,27 @@ pub struct Update {
 
     /// Provider that supplied the current lyrics
     pub provider: Option<Provider>,
+
+    /// Monotonic projection anchor for unified position tracking
+    pub time_anchor: TimeAnchor,
+}
+
+impl Update {
+    /// Returns the projected playback position at the given monotonic timestamp.
+    #[must_use]
+    pub fn current_position_at(&self, now: std::time::Instant) -> f64 {
+        if self.time_anchor.instant.is_some() {
+            self.time_anchor.current_position_at(now)
+        } else {
+            self.position
+        }
+    }
+
+    /// Returns the projected playback position at the current instant.
+    #[must_use]
+    pub fn current_position(&self) -> f64 {
+        self.current_position_at(std::time::Instant::now())
+    }
 }
 
 // ============================================================================
@@ -166,6 +188,7 @@ impl PlayerState {
         self.length = meta.length;
         self.timer.reset(0.0);
         self.position = 0.0;
+        self.playing = false;
         self.err = None;
     }
 
@@ -271,6 +294,9 @@ impl PlayerState {
             self.playing = true;
             self.timer.mark_playing();
             tracing::debug!(pos = self.position, "Playback resumed");
+        } else if self.timer.time_anchor(true).instant.is_none() {
+            self.timer.mark_playing();
+            tracing::debug!(pos = self.position, "Playback timer initialized");
         }
     }
 
@@ -279,10 +305,17 @@ impl PlayerState {
     /// This is idempotent: calling multiple times has no additional effect.
     pub fn pause(&mut self) {
         if self.playing {
+            self.position = self.estimate_position();
             self.playing = false;
-            self.timer.mark_paused();
+            self.timer.reset(self.position);
             tracing::debug!(pos = self.position, "Playback paused");
         }
+    }
+
+    /// Returns an immutable [`TimeAnchor`] for deterministic external position projection.
+    #[must_use]
+    pub fn time_anchor(&self) -> TimeAnchor {
+        self.timer.time_anchor(self.playing)
     }
 }
 
@@ -311,6 +344,9 @@ pub struct LyricState {
 
     /// Index of the currently highlighted line (if any)
     pub index: Option<usize>,
+
+    /// O(1) sequential line progress tracker
+    pub tracker: crate::lyrics::types::SyncTracker,
 }
 
 impl LyricState {
@@ -333,6 +369,7 @@ impl LyricState {
     /// let index = state.get_index(15.5); // Returns index of active line at 15.5s
     /// ```
     #[must_use]
+    #[cfg(test)]
     pub fn get_index(&self, position: f64) -> Option<usize> {
         // Early returns for invalid input
         if self.lines.is_empty() || !position.is_finite() {
@@ -354,6 +391,7 @@ impl LyricState {
         let sanitized = Self::sanitize_and_sort(lines);
         self.lines = Arc::new(sanitized);
         self.index = None;
+        self.tracker.reset();
     }
 
     /// Sanitizes and sorts a collection of lyric lines.
@@ -382,17 +420,6 @@ impl LyricState {
         }
 
         Some(line)
-    }
-
-    /// Updates the current index, returning `true` if it changed.
-    ///
-    /// This is used to track state changes for efficient UI updates.
-    pub fn update_index(&mut self, new_index: Option<usize>) -> bool {
-        let changed = self.index != new_index;
-        if changed {
-            self.index = new_index;
-        }
-        changed
     }
 
     /// Returns `true` if no lyrics are loaded.
@@ -548,10 +575,13 @@ impl StateBundle {
     ///
     /// # Performance
     ///
-    /// Uses binary search for O(log n) lookup.
+    /// Uses [`SyncTracker`] for O(1) forward tracking with binary search fallback.
     pub fn update_index(&mut self, position: f64) -> bool {
-        let new_index = self.lyric_state.get_index(position);
-        let changed = self.lyric_state.update_index(new_index);
+        let (new_index, changed) = self
+            .lyric_state
+            .tracker
+            .update(&self.lyric_state.lines, position);
+        self.lyric_state.index = new_index;
 
         if changed {
             self.increment_version();
@@ -615,6 +645,7 @@ impl StateBundle {
     /// If paused, uses the anchor position directly.
     #[must_use]
     pub fn create_update(&self) -> Update {
+        let anchor = self.player_state.time_anchor();
         let position = if self.player_state.playing {
             self.player_state.estimate_position()
         } else {
@@ -632,6 +663,7 @@ impl StateBundle {
             title: self.player_state.title.clone(),
             album: self.player_state.album.clone(),
             provider: self.provider,
+            time_anchor: anchor,
         }
     }
 
@@ -714,5 +746,46 @@ mod tests {
         // While paused, estimation remains frozen at 10.0
         assert_eq!(player.estimate_position(), 10.0);
         assert_eq!(player.timer.estimate(true), 10.0);
+    }
+
+    #[test]
+    fn test_track_transition_resets_playing_and_start_playing_activates_anchor() {
+        let mut player = PlayerState::default();
+        player.start_playing();
+        assert!(player.playing);
+        assert!(player.time_anchor().instant.is_some());
+
+        let meta = TrackMetadata {
+            title: "New Track".into(),
+            artist: "New Artist".into(),
+            album: "New Album".into(),
+            length: Some(200.0),
+            ..Default::default()
+        };
+
+        player.update_from_metadata(&meta);
+        assert!(!player.playing);
+        assert_eq!(player.position, 0.0);
+        assert!(player.time_anchor().instant.is_none());
+
+        player.start_playing();
+        assert!(player.playing);
+        assert!(player.time_anchor().instant.is_some());
+    }
+
+    #[test]
+    fn test_player_state_pause_freezes_estimated_position() {
+        let mut player = PlayerState::default();
+        player.set_position(5.0);
+        player.start_playing();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        let estimated_before = player.estimate_position();
+        assert!(estimated_before >= 5.01);
+
+        player.pause();
+        assert!(!player.playing);
+        assert!(player.time_anchor().instant.is_none());
+        assert!((player.position - estimated_before).abs() < 0.005);
+        assert_eq!(player.estimate_position(), player.position);
     }
 }

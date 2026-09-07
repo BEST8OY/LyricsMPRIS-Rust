@@ -389,6 +389,7 @@ mod tests {
             title: title.into(),
             album: "Album".into(),
             provider: None,
+            ..Default::default()
         }
     }
 
