@@ -30,6 +30,7 @@ pub enum Event {
 
     /// Position calibration event after transient buffering.
     Calibrated {
+        meta: TrackMetadata,
         position: f64,
         sampled_at: std::time::Instant,
     },

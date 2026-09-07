@@ -68,6 +68,7 @@ pub(crate) async fn handle_mpris_event(
             return RetryDirective::Keep;
         }
         MprisEvent::Calibrated {
+            meta,
             position,
             sampled_at,
         } => {
@@ -75,13 +76,12 @@ pub(crate) async fn handle_mpris_event(
                 return RetryDirective::Keep;
             }
 
-            // Discard calibration events that were captured before the current track's lyrics were loaded
-            if let Some(loaded_at) = state.lyrics_loaded_at
-                && sampled_at < loaded_at
-            {
+            // Discard calibration event if it was emitted for a different track
+            if state.player_state.title != meta.title || state.player_state.artist != meta.artist {
                 tracing::debug!(
-                    position,
-                    "Discarding calibration event sampled before lyrics were loaded"
+                    calibrated_title = %meta.title,
+                    current_title = %state.player_state.title,
+                    "Discarding calibration event for different track"
                 );
                 return RetryDirective::Keep;
             }
@@ -162,7 +162,9 @@ pub(crate) async fn handle_mpris_event(
             let current_position = state.player_state.estimate_position();
             let position_delta = (position - current_position).abs();
 
-            if elapsed < 0.5 && position_delta < 2.0 {
+            if elapsed < 0.5
+                && position_delta <= crate::state::StateBundle::POSITION_DRIFT_THRESHOLD_SECS
+            {
                 tracing::debug!(
                     seek_position = position,
                     current_position,
@@ -352,6 +354,7 @@ mod tests {
         // Calibration moves position to 6.0s (Line 1 active)
         let directive = handle_mpris_event(
             MprisEvent::Calibrated {
+                meta: TrackMetadata::default(),
                 position: 6.0,
                 sampled_at: std::time::Instant::now(),
             },
@@ -366,6 +369,43 @@ mod tests {
         let update = rx.recv().await.expect("Calibration update should be sent");
         assert_eq!(update.index, Some(0));
         assert!((update.position - 6.0).abs() < 0.1);
+    }
+
+    #[tokio::test]
+    async fn test_handle_calibrated_event_sub_second_buffering_drift() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut state = StateBundle::new();
+
+        let lines = vec![
+            crate::lyrics::LyricLine::new(5.0, "Line 1"),
+            crate::lyrics::LyricLine::new(15.0, "Line 2"),
+        ];
+        state.lyric_state.update_lines(lines);
+        state.player_state.update_playback_dbus(true, 0.0);
+        state.update_index(0.0);
+        state.mark_state_sent();
+
+        let (event_tx, _event_rx) = mpsc::channel(32);
+        // Post-buffering calibration tick with 200ms delta (well below legacy 500ms threshold)
+        let directive = handle_mpris_event(
+            MprisEvent::Calibrated {
+                meta: TrackMetadata::default(),
+                position: 0.20,
+                sampled_at: std::time::Instant::now(),
+            },
+            &mut state,
+            &event_tx,
+            &tx,
+            &[],
+        )
+        .await;
+
+        assert!(matches!(directive, RetryDirective::Keep));
+        let update = rx
+            .recv()
+            .await
+            .expect("Calibration update for 200ms drift must be sent to UI");
+        assert!((update.position - 0.20).abs() < 0.05);
     }
 
     #[tokio::test]
@@ -387,6 +427,7 @@ mod tests {
         // Spurious calibration tick reporting 0.0s during mid-track playback
         let directive = handle_mpris_event(
             MprisEvent::Calibrated {
+                meta: TrackMetadata::default(),
                 position: 0.0,
                 sampled_at: std::time::Instant::now(),
             },
@@ -402,6 +443,42 @@ mod tests {
         assert!(state.player_state.estimate_position() >= 45.0);
         // No retrograde position update should be emitted
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_calibrated_event_ignores_mismatched_track() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let (event_tx, _event_rx) = mpsc::channel(32);
+        let mut state = StateBundle::new();
+
+        let mut current_meta = TrackMetadata::default();
+        current_meta.title = "Current Track".into();
+        current_meta.artist = "Current Artist".into();
+        state.player_state.update_from_metadata(&current_meta);
+        state.player_state.update_playback_dbus(true, 10.0);
+        state.mark_state_sent();
+
+        let mut old_meta = TrackMetadata::default();
+        old_meta.title = "Stale Track".into();
+        old_meta.artist = "Stale Artist".into();
+
+        let directive = handle_mpris_event(
+            MprisEvent::Calibrated {
+                meta: old_meta,
+                position: 50.0,
+                sampled_at: std::time::Instant::now(),
+            },
+            &mut state,
+            &event_tx,
+            &tx,
+            &[],
+        )
+        .await;
+
+        assert!(matches!(directive, RetryDirective::Keep));
+        // Must ignore calibration for stale track
+        assert!(rx.try_recv().is_err());
+        assert!((state.player_state.estimate_position() - 10.0).abs() < 0.5);
     }
 
     #[tokio::test]

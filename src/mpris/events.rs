@@ -86,28 +86,36 @@ impl CalibrationTracker {
     }
 
     /// Step the calibration state machine given the newly fetched authoritative position.
-    fn on_step(&mut self, real_pos: f64) {
+    ///
+    /// Returns `true` if this step detected audio movement or confirmed steady-state (should emit calibration event),
+    /// or `false` if the player is still buffering or timed out without moving.
+    fn on_step(&mut self, real_pos: f64) -> bool {
         self.attempts += 1;
         self.error_attempts = 0;
         let moved = (real_pos - self.anchor_pos).abs() > MOVEMENT_DELTA_THRESHOLD_SECS;
 
         if moved {
             if !self.confirmed {
-                // Audio started advancing; schedule 1 final confirmation check to lock in steady-state sync
+                // Audio started advancing; update anchor to verify continuous playback on confirmation check
                 self.confirmed = true;
+                self.anchor_pos = real_pos;
                 self.timer = Some(Box::pin(tokio::time::sleep(
                     CALIBRATION_CONFIRMATION_INTERVAL,
                 )));
+                true
             } else {
                 // Steady-state verified: disarm calibration for the remainder of this track
                 self.disarm();
+                true
             }
         } else if self.attempts < MAX_CALIBRATION_ATTEMPTS {
             // Still buffering (real_pos unchanged from anchor); adaptive probe
             self.timer = Some(Box::pin(tokio::time::sleep(probe_delay(self.attempts))));
+            false
         } else {
             // Reached maximum attempts (slow network timeout): disarm
             self.disarm();
+            false
         }
     }
 
@@ -139,7 +147,12 @@ pub trait MprisEventCallback: Send + 'static {
         service: String,
         sampled_at: std::time::Instant,
     );
-    fn on_calibrate(&mut self, position: f64, sampled_at: std::time::Instant);
+    fn on_calibrate(
+        &mut self,
+        metadata: TrackMetadata,
+        position: f64,
+        sampled_at: std::time::Instant,
+    );
 }
 
 impl MprisEventCallback for tokio::sync::mpsc::Sender<crate::event::Event> {
@@ -176,8 +189,14 @@ impl MprisEventCallback for tokio::sync::mpsc::Sender<crate::event::Event> {
         }
     }
 
-    fn on_calibrate(&mut self, position: f64, sampled_at: std::time::Instant) {
+    fn on_calibrate(
+        &mut self,
+        metadata: TrackMetadata,
+        position: f64,
+        sampled_at: std::time::Instant,
+    ) {
         if let Err(e) = self.try_send(crate::event::Event::Calibrated {
+            meta: metadata,
             position,
             sampled_at,
         }) {
@@ -351,8 +370,13 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                                 let real_pos = microsecs as f64 / 1_000_000.0;
                                 let sampled_at = std::time::Instant::now();
                                 self.state.position = real_pos;
-                                self.callback.on_calibrate(real_pos, sampled_at);
-                                tracker.on_step(real_pos);
+                                if tracker.on_step(real_pos) {
+                                    self.callback.on_calibrate(
+                                        self.state.track.clone(),
+                                        real_pos,
+                                        sampled_at,
+                                    );
+                                }
                             }
                             Err(e) => {
                                 tracing::debug!(
@@ -871,25 +895,25 @@ mod tests {
         let mut tracker = CalibrationTracker::new(true, 0.0);
 
         // Step 1: Still buffering at 0.0s
-        tracker.on_step(0.0);
+        assert!(!tracker.on_step(0.0));
         assert_eq!(tracker.attempts, 1);
         assert!(!tracker.confirmed);
         assert!(tracker.timer.is_some());
 
         // Step 2: Still buffering at 0.0s
-        tracker.on_step(0.0);
+        assert!(!tracker.on_step(0.0));
         assert_eq!(tracker.attempts, 2);
         assert!(!tracker.confirmed);
         assert!(tracker.timer.is_some());
 
         // Step 3: Audio starts playing (moved past delta threshold)
-        tracker.on_step(0.4);
+        assert!(tracker.on_step(0.4));
         assert_eq!(tracker.attempts, 3);
         assert!(tracker.confirmed);
         assert!(tracker.timer.is_some()); // Armed for final confirmation
 
         // Step 4: Final confirmation step verifies continuous playback
-        tracker.on_step(1.6);
+        assert!(tracker.on_step(1.6));
         assert_eq!(tracker.attempts, 4);
         assert!(tracker.timer.is_none()); // Disarmed!
     }
@@ -899,18 +923,18 @@ mod tests {
         let mut tracker = CalibrationTracker::new(true, 45.0);
 
         // Step 1: Mid-track buffering (authoritative pos still 45.0)
-        tracker.on_step(45.0);
+        assert!(!tracker.on_step(45.0));
         assert_eq!(tracker.attempts, 1);
         assert!(!tracker.confirmed);
         assert!(tracker.timer.is_some());
 
-        // Step 2: Resumed playback moves to 45.3s (delta 0.3 > 0.08)
-        tracker.on_step(45.3);
+        // Step 2: Resumed playback moves to 45.3s (delta 0.3 > 0.03)
+        assert!(tracker.on_step(45.3));
         assert!(tracker.confirmed);
         assert!(tracker.timer.is_some());
 
         // Step 3: Steady-state confirmation
-        tracker.on_step(46.5);
+        assert!(tracker.on_step(46.5));
         assert!(tracker.timer.is_none()); // Disarmed
     }
 
@@ -918,7 +942,7 @@ mod tests {
     async fn test_tracker_max_attempts_timeout() {
         let mut tracker = CalibrationTracker::new(true, 0.0);
         for i in 1..=MAX_CALIBRATION_ATTEMPTS {
-            tracker.on_step(0.0);
+            assert!(!tracker.on_step(0.0));
             if i < MAX_CALIBRATION_ATTEMPTS {
                 assert!(tracker.timer.is_some());
             } else {
@@ -947,20 +971,34 @@ mod tests {
 
         // Player buffers online for 15 attempts (past fast probes into 1s interval)
         for i in 1..=15 {
-            tracker.on_step(0.0);
+            assert!(!tracker.on_step(0.0));
             assert_eq!(tracker.attempts, i);
             assert_eq!(tracker.error_attempts, 0);
             assert!(tracker.timer.is_some());
         }
 
         // At attempt 16 (e.g. after ~10s of buffering), audio finally moves to 0.4s
-        tracker.on_step(0.4);
+        assert!(tracker.on_step(0.4));
         assert!(tracker.confirmed);
         assert!(tracker.timer.is_some());
 
         // Final confirmation check
-        tracker.on_step(0.65);
+        assert!(tracker.on_step(0.65));
         assert!(tracker.timer.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_tracker_confirmation_requires_advancement() {
+        let mut tracker = CalibrationTracker::new(true, 0.0);
+
+        // Movement observed
+        assert!(tracker.on_step(0.4));
+        assert!(tracker.confirmed);
+
+        // Player froze at 0.4s during confirmation probe
+        assert!(!tracker.on_step(0.4));
+        // Should not disarm; continues adaptive probes
+        assert!(tracker.timer.is_some());
     }
 
     #[tokio::test]
