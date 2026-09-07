@@ -6,7 +6,6 @@
 pub mod fetch;
 pub mod handlers;
 
-pub use fetch::fetch_and_update_lyrics;
 pub use handlers::{RetryDirective, handle_no_player};
 
 use crate::mpris::TrackMetadata;
@@ -34,17 +33,7 @@ pub enum Event {
         position: f64,
         sampled_at: std::time::Instant,
     },
-
-    /// Background upgrade of lyrics format (e.g. line-level to Richsync karaoke).
-    UpgradeLyrics {
-        meta: TrackMetadata,
-        lines: Vec<crate::lyrics::LyricLine>,
-        format: crate::lyrics::database::LyricsFormat,
-    },
 }
-
-/// Alias for backwards compatibility
-pub type MprisEvent = Event;
 
 /// Sends an update to the UI channel when appropriate.
 pub async fn send_update(state: &mut StateBundle, update_tx: &mpsc::Sender<Update>, force: bool) {
@@ -66,9 +55,7 @@ pub async fn send_update(state: &mut StateBundle, update_tx: &mpsc::Sender<Updat
 pub async fn process_event(
     event: Event,
     state: &mut StateBundle,
-    event_tx: &mpsc::Sender<Event>,
     update_tx: &mpsc::Sender<Update>,
-    providers: &[String],
 ) -> RetryDirective {
-    handlers::handle_mpris_event(event, state, event_tx, update_tx, providers).await
+    handlers::handle_mpris_event(event, state, update_tx).await
 }

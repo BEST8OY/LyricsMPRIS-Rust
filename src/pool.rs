@@ -8,6 +8,7 @@
 //! - **Separation of concerns**: Events, state management, and lyrics fetching are distinct
 //! - **Resilience**: D-Bus failures don't crash the loop; state is maintained
 //! - **Efficiency**: Event-driven architecture eliminates unnecessary polling
+//! - **Non-blocking responsiveness**: Lyrics retrieval is fully asynchronous and never blocks the event loop
 //!
 //! # Architecture
 //!
@@ -16,27 +17,23 @@
 //! │ MPRIS D-Bus     │
 //! │ Event Watcher   │
 //! └────────┬────────┘
-//!          │ Events
+//!          │ Events (channel cap 64)
 //!          ▼
-//! ┌─────────────────┐
-//! │ Event Channel   │
-//! └────────┬────────┘
-//!          │
-//!          ▼
-//! ┌─────────────────┐      ┌─────────────────┐
-//! │ Event Loop      │─────▶│ State Bundle    │
-//! │ (this module)   │      │ (state.rs)      │
-//! └────────┬────────┘      └─────────────────┘
-//!          │
-//!          ▼
-//! ┌─────────────────┐
-//! │ UI Update       │
+//! ┌─────────────────┐      ┌─────────────────────────┐
+//! │ Event Loop      │─────▶│ Background Fetch Tasks  │
+//! │ (this module)   │◀─────│ (epoch-tagged outcome)  │
+//! └────────┬────────┘      └─────────────────────────┘
+//!          │                          │
+//!          │ Updates                  ▼
+//!          ▼                 ┌─────────────────┐
+//! ┌─────────────────┐        │ SQLite Cache    │
+//! │ UI Update       │        └─────────────────┘
 //! │ Channel         │
 //! └─────────────────┘
 //! ```
 
-use crate::event::fetch::FetchSummary;
-use crate::event::{self, Event, RetryDirective, process_event, send_update};
+use crate::event::fetch::{FetchOutcome, db_format_to_provider, spawn_fetch};
+use crate::event::{Event, RetryDirective, process_event, send_update};
 use crate::mpris::{TrackMetadata, events::MprisEventHandler};
 use crate::state::{StateBundle, Update};
 use std::pin::Pin;
@@ -62,12 +59,12 @@ struct PendingRetry {
 }
 
 impl PendingRetry {
-    fn new(meta: TrackMetadata, service: String) -> Self {
+    fn new(meta: TrackMetadata, service: String, delay: std::time::Duration) -> Self {
         Self {
-            sleep: Box::pin(tokio::time::sleep(RETRY_BASE_DELAY)),
+            sleep: Box::pin(tokio::time::sleep(delay)),
             meta,
             service,
-            delay: RETRY_BASE_DELAY,
+            delay,
         }
     }
 }
@@ -118,12 +115,17 @@ impl LoopConfig {
 
 /// Encapsulates the runtime state needed by the event loop.
 ///
-/// This struct maintains the shared state bundle for event processing.
+/// This struct maintains the shared state bundle, generational epoch counter,
+/// and background task handles for non-blocking execution.
 struct LoopState {
     /// Shared state bundle with lyrics and player state
     state_bundle: StateBundle,
     /// Scheduled retry when providers were unreachable for the current track
     pending_retry: Option<PendingRetry>,
+    /// Monotonic epoch counter to reject stale out-of-order background fetches
+    current_epoch: u64,
+    /// Task handle for the in-flight background lyrics fetch, aborted on track changes
+    active_fetch: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl LoopState {
@@ -132,6 +134,15 @@ impl LoopState {
         Self {
             state_bundle: StateBundle::new(),
             pending_retry: None,
+            current_epoch: 0,
+            active_fetch: None,
+        }
+    }
+
+    /// Aborts any running background lyrics fetch task.
+    fn abort_fetch(&mut self) {
+        if let Some(handle) = self.active_fetch.take() {
+            handle.abort();
         }
     }
 }
@@ -146,17 +157,6 @@ impl LoopState {
 /// * `update_tx` - Channel for sending state updates to UI/consumers
 /// * `shutdown_rx` - Receives shutdown signal to terminate loop
 /// * `config` - Application configuration including provider settings
-///
-/// # Architecture
-///
-/// 1. Initialize loop configuration and state
-/// 2. Discover active player and fetch initial state
-/// 3. Spawn MPRIS event watcher
-/// 4. Run event loop until shutdown
-///
-/// # Error Handling
-///
-/// All errors are handled gracefully - D-Bus failures don't crash the loop.
 pub async fn listen(
     update_tx: mpsc::Sender<Update>,
     shutdown_rx: mpsc::Receiver<()>,
@@ -166,7 +166,7 @@ pub async fn listen(
     let mut loop_state = LoopState::new();
     let (watcher_shutdown_tx, watcher_shutdown_rx) = tokio::sync::watch::channel(false);
 
-    let (event_tx, event_rx) = initialize_loop(
+    let (event_rx, fetch_tx, fetch_rx) = initialize_loop(
         &mut loop_state,
         &update_tx,
         &loop_config,
@@ -174,63 +174,66 @@ pub async fn listen(
     )
     .await;
 
-    run_event_loop(
-        loop_state,
-        event_tx,
+    let channels = LoopChannels {
         event_rx,
+        fetch_tx,
+        fetch_rx,
         update_tx,
         shutdown_rx,
         watcher_shutdown_tx,
-        loop_config,
-    )
-    .await;
+    };
+
+    run_event_loop(loop_state, channels, loop_config).await;
 }
 
 /// Initializes the event loop infrastructure.
 ///
 /// This function:
-/// 1. Creates the event channel
+/// 1. Creates the event channel and background fetch channel
 /// 2. Discovers active player
-/// 3. Fetches initial metadata and lyrics (if player found)
-/// 4. Spawns MPRIS event watcher
-///
-/// # Returns
-///
-/// The receiver end of the event channel for the main loop to consume.
+/// 3. Fetches initial metadata and initializes player state (<5ms)
+/// 4. Dispatches immediate UI update for instant startup
+/// 5. Spawns isolated background fetch task
+/// 6. Spawns MPRIS event watcher
 async fn initialize_loop(
     loop_state: &mut LoopState,
     update_tx: &mpsc::Sender<Update>,
     config: &LoopConfig,
     watcher_shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> (mpsc::Sender<Event>, mpsc::Receiver<Event>) {
+) -> (
+    mpsc::Receiver<Event>,
+    mpsc::Sender<FetchOutcome>,
+    mpsc::Receiver<FetchOutcome>,
+) {
     tracing::debug!("Initializing event loop");
-    let (event_tx, event_rx) = mpsc::channel::<Event>(16);
+    let (event_tx, event_rx) = mpsc::channel::<Event>(64);
+    let (fetch_tx, fetch_rx) = mpsc::channel::<FetchOutcome>(16);
 
     let active_service = discover_active_player(config).await;
 
     if let Some(service) = active_service {
         tracing::debug!(service = %service, "Active player found");
-        initialize_with_player(loop_state, &service, config, &event_tx).await;
+        initialize_with_player(loop_state, &service, config, &fetch_tx).await;
         send_update(&mut loop_state.state_bundle, update_tx, true).await;
     } else {
         tracing::debug!("No active player found");
         crate::event::handle_no_player(&mut loop_state.state_bundle, update_tx).await;
     }
 
-    spawn_mpris_watcher(event_tx.clone(), config, watcher_shutdown_rx);
+    spawn_mpris_watcher(event_tx, config, watcher_shutdown_rx);
 
-    (event_tx, event_rx)
+    (event_rx, fetch_tx, fetch_rx)
 }
 
 /// Initializes state with an active player.
 ///
-/// Fetches initial metadata and lyrics for the current track. If providers
-/// were unreachable, schedules a background retry on the loop state.
+/// Queries metadata, status, and position from D-Bus (<5ms) and immediately
+/// schedules non-blocking lyrics retrieval in the background.
 async fn initialize_with_player(
     loop_state: &mut LoopState,
     service: &str,
     config: &LoopConfig,
-    event_tx: &mpsc::Sender<Event>,
+    fetch_tx: &mpsc::Sender<FetchOutcome>,
 ) {
     tracing::debug!(
         service = %service,
@@ -238,18 +241,35 @@ async fn initialize_with_player(
         "Initializing with active player"
     );
     let initial_metadata = fetch_initial_metadata(service, config).await;
-    let summary =
-        initialize_lyrics_state(loop_state, &initial_metadata, service, config, event_tx).await;
+    let playback_status = crate::mpris::get_playback_status(service).await;
+    let initial_pos = crate::mpris::playback::get_position(service)
+        .await
+        .unwrap_or(0.0);
 
-    if summary == FetchSummary::Unavailable {
-        tracing::info!(
-            title = %initial_metadata.title,
-            artist = %initial_metadata.artist,
-            retry_delay_secs = RETRY_BASE_DELAY.as_secs(),
-            "Providers unreachable at startup, scheduling retry"
-        );
-        loop_state.pending_retry = Some(PendingRetry::new(initial_metadata, service.to_string()));
+    loop_state
+        .state_bundle
+        .player_state
+        .update_from_metadata(&initial_metadata);
+    loop_state
+        .state_bundle
+        .player_state
+        .set_position(initial_pos);
+    if playback_status == "Playing" {
+        loop_state.state_bundle.player_state.start_playing();
+    } else {
+        loop_state.state_bundle.player_state.pause();
     }
+
+    // Spawn non-blocking background fetch with epoch 1
+    loop_state.current_epoch = 1;
+    let handle = spawn_fetch(
+        loop_state.current_epoch,
+        initial_metadata,
+        config.providers().to_vec(),
+        Some(service.to_string()),
+        fetch_tx.clone(),
+    );
+    loop_state.active_fetch = Some(handle);
 }
 
 /// Discovers the first active, non-blocked media player service.
@@ -258,10 +278,6 @@ async fn initialize_with_player(
 ///
 /// - `Some(service)` if an active, non-blocked player is found
 /// - `None` if no players are available, all are blocked, or enumeration failed
-///
-/// # Error Handling
-///
-/// D-Bus enumeration errors are logged as warnings and treated as no player.
 async fn discover_active_player(config: &LoopConfig) -> Option<String> {
     match crate::mpris::find_active_service(config.block_list(), config.target_list()).await {
         Ok(Some(service)) => {
@@ -287,10 +303,6 @@ async fn discover_active_player(config: &LoopConfig) -> Option<String> {
 /// # Returns
 ///
 /// Track metadata, or default metadata if the fetch fails.
-///
-/// # Error Handling
-///
-/// Errors are logged and default metadata is returned.
 async fn fetch_initial_metadata(service: &str, _config: &LoopConfig) -> TrackMetadata {
     match crate::mpris::metadata::get_metadata(service).await {
         Ok(metadata) => metadata,
@@ -305,48 +317,6 @@ async fn fetch_initial_metadata(service: &str, _config: &LoopConfig) -> TrackMet
     }
 }
 
-/// Initializes lyrics state based on initial metadata.
-///
-/// This function fetches lyrics from configured providers.
-/// Position and state updates are handled internally by `fetch_and_update_lyrics`.
-///
-/// Returns the [`FetchSummary`] of the fetch pass.
-async fn initialize_lyrics_state(
-    loop_state: &mut LoopState,
-    metadata: &TrackMetadata,
-    service: &str,
-    config: &LoopConfig,
-    event_tx: &mpsc::Sender<Event>,
-) -> FetchSummary {
-    tracing::debug!(
-        title = %metadata.title,
-        artist = %metadata.artist,
-        "Fetching initial lyrics"
-    );
-
-    // fetch_and_update_lyrics already sets the position internally
-    let (_position, summary) = event::fetch_and_update_lyrics(
-        metadata,
-        &mut loop_state.state_bundle,
-        config.providers(),
-        Some(service),
-        event_tx,
-    )
-    .await;
-
-    if loop_state.state_bundle.has_lyrics() {
-        tracing::debug!(
-            provider = ?loop_state.state_bundle.provider,
-            lines = loop_state.state_bundle.lyric_state.lines.len(),
-            "Successfully loaded lyrics"
-        );
-    } else {
-        tracing::debug!("No lyrics found for track");
-    }
-
-    summary
-}
-
 /// Spawns a background task to watch for MPRIS events.
 ///
 /// The watcher monitors D-Bus for:
@@ -354,12 +324,6 @@ async fn initialize_lyrics_state(
 /// - Seek events (user scrubbing through track)
 ///
 /// Events are forwarded to the event channel for processing by the main loop.
-///
-/// # Error Handling
-///
-/// If initialization fails or the D-Bus connection is lost, the watcher automatically
-/// retries with exponential backoff (500 ms up to 30 s). Backoff is reset to 500 ms
-/// only after sustained uptime (>= 5 seconds).
 fn spawn_mpris_watcher(
     event_tx: mpsc::Sender<Event>,
     config: &LoopConfig,
@@ -423,6 +387,16 @@ fn spawn_mpris_watcher(
     });
 }
 
+/// Channel endpoints used by the event loop.
+struct LoopChannels {
+    event_rx: mpsc::Receiver<Event>,
+    fetch_tx: mpsc::Sender<FetchOutcome>,
+    fetch_rx: mpsc::Receiver<FetchOutcome>,
+    update_tx: mpsc::Sender<Update>,
+    shutdown_rx: mpsc::Receiver<()>,
+    watcher_shutdown_tx: tokio::sync::watch::Sender<bool>,
+}
+
 /// Main event processing loop.
 ///
 /// This is the core loop that processes events until shutdown.
@@ -430,40 +404,36 @@ fn spawn_mpris_watcher(
 /// # Event Sources
 ///
 /// - MPRIS events (from background watcher task)
+/// - Background fetch outcomes (from worker tasks)
 /// - Network-retry timer (refetches lyrics when providers were unreachable)
 /// - Shutdown signal (for graceful termination)
-///
-/// # Termination
-///
-/// The loop runs indefinitely until a shutdown signal is received.
-/// All event handlers are designed to never panic, ensuring graceful degradation.
-async fn run_event_loop(
-    mut loop_state: LoopState,
-    event_tx: mpsc::Sender<Event>,
-    mut event_rx: mpsc::Receiver<Event>,
-    update_tx: mpsc::Sender<Update>,
-    mut shutdown_rx: mpsc::Receiver<()>,
-    watcher_shutdown_tx: tokio::sync::watch::Sender<bool>,
-    config: LoopConfig,
-) {
+async fn run_event_loop(mut loop_state: LoopState, mut channels: LoopChannels, config: LoopConfig) {
     loop {
         tokio::select! {
             // Shutdown signal received - clean up and terminate
-            _ = shutdown_rx.recv() => {
-                let _ = watcher_shutdown_tx.send(true);
-                handle_shutdown(&mut loop_state, &update_tx).await;
+            _ = channels.shutdown_rx.recv() => {
+                let _ = channels.watcher_shutdown_tx.send(true);
+                loop_state.abort_fetch();
+                handle_shutdown(&mut loop_state, &channels.update_tx).await;
                 break;
             }
 
+            // Asynchronous lyrics fetch outcome received
+            outcome = channels.fetch_rx.recv() => {
+                if let Some(outcome) = outcome {
+                    handle_fetch_outcome(outcome, &mut loop_state, &channels.update_tx).await;
+                }
+            }
+
             // MPRIS event received from watcher
-            event = event_rx.recv() => {
+            event = channels.event_rx.recv() => {
                 if let Some(ev) = event {
-                    let directive =
-                        handle_event(ev, &mut loop_state, &event_tx, &update_tx, &config).await;
-                    apply_retry_directive(&mut loop_state, directive);
+                    let directive = handle_event(ev, &mut loop_state, &channels.update_tx).await;
+                    apply_retry_directive(&mut loop_state, directive, &channels.fetch_tx, &config);
                 } else {
                     tracing::warn!("MPRIS event channel closed, terminating event loop");
-                    let _ = watcher_shutdown_tx.send(true);
+                    let _ = channels.watcher_shutdown_tx.send(true);
+                    loop_state.abort_fetch();
                     break;
                 }
             }
@@ -475,45 +445,191 @@ async fn run_event_loop(
                     None => futures_util::future::pending().await,
                 }
             } => {
-                handle_retry_tick(&mut loop_state, &event_tx, &update_tx, &config).await;
+                handle_retry_tick(&mut loop_state, &channels.fetch_tx, &config).await;
             }
         }
     }
 }
 
 /// Applies a [`RetryDirective`] to the loop state.
-fn apply_retry_directive(loop_state: &mut LoopState, directive: RetryDirective) {
+fn apply_retry_directive(
+    loop_state: &mut LoopState,
+    directive: RetryDirective,
+    fetch_tx: &mpsc::Sender<FetchOutcome>,
+    config: &LoopConfig,
+) {
     match directive {
         RetryDirective::Keep => {}
         RetryDirective::Clear => {
+            loop_state.abort_fetch();
             if loop_state.pending_retry.take().is_some() {
                 tracing::debug!("Cancelled scheduled lyrics retry");
             }
         }
-        RetryDirective::Schedule { meta, service } => {
+        RetryDirective::TrackChanged { meta, service } => {
+            loop_state.current_epoch = loop_state.current_epoch.wrapping_add(1);
+            loop_state.abort_fetch();
+            loop_state.pending_retry = None;
+            let handle = spawn_fetch(
+                loop_state.current_epoch,
+                meta,
+                config.providers().to_vec(),
+                Some(service),
+                fetch_tx.clone(),
+            );
+            loop_state.active_fetch = Some(handle);
+        }
+    }
+}
+
+/// Handles a completed background lyrics fetch.
+async fn handle_fetch_outcome(
+    outcome: FetchOutcome,
+    loop_state: &mut LoopState,
+    update_tx: &mpsc::Sender<Update>,
+) {
+    if outcome.epoch() != loop_state.current_epoch {
+        tracing::debug!(
+            outcome_epoch = outcome.epoch(),
+            current_epoch = loop_state.current_epoch,
+            "Discarding stale fetch outcome from previous epoch"
+        );
+        return;
+    }
+
+    match outcome {
+        FetchOutcome::Success {
+            meta,
+            lines,
+            provider,
+            position,
+            ..
+        } => {
+            let current = &loop_state.state_bundle.player_state;
+            if current.title != meta.title || current.artist != meta.artist {
+                tracing::debug!("Discarding fetch success for mismatched track");
+                return;
+            }
+
+            loop_state.active_fetch = None;
+            loop_state.pending_retry = None;
+
+            loop_state
+                .state_bundle
+                .update_lyrics(lines, &meta, None, Some(provider));
+
+            let pos_before = loop_state.state_bundle.player_state.estimate_position();
+            let effective_pos = if position <= 0.05 && pos_before > 1.0 {
+                pos_before
+            } else if position > 0.05 {
+                position
+            } else {
+                pos_before
+            };
+
+            loop_state.state_bundle.update_index(effective_pos);
+            loop_state
+                .state_bundle
+                .player_state
+                .set_position(effective_pos);
+
+            send_update(&mut loop_state.state_bundle, update_tx, true).await;
+
             tracing::info!(
                 title = %meta.title,
                 artist = %meta.artist,
-                retry_delay_secs = RETRY_BASE_DELAY.as_secs(),
-                "Scheduling lyrics retry after provider outage"
+                provider = ?provider,
+                "Lyrics loaded successfully"
             );
-            loop_state.pending_retry = Some(PendingRetry::new(meta, service));
+        }
+        FetchOutcome::Upgraded {
+            meta,
+            lines,
+            format,
+            ..
+        } => {
+            let current = &loop_state.state_bundle.player_state;
+            if current.title != meta.title || current.artist != meta.artist {
+                return;
+            }
+
+            let provider = db_format_to_provider(format);
+            loop_state
+                .state_bundle
+                .update_lyrics(lines, &meta, None, Some(provider));
+            let current_pos = loop_state.state_bundle.player_state.estimate_position();
+            loop_state.state_bundle.update_index(current_pos);
+            send_update(&mut loop_state.state_bundle, update_tx, false).await;
+            tracing::info!(
+                title = %meta.title,
+                artist = %meta.artist,
+                "Hot-swapped lyrics to Richsync karaoke"
+            );
+        }
+        FetchOutcome::Exhausted { meta, err, .. } => {
+            let current = &loop_state.state_bundle.player_state;
+            if current.title != meta.title || current.artist != meta.artist {
+                return;
+            }
+
+            loop_state.active_fetch = None;
+            loop_state.pending_retry = None;
+
+            loop_state
+                .state_bundle
+                .update_lyrics(Vec::new(), &meta, None, None);
+            if let Some(err_msg) = err {
+                loop_state.state_bundle.player_state.err = Some(err_msg);
+            }
+            send_update(&mut loop_state.state_bundle, update_tx, true).await;
+            tracing::debug!(
+                title = %meta.title,
+                artist = %meta.artist,
+                "Lyrics exhausted (no lyrics available)"
+            );
+        }
+        FetchOutcome::Unavailable {
+            meta,
+            service,
+            message,
+            ..
+        } => {
+            let current = &loop_state.state_bundle.player_state;
+            if current.title != meta.title || current.artist != meta.artist {
+                return;
+            }
+
+            loop_state.active_fetch = None;
+            loop_state
+                .state_bundle
+                .update_lyrics(Vec::new(), &meta, Some(message), None);
+            send_update(&mut loop_state.state_bundle, update_tx, true).await;
+
+            let next_delay = match &loop_state.pending_retry {
+                Some(p) => p.delay.saturating_mul(2).min(RETRY_MAX_DELAY),
+                None => RETRY_BASE_DELAY,
+            };
+            tracing::info!(
+                title = %meta.title,
+                artist = %meta.artist,
+                retry_delay_secs = next_delay.as_secs(),
+                "Providers unreachable, scheduling lyrics retry"
+            );
+            loop_state.pending_retry = Some(PendingRetry::new(meta, service, next_delay));
         }
     }
 }
 
 /// Handles a fired network-retry timer.
 ///
-/// Refetches lyrics for the pending track if it is still current and still
-/// lyric-less. On continued unavailability, reschedules with doubled backoff
-/// (capped at [`RETRY_MAX_DELAY`]); otherwise the retry is retired.
+/// Spawns an asynchronous fetch for the pending track if it is still current
+/// and still lyric-less.
 async fn handle_retry_tick(
     loop_state: &mut LoopState,
-    event_tx: &mpsc::Sender<Event>,
-    update_tx: &mpsc::Sender<Update>,
+    fetch_tx: &mpsc::Sender<FetchOutcome>,
     config: &LoopConfig,
 ) {
-    let Some(pending) = loop_state.pending_retry.take() else {
+    let Some(pending) = loop_state.pending_retry.as_ref() else {
         return;
     };
 
@@ -525,42 +641,29 @@ async fn handle_retry_tick(
         || loop_state.state_bundle.has_lyrics()
     {
         tracing::debug!("Skipping stale lyrics retry");
+        loop_state.pending_retry = None;
         return;
     }
 
+    let meta = pending.meta.clone();
+    let service = pending.service.clone();
+
     tracing::debug!(
-        title = %pending.meta.title,
-        artist = %pending.meta.artist,
+        title = %meta.title,
+        artist = %meta.artist,
         "Retrying lyrics fetch after network failure"
     );
 
-    let (_, summary) = event::fetch_and_update_lyrics(
-        &pending.meta,
-        &mut loop_state.state_bundle,
-        config.providers(),
-        Some(&pending.service),
-        event_tx,
-    )
-    .await;
-
-    send_update(&mut loop_state.state_bundle, update_tx, true).await;
-
-    match summary {
-        FetchSummary::Unavailable => {
-            let delay = pending.delay.saturating_mul(2).min(RETRY_MAX_DELAY);
-            tracing::debug!(
-                next_delay_secs = delay.as_secs(),
-                "Providers still unreachable, rescheduling lyrics retry"
-            );
-            loop_state.pending_retry = Some(PendingRetry {
-                meta: pending.meta,
-                service: pending.service,
-                delay,
-                sleep: Box::pin(tokio::time::sleep(delay)),
-            });
-        }
-        FetchSummary::Loaded | FetchSummary::Exhausted => {}
-    }
+    loop_state.current_epoch = loop_state.current_epoch.wrapping_add(1);
+    loop_state.abort_fetch();
+    let handle = spawn_fetch(
+        loop_state.current_epoch,
+        meta,
+        config.providers().to_vec(),
+        Some(service),
+        fetch_tx.clone(),
+    );
+    loop_state.active_fetch = Some(handle);
 }
 
 /// Processes a shutdown event and cleans up state.
@@ -575,16 +678,233 @@ async fn handle_shutdown(loop_state: &mut LoopState, update_tx: &mpsc::Sender<Up
 async fn handle_event(
     event: Event,
     loop_state: &mut LoopState,
-    event_tx: &mpsc::Sender<Event>,
     update_tx: &mpsc::Sender<Update>,
-    config: &LoopConfig,
 ) -> RetryDirective {
-    process_event(
-        event,
-        &mut loop_state.state_bundle,
-        event_tx,
-        update_tx,
-        config.providers(),
-    )
-    .await
+    process_event(event, &mut loop_state.state_bundle, update_tx).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_loop_state_initial_values() {
+        let state = LoopState::new();
+        assert_eq!(state.current_epoch, 0);
+        assert!(state.pending_retry.is_none());
+        assert!(state.active_fetch.is_none());
+        assert!(!state.state_bundle.has_lyrics());
+    }
+
+    #[tokio::test]
+    async fn test_apply_retry_directive_track_changed() {
+        let mut loop_state = LoopState::new();
+        let (fetch_tx, _fetch_rx) = mpsc::channel(16);
+        let config = LoopConfig::new(crate::Config::default());
+
+        let meta = TrackMetadata {
+            title: "Test Track".into(),
+            artist: "Test Artist".into(),
+            ..Default::default()
+        };
+
+        apply_retry_directive(
+            &mut loop_state,
+            RetryDirective::TrackChanged {
+                meta,
+                service: "org.mpris.MediaPlayer2.test".into(),
+            },
+            &fetch_tx,
+            &config,
+        );
+
+        assert_eq!(loop_state.current_epoch, 1);
+        assert!(loop_state.active_fetch.is_some());
+        assert!(loop_state.pending_retry.is_none());
+
+        loop_state.abort_fetch();
+        assert!(loop_state.active_fetch.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_apply_retry_directive_clear_aborts_fetch() {
+        let mut loop_state = LoopState::new();
+        let (fetch_tx, _fetch_rx) = mpsc::channel(16);
+        let config = LoopConfig::new(crate::Config::default());
+
+        let meta = TrackMetadata {
+            title: "Test Track".into(),
+            artist: "Test Artist".into(),
+            ..Default::default()
+        };
+
+        apply_retry_directive(
+            &mut loop_state,
+            RetryDirective::TrackChanged {
+                meta: meta.clone(),
+                service: "org.mpris.MediaPlayer2.test".into(),
+            },
+            &fetch_tx,
+            &config,
+        );
+        assert!(loop_state.active_fetch.is_some());
+
+        apply_retry_directive(&mut loop_state, RetryDirective::Clear, &fetch_tx, &config);
+        assert!(loop_state.active_fetch.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_handle_fetch_outcome_stale_epoch_ignored() {
+        let mut loop_state = LoopState::new();
+        let (update_tx, mut update_rx) = mpsc::channel(16);
+        loop_state.current_epoch = 2;
+
+        let meta = TrackMetadata {
+            title: "Track 1".into(),
+            artist: "Artist 1".into(),
+            ..Default::default()
+        };
+
+        let outcome = FetchOutcome::Success {
+            epoch: 1, // Stale epoch (current is 2)
+            meta,
+            lines: vec![crate::lyrics::LyricLine::new(0.0, "Hello")],
+            provider: crate::state::Provider::Lrclib,
+            position: 0.0,
+        };
+
+        handle_fetch_outcome(outcome, &mut loop_state, &update_tx).await;
+
+        // No lyrics should have been applied and no update sent
+        assert!(!loop_state.state_bundle.has_lyrics());
+        assert!(update_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_fetch_outcome_matching_epoch_applies_lyrics() {
+        let mut loop_state = LoopState::new();
+        let (update_tx, mut update_rx) = mpsc::channel(16);
+        loop_state.current_epoch = 1;
+
+        let meta = TrackMetadata {
+            title: "Track 1".into(),
+            artist: "Artist 1".into(),
+            ..Default::default()
+        };
+        loop_state
+            .state_bundle
+            .player_state
+            .update_from_metadata(&meta);
+
+        let outcome = FetchOutcome::Success {
+            epoch: 1,
+            meta: meta.clone(),
+            lines: vec![crate::lyrics::LyricLine::new(0.0, "Hello")],
+            provider: crate::state::Provider::Lrclib,
+            position: 0.0,
+        };
+
+        handle_fetch_outcome(outcome, &mut loop_state, &update_tx).await;
+
+        assert!(loop_state.state_bundle.has_lyrics());
+        assert_eq!(loop_state.state_bundle.lyric_state.lines.len(), 1);
+        let update = update_rx.try_recv().expect("UI update should be sent");
+        assert_eq!(update.title, "Track 1");
+        assert_eq!(update.lines.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_handle_fetch_outcome_upgraded_hotswaps_active_track() {
+        let mut loop_state = LoopState::new();
+        let (update_tx, mut update_rx) = mpsc::channel(16);
+        loop_state.current_epoch = 1;
+
+        let mut meta = TrackMetadata::default();
+        meta.title = "Current Track".into();
+        meta.artist = "Current Artist".into();
+        loop_state
+            .state_bundle
+            .player_state
+            .update_from_metadata(&meta);
+        loop_state.state_bundle.mark_state_sent();
+
+        let rich_word = crate::lyrics::types::WordTiming {
+            start: 10.0,
+            end: 14.0,
+            text: "Karaoke".into(),
+            grapheme_boundaries: vec![0, 7],
+            grapheme_times: vec![],
+        };
+        let upgraded_lines = vec![
+            crate::lyrics::LyricLine::new(5.0, "Upgraded line 1"),
+            crate::lyrics::LyricLine::new(10.0, "Karaoke line 2").with_words(Some(vec![rich_word])),
+        ];
+
+        let outcome = FetchOutcome::Upgraded {
+            epoch: 1,
+            meta: meta.clone(),
+            lines: upgraded_lines,
+            format: crate::lyrics::database::LyricsFormat::Richsync,
+        };
+
+        handle_fetch_outcome(outcome, &mut loop_state, &update_tx).await;
+
+        assert_eq!(loop_state.state_bundle.lyric_state.lines.len(), 2);
+        assert_eq!(
+            loop_state.state_bundle.lyric_state.lines[1].text,
+            "Karaoke line 2"
+        );
+        assert!(loop_state.state_bundle.lyric_state.lines[1].words.is_some());
+        let update = update_rx
+            .try_recv()
+            .expect("Hot-swap update should be sent");
+        assert_eq!(
+            update.provider,
+            Some(crate::state::Provider::MusixmatchRichsync)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_fetch_outcome_upgraded_ignores_stale_track() {
+        let mut loop_state = LoopState::new();
+        let (update_tx, mut update_rx) = mpsc::channel(16);
+        loop_state.current_epoch = 1;
+
+        // Player is currently playing Track B
+        let mut current_meta = TrackMetadata::default();
+        current_meta.title = "New Song".into();
+        current_meta.artist = "New Artist".into();
+        loop_state
+            .state_bundle
+            .player_state
+            .update_from_metadata(&current_meta);
+        let initial_lines = vec![crate::lyrics::LyricLine::new(0.0, "New track line")];
+        loop_state
+            .state_bundle
+            .lyric_state
+            .update_lines(initial_lines);
+        loop_state.state_bundle.mark_state_sent();
+
+        // Stale upgrade arrives for Track A
+        let mut old_meta = TrackMetadata::default();
+        old_meta.title = "Old Song".into();
+        old_meta.artist = "Old Artist".into();
+        let old_lines = vec![crate::lyrics::LyricLine::new(0.0, "Stale line")];
+
+        let outcome = FetchOutcome::Upgraded {
+            epoch: 1,
+            meta: old_meta,
+            lines: old_lines,
+            format: crate::lyrics::database::LyricsFormat::Richsync,
+        };
+
+        handle_fetch_outcome(outcome, &mut loop_state, &update_tx).await;
+
+        // No update sent because track didn't match
+        assert!(update_rx.try_recv().is_err());
+        assert_eq!(
+            loop_state.state_bundle.lyric_state.lines[0].text,
+            "New track line"
+        );
+    }
 }

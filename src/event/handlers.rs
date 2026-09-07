@@ -1,7 +1,6 @@
 //! MPRIS event handlers for state transitions, track changes, and seeks.
 
-use super::fetch::{FetchSummary, fetch_and_update_lyrics};
-use super::{MprisEvent, send_update};
+use super::{Event, send_update};
 use crate::mpris::TrackMetadata;
 use crate::state::{StateBundle, Update};
 use tokio::sync::mpsc;
@@ -13,21 +12,19 @@ pub(crate) struct NewTrackContext<'a> {
     pub(crate) service: String,
     pub(crate) playback_status: Option<String>,
     pub(crate) state: &'a mut StateBundle,
-    pub(crate) event_tx: &'a mpsc::Sender<super::Event>,
     pub(crate) update_tx: &'a mpsc::Sender<Update>,
-    pub(crate) providers: &'a [String],
 }
 
 /// Instructs the event loop on how to manage the network-retry timer
 /// after processing an MPRIS event.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum RetryDirective {
     /// Leave any scheduled retry untouched (position updates, seeks)
     Keep,
     /// Cancel any scheduled retry (no player, stopped, shutdown)
     Clear,
-    /// Schedule a retry for this track after providers were unreachable
-    Schedule {
+    /// A new track was detected; event loop increments epoch and spawns async fetch
+    TrackChanged {
         meta: TrackMetadata,
         service: String,
     },
@@ -37,37 +34,14 @@ pub enum RetryDirective {
 ///
 /// Returns a [`RetryDirective`] so the caller can maintain the retry schedule.
 pub(crate) async fn handle_mpris_event(
-    event: MprisEvent,
+    event: Event,
     state: &mut StateBundle,
-    event_tx: &mpsc::Sender<super::Event>,
     update_tx: &mpsc::Sender<Update>,
-    providers: &[String],
 ) -> RetryDirective {
     let (meta, position, service, event_status, sampled_at, is_full_update) = match event {
-        MprisEvent::PlayerUpdate(m, p, s, status, sampled_at) => {
-            (m, p, s, status, sampled_at, true)
-        }
-        MprisEvent::Seeked(m, p, s, sampled_at) => (m, p, s, None, sampled_at, false),
-        MprisEvent::UpgradeLyrics {
-            meta,
-            lines,
-            format,
-        } => {
-            if state.player_state.title == meta.title && state.player_state.artist == meta.artist {
-                let provider = super::fetch::db_format_to_provider(format);
-                state.update_lyrics(lines, &meta, None, Some(provider));
-                let current_pos = state.player_state.estimate_position();
-                state.update_index(current_pos);
-                send_update(state, update_tx, false).await;
-                tracing::info!(
-                    title = %meta.title,
-                    artist = %meta.artist,
-                    "Hot-swapped lyrics to Richsync karaoke"
-                );
-            }
-            return RetryDirective::Keep;
-        }
-        MprisEvent::Calibrated {
+        Event::PlayerUpdate(m, p, s, status, sampled_at) => (m, p, s, status, sampled_at, true),
+        Event::Seeked(m, p, s, sampled_at) => (m, p, s, None, sampled_at, false),
+        Event::Calibrated {
             meta,
             position,
             sampled_at,
@@ -124,9 +98,7 @@ pub(crate) async fn handle_mpris_event(
             service,
             playback_status,
             state,
-            event_tx,
             update_tx,
-            providers,
         })
         .await;
     }
@@ -213,8 +185,8 @@ pub async fn handle_no_player(state: &mut StateBundle, update_tx: &mpsc::Sender<
 
 /// Handles detection of a new track.
 ///
-/// Returns a [`RetryDirective`]: [`RetryDirective::Schedule`] when providers
-/// were unreachable so the event loop can retry in the background.
+/// Returns [`RetryDirective::TrackChanged`] so the event loop can increment its
+/// epoch counter, abort any in-flight fetch, and spawn a new isolated fetch task.
 pub(crate) async fn handle_new_track(ctx: NewTrackContext<'_>) -> RetryDirective {
     let NewTrackContext {
         meta,
@@ -222,9 +194,7 @@ pub(crate) async fn handle_new_track(ctx: NewTrackContext<'_>) -> RetryDirective
         service,
         playback_status,
         state,
-        event_tx,
         update_tx,
-        providers,
     } = ctx;
 
     state.clear_lyrics();
@@ -250,15 +220,7 @@ pub(crate) async fn handle_new_track(ctx: NewTrackContext<'_>) -> RetryDirective
 
     send_update(state, update_tx, true).await;
 
-    let (_, summary) =
-        fetch_and_update_lyrics(&meta, state, providers, Some(&service), event_tx).await;
-
-    send_update(state, update_tx, true).await;
-
-    match summary {
-        FetchSummary::Unavailable => RetryDirective::Schedule { meta, service },
-        FetchSummary::Loaded | FetchSummary::Exhausted => RetryDirective::Clear,
-    }
+    RetryDirective::TrackChanged { meta, service }
 }
 
 /// Handles position and playback state updates.
@@ -350,18 +312,15 @@ mod tests {
         state.update_index(0.0);
         state.mark_state_sent();
 
-        let (event_tx, _event_rx) = mpsc::channel(32);
         // Calibration moves position to 6.0s (Line 1 active)
         let directive = handle_mpris_event(
-            MprisEvent::Calibrated {
+            Event::Calibrated {
                 meta: TrackMetadata::default(),
                 position: 6.0,
                 sampled_at: std::time::Instant::now(),
             },
             &mut state,
-            &event_tx,
             &tx,
-            &[],
         )
         .await;
 
@@ -385,18 +344,15 @@ mod tests {
         state.update_index(0.0);
         state.mark_state_sent();
 
-        let (event_tx, _event_rx) = mpsc::channel(32);
         // Post-buffering calibration tick with 200ms delta (well below legacy 500ms threshold)
         let directive = handle_mpris_event(
-            MprisEvent::Calibrated {
+            Event::Calibrated {
                 meta: TrackMetadata::default(),
                 position: 0.20,
                 sampled_at: std::time::Instant::now(),
             },
             &mut state,
-            &event_tx,
             &tx,
-            &[],
         )
         .await;
 
@@ -423,18 +379,15 @@ mod tests {
         state.update_index(45.0);
         state.mark_state_sent();
 
-        let (event_tx, _event_rx) = mpsc::channel(32);
         // Spurious calibration tick reporting 0.0s during mid-track playback
         let directive = handle_mpris_event(
-            MprisEvent::Calibrated {
+            Event::Calibrated {
                 meta: TrackMetadata::default(),
                 position: 0.0,
                 sampled_at: std::time::Instant::now(),
             },
             &mut state,
-            &event_tx,
             &tx,
-            &[],
         )
         .await;
 
@@ -448,7 +401,6 @@ mod tests {
     #[tokio::test]
     async fn test_handle_calibrated_event_ignores_mismatched_track() {
         let (tx, mut rx) = mpsc::channel(32);
-        let (event_tx, _event_rx) = mpsc::channel(32);
         let mut state = StateBundle::new();
 
         let mut current_meta = TrackMetadata::default();
@@ -463,15 +415,13 @@ mod tests {
         old_meta.artist = "Stale Artist".into();
 
         let directive = handle_mpris_event(
-            MprisEvent::Calibrated {
+            Event::Calibrated {
                 meta: old_meta,
                 position: 50.0,
                 sampled_at: std::time::Instant::now(),
             },
             &mut state,
-            &event_tx,
             &tx,
-            &[],
         )
         .await;
 
@@ -506,106 +456,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_upgrade_lyrics_hotswap_current_track() {
-        let (tx, mut rx) = mpsc::channel(32);
-        let (event_tx, _event_rx) = mpsc::channel(32);
-        let mut state = StateBundle::new();
-
-        let mut meta = TrackMetadata::default();
-        meta.title = "Current Song".into();
-        meta.artist = "Current Artist".into();
-        state.player_state.update_from_metadata(&meta);
-        state.player_state.update_playback_dbus(true, 12.0);
-
-        let initial_lines = vec![
-            crate::lyrics::LyricLine::new(5.0, "Old line 1"),
-            crate::lyrics::LyricLine::new(15.0, "Old line 2"),
-        ];
-        state.lyric_state.update_lines(initial_lines);
-        state.update_index(12.0);
-        state.mark_state_sent();
-
-        // An UpgradeLyrics event arrives for the currently playing track
-        let rich_word = crate::lyrics::types::WordTiming {
-            start: 10.0,
-            end: 14.0,
-            text: "Karaoke".into(),
-            grapheme_boundaries: vec![0, 7],
-            grapheme_times: vec![],
-        };
-        let upgraded_lines = vec![
-            crate::lyrics::LyricLine::new(5.0, "Upgraded line 1"),
-            crate::lyrics::LyricLine::new(10.0, "Karaoke line 2").with_words(Some(vec![rich_word])),
-        ];
-
-        let directive = handle_mpris_event(
-            MprisEvent::UpgradeLyrics {
-                meta: meta.clone(),
-                lines: upgraded_lines,
-                format: crate::lyrics::database::LyricsFormat::Richsync,
-            },
-            &mut state,
-            &event_tx,
-            &tx,
-            &[],
-        )
-        .await;
-
-        assert!(matches!(directive, RetryDirective::Keep));
-        let update = rx.recv().await.expect("Hot-swap update should be sent");
-        assert_eq!(
-            update.provider,
-            Some(crate::state::Provider::MusixmatchRichsync)
-        );
-        assert_eq!(state.lyric_state.lines.len(), 2);
-        assert_eq!(state.lyric_state.lines[1].text, "Karaoke line 2");
-        assert!(state.lyric_state.lines[1].words.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_upgrade_lyrics_ignores_stale_track() {
-        let (tx, mut rx) = mpsc::channel(32);
-        let (event_tx, _event_rx) = mpsc::channel(32);
-        let mut state = StateBundle::new();
-
-        // Player is now on Track B
-        let mut current_meta = TrackMetadata::default();
-        current_meta.title = "New Song".into();
-        current_meta.artist = "New Artist".into();
-        state.player_state.update_from_metadata(&current_meta);
-        let initial_lines = vec![crate::lyrics::LyricLine::new(0.0, "New track line")];
-        state.lyric_state.update_lines(initial_lines);
-        state.mark_state_sent();
-
-        // Stale upgrade event arrives for Track A
-        let mut old_meta = TrackMetadata::default();
-        old_meta.title = "Old Song".into();
-        old_meta.artist = "Old Artist".into();
-        let old_lines = vec![crate::lyrics::LyricLine::new(0.0, "Stale line")];
-
-        let directive = handle_mpris_event(
-            MprisEvent::UpgradeLyrics {
-                meta: old_meta,
-                lines: old_lines,
-                format: crate::lyrics::database::LyricsFormat::Richsync,
-            },
-            &mut state,
-            &event_tx,
-            &tx,
-            &[],
-        )
-        .await;
-
-        assert!(matches!(directive, RetryDirective::Keep));
-        // No update sent because track didn't match
-        assert!(rx.try_recv().is_err());
-        assert_eq!(state.lyric_state.lines[0].text, "New track line");
-    }
-
-    #[tokio::test]
     async fn test_discard_stale_player_update_sampled_before_lyrics_loaded() {
         let (tx, mut rx) = mpsc::channel(32);
-        let (event_tx, _event_rx) = mpsc::channel(32);
         let mut state = StateBundle::new();
 
         let mut meta = TrackMetadata::default();
@@ -627,7 +479,7 @@ mod tests {
         // Stale PlayerUpdate sampled 200ms BEFORE lyrics were loaded
         let stale_sample = load_time - std::time::Duration::from_millis(200);
         let directive = handle_mpris_event(
-            MprisEvent::PlayerUpdate(
+            Event::PlayerUpdate(
                 meta.clone(),
                 0.0, // Stale 0.0s position from track start
                 "org.mpris.MediaPlayer2.spotify".into(),
@@ -635,9 +487,7 @@ mod tests {
                 stale_sample,
             ),
             &mut state,
-            &event_tx,
             &tx,
-            &[],
         )
         .await;
 
@@ -675,7 +525,6 @@ mod tests {
     #[tokio::test]
     async fn test_track_change_not_discarded_even_if_sampled_before_lyrics_loaded() {
         let (tx, _rx) = mpsc::channel(32);
-        let (event_tx, _event_rx) = mpsc::channel(32);
         let mut state = StateBundle::new();
 
         let mut old_meta = TrackMetadata::default();
@@ -695,7 +544,7 @@ mod tests {
         let stale_sample = load_time - std::time::Duration::from_millis(200);
 
         let directive = handle_mpris_event(
-            MprisEvent::PlayerUpdate(
+            Event::PlayerUpdate(
                 new_meta,
                 0.0,
                 "org.mpris.MediaPlayer2.spotify".into(),
@@ -703,21 +552,18 @@ mod tests {
                 stale_sample,
             ),
             &mut state,
-            &event_tx,
             &tx,
-            &[],
         )
         .await;
 
         // New track must NOT be discarded; title must change
         assert_eq!(state.player_state.title, "New Song");
-        assert!(matches!(directive, RetryDirective::Clear));
+        assert!(matches!(directive, RetryDirective::TrackChanged { .. }));
     }
 
     #[tokio::test]
     async fn test_pause_status_not_discarded_even_if_sampled_before_lyrics_loaded() {
         let (tx, mut rx) = mpsc::channel(32);
-        let (event_tx, _event_rx) = mpsc::channel(32);
         let mut state = StateBundle::new();
 
         let mut meta = TrackMetadata::default();
@@ -735,7 +581,7 @@ mod tests {
         // User paused while lyrics were loading
         let stale_sample = load_time - std::time::Duration::from_millis(150);
         let directive = handle_mpris_event(
-            MprisEvent::PlayerUpdate(
+            Event::PlayerUpdate(
                 meta.clone(),
                 10.0,
                 "org.mpris.MediaPlayer2.spotify".into(),
@@ -743,9 +589,7 @@ mod tests {
                 stale_sample,
             ),
             &mut state,
-            &event_tx,
             &tx,
-            &[],
         )
         .await;
 
@@ -758,7 +602,6 @@ mod tests {
     #[tokio::test]
     async fn test_paused_state_does_not_add_queue_latency() {
         let (tx, mut rx) = mpsc::channel(32);
-        let (event_tx, _event_rx) = mpsc::channel(32);
         let mut state = StateBundle::new();
 
         let mut meta = TrackMetadata::default();
@@ -771,16 +614,14 @@ mod tests {
         // Seek while paused, but event sat in queue for 500ms
         let sampled_at = std::time::Instant::now() - std::time::Duration::from_millis(500);
         handle_mpris_event(
-            MprisEvent::Seeked(
+            Event::Seeked(
                 meta,
                 30.0,
                 "org.mpris.MediaPlayer2.spotify".into(),
                 sampled_at,
             ),
             &mut state,
-            &event_tx,
             &tx,
-            &[],
         )
         .await;
 
