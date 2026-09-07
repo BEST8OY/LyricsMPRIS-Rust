@@ -71,6 +71,15 @@ fn schedule_next_richsync_boundary(upd: &Update) -> Option<Pin<Box<Sleep>>> {
 
     // Scan from current line forward for the nearest future boundary
     for line in upd.lines.iter().skip(current_idx) {
+        // Because lines are chronologically sorted, if this line's start time is already
+        // further in the future than our best found boundary, no word in this line or any
+        // subsequent line can possibly start sooner.
+        if let Some(d) = best_delay {
+            if d <= 0.01 || (line.time.is_finite() && line.time > upd.position + d) {
+                break;
+            }
+        }
+
         if line.time.is_finite() && line.time > upd.position {
             update_best_delay(&mut best_delay, line.time, upd.position);
         }
@@ -87,13 +96,6 @@ fn schedule_next_richsync_boundary(upd: &Update) -> Option<Pin<Box<Sleep>>> {
             for &grapheme_boundary in &word.grapheme_times {
                 update_best_delay(&mut best_delay, grapheme_boundary, upd.position);
             }
-        }
-
-        // Early exit if we found a very near boundary
-        if let Some(d) = best_delay
-            && d <= 0.01
-        {
-            break;
         }
     }
 

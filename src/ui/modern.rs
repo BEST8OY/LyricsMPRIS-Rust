@@ -242,8 +242,14 @@ where
 
 /// Helper: Update cached lines and last update
 fn update_cache_and_state(state: &mut ModernUIState, update: &Update) {
-    // Explicitly clear old cache before creating new one to free memory immediately
-    state.wrapped_cache = None;
+    // Invalidate wrapped cache only if lyrics lines actually changed
+    let lyrics_changed = match &state.last_update {
+        Some(prev) => !std::sync::Arc::ptr_eq(&prev.lines, &update.lines),
+        None => true,
+    };
+    if lyrics_changed {
+        state.wrapped_cache = None;
+    }
 
     state.last_update = Some(update.clone());
     state.last_update_instant = Some(Instant::now());
@@ -459,5 +465,31 @@ mod tests {
         let mut state = ModernUIState::new();
         update_state(&mut state, None);
         assert!(state.should_exit);
+    }
+
+    #[test]
+    fn test_wrapped_cache_preserved_when_lines_unchanged() {
+        let mut state = ModernUIState::new();
+        let update1 = sample_update("Song", 3, None);
+        update_state(&mut state, Some(update1.clone()));
+
+        // Simulate population of wrapped_cache
+        state.wrapped_cache = Some((80, false, Vec::new()));
+
+        // Position update arrives with identical lines Arc
+        let mut update2 = update1.clone();
+        update2.position = 5.0;
+        update2.index = Some(1);
+        update_state(&mut state, Some(update2));
+
+        // Cache must NOT be cleared!
+        assert!(state.wrapped_cache.is_some());
+
+        // Now a new track arrives with different lines Arc
+        let update3 = sample_update("Different Song", 3, None);
+        update_state(&mut state, Some(update3));
+
+        // Cache must be cleared for new lines
+        assert!(state.wrapped_cache.is_none());
     }
 }
