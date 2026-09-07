@@ -588,7 +588,20 @@ pub async fn fetch_and_update_lyrics(
     let summary = fetch_api_lyrics(meta, state, providers, event_tx).await;
 
     let fetch_duration = start_time.elapsed();
-    let position = fetch_fresh_position(service, state).await;
+    let raw_position = fetch_fresh_position(service, state).await;
+
+    // Guard against spurious near-zero position glitches if fetch took time and playback was already progressing
+    let position = if raw_position <= 0.05 && position_before > 1.0 {
+        tracing::debug!(
+            estimated = position_before,
+            raw_position,
+            "Ignoring 0.0s position report after lyrics fetch while track is already active at {position_before}s"
+        );
+        position_before
+    } else {
+        raw_position
+    };
+
     let position_change = position - position_before;
 
     tracing::debug!(
