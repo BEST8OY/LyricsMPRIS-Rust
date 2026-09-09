@@ -7,7 +7,7 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 [![Platform](https://img.shields.io/badge/Platform-Linux-blue.svg?style=flat-sq&logo=linux)](https://kernel.org)
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-sq)](LICENSE)
 
-`LyricsMPRIS-Rust` monitors your active media player in real-time using D-Bus, fetches synchronized lyrics automatically, and renders them beautifully in a modern Terminal User Interface (TUI) with word-level karaoke support. It also features a scriptable **Pipe Mode** for status bar integration, **ISRC tag reading** from local audio files, **multi-script Romanization** (Romaji, Pinyin, Cyrillic), and an optimized **local SQLite database** with Zstd compression for instant offline lookups.
+`LyricsMPRIS-Rust` monitors your active media player in real-time using D-Bus, fetches synchronized lyrics automatically, and renders them beautifully in a modern Terminal User Interface (TUI) with word-level karaoke support. It also features a scriptable **Pipe Mode** for status bar integration, **ISRC tag reading** from local audio files, **multi-script Romanization** (Romaji, Pinyin, Cyrillic, Greek, Arabic), and an optimized **local SQLite database** with Zstd compression for instant offline lookups.
 
 ![LyricMPRIS-Rust](https://github.com/user-attachments/assets/501f224e-6c40-46cd-ac66-cd9ae4f927cf)
 
@@ -39,7 +39,7 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 * **Streamlined Pipe Mode**: Outputs current lyric line to `stdout` in real-time, automatically clearing out-of-bound segments (intros/outros/silence), and routing transient network warnings to `stderr` to keep status bars (Polybar, Waybar, i3blocks) pristine.
 
 ### 🌐 Multi-Language Script Romanization
-* **Foreign Script Transliteration**: Automatically generates synchronized Romaji, Pinyin, Korean Hangul, and Cyrillic phonetic subtitles for non-Latin lyrics using `kakasi` and `deunicode`.
+* **Foreign Script Transliteration**: Automatically generates synchronized Romaji, Pinyin, Korean Hangul, Cyrillic, Greek, and Arabic phonetic subtitles for non-Latin lyrics using `kakasi` and `deunicode`.
 * **Flexible Activation**: Enable at launch via `--romanize` or toggle interactively in the TUI with the `r` key.
 
 ### 📚 Multiple Lyrics Providers & Hedged Racing
@@ -55,7 +55,8 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 
 ### ⚡ Resilience & Background Retries
 * **Transient Error Classification**: Automatically distinguishes between missing lyrics and temporary network/server outages (rate limits, DNS failures, 5xx errors).
-* **Exponential Backoff Loop**: Automatically schedules background retries with exponential backoff (up to 30s cap) when providers are temporarily unreachable without interrupting active playback.
+* **Exponential Backoff Loop**: Automatically schedules background retries with exponential backoff (up to 60s cap) when providers are temporarily unreachable without interrupting active playback.
+* **Non-Blocking Epoch-Protected Workers**: Decoupled asynchronous worker tasks retrieve lyrics in the background without blocking the D-Bus event loop, discarding stale responses via generational epoch matching during rapid track skipping.
 
 ### 🏷️ Local File ISRC Extraction
 * Reads local audio file metadata (FLAC, MP3, M4A, OGG) via `lofty` when `--isrc` is enabled to perform pinpoint ISRC lookups.
@@ -68,6 +69,7 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 
 ### 🚀 Ultra-Low Resource Footprint
 * **Single-Threaded Async Engine**: Utilizes Tokio `current_thread` runtime and asynchronous event streaming, reducing active thread count down to just 1–2 lightweight threads.
+* **Non-Blocking Reactor**: Decoupled asynchronous fetch workers and monotonic time projections prevent network I/O from blocking D-Bus event handling or TUI responsiveness.
 * **Zero-Allocation Rendering**: Zero-copy span borrowing and chunk-reversed visible line collection eliminate frame-by-frame heap allocations.
 * **D-Bus Query Timeouts**: Dynamic `Position` and `PlaybackStatus` queries are protected with a 150ms timeout (`DBUS_QUERY_TIMEOUT`), preventing frozen players from stalling the reactor.
 * **Dual-Tier Discovery & Playback Prioritization**: Prefers `playerctld` for recency-ordered player prioritization, with an intelligent fallback (`Playing` > `Paused` > `Stopped`) via standard D-Bus discovery.
@@ -80,7 +82,7 @@ A lightweight, ultra-high-performance synchronized lyrics viewer for Linux that 
 
 ### Prerequisites
 - **Linux** desktop environment with **D-Bus** session daemon.
-- **Rust Toolchain** (1.70+): Install via [rustup.rs](https://rustup.rs).
+- **Rust Toolchain** (1.85+): Install via [rustup.rs](https://rustup.rs) (required for Rust Edition 2024).
 - **playerctld** *(optional)*: Enhances active player tracking across desktop sessions; completely optional as priority-ranked standalone discovery is built-in.
 
 ### Build from Source
@@ -137,7 +139,7 @@ The optimized executable binary will be created at `./target/release/lyricsmpris
 | `--providers <LIST>` | Comma-separated provider priority order (default: `musixmatch,lrclib`) | `--providers musixmatch,lrclib` |
 | `--visible-lines <COUNT>`| Limit maximum visible lyric lines in TUI | `--visible-lines 3` |
 | `--isrc` | Extract ISRC from local audio files via `lofty` | `--isrc` |
-| `--romanize` | Enable phonetic Romanization subtitles (Romaji/Pinyin) | `--romanize` |
+| `--romanize` | Enable phonetic Romanization subtitles (Romaji/Pinyin/Cyrillic/Greek/Arabic) | `--romanize` |
 | `--no-karaoke` | Disable per-word karaoke highlighting | `--no-karaoke` |
 | `--pipe` | Output lyrics to `stdout` (no TUI) | `--pipe` |
 | `--block <LIST>` | Ignore specific MPRIS service names | `--block firefox,chromium` |
@@ -314,16 +316,16 @@ format-prefix-foreground = #8abeb7
 src/
 ├── main.rs           # Entry point, CLI argument parsing (clap), current_thread runtime
 ├── event/            # Event coordinator (fetch pipeline, MPRIS handlers, retry backoff)
-├── pool.rs           # Event loop supervisor (wires D-Bus → state → UI)
+├── pool.rs           # Event loop supervisor (wires D-Bus → state → UI) with epoch-protected workers
 ├── state.rs          # StateBundle, PlayerState, LyricState, Update snapshot
-├── timer.rs          # PlaybackTimer (monotonic position estimation)
+├── timer.rs          # PlaybackTimer & TimeAnchor (monotonic position projection)
 ├── text_utils.rs     # Text wrapping utility
 ├── lyrics/
 │   ├── providers/    # lrclib.rs, musixmatch/ (API integrations & token manager)
 │   ├── database/     # SQLite cache engine with sqlx + Zstd compression
 │   ├── parse.rs      # LRC (centisecond & millisecond), Richsync, subtitle parsers
 │   ├── romanize/     # Multi-script romanization engine (kakasi Japanese Kana, deunicode)
-│   └── types.rs      # LyricLine, TrackMatchInfo, error models
+│   └── types.rs      # LyricLine, SyncTracker, TrackMatchInfo, error models
 ├── mpris/
 │   ├── connection.rs # D-Bus session singleton, PlaybackPriority, discovery & filtering
 │   ├── events.rs     # D-Bus signal listener, broker-level match rules & calibration
