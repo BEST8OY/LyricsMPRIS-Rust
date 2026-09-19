@@ -26,9 +26,9 @@ src/mpris/ (events.rs, metadata.rs, connection.rs)
 src/pool.rs (event loop orchestrator)
       │
       ▼
-src/event.rs (lyrics lookup pipeline)
-      ├─▶ SQLite DB cache (src/lyrics/database.rs)
-      └─▶ External providers (src/lyrics/providers/: lrclib, musixmatch)
+src/event/ (fetch.rs, handlers.rs) (lyrics lookup pipeline)
+      ├─▶ SQLite DB cache (src/lyrics/database/)
+      └─▶ External providers (src/lyrics/providers/: lrclib.rs, musixmatch/)
       │
       ▼
 src/state.rs (StateBundle -> Update snapshot broadcast)
@@ -49,10 +49,20 @@ src/ui/ (modern.rs Ratatui TUI or pipe.rs stdout)
   - Real-Time Position & Property Streams: `Metadata` and `PlaybackStatus` use standard caching (`CacheProperties::Lazily`) enabling property change streams. Dynamic `Position` is queried via `get_position()` using direct D-Bus `Properties.Get` (via `conn.call_method()`) to avoid stale cached position data and eliminate proxy construction overhead, propagating errors so callers retain estimated positions on transient failures.
   - Resilience: The watcher task in `pool.rs` retries with exponential backoff (500 ms → ×2, cap 30 s), resetting only after sustained uptime (≥ 5 s). The event loop backs off on error to prevent CPU spin.
   - Multi-Threaded Tag Reading: ISRC extraction checks `runtime_flavor() == RuntimeFlavor::MultiThread` before invoking `block_in_place`.
-- **Musixmatch Token Engine (`src/lyrics/providers/musixmatch.rs`)**:
+- **Musixmatch Engine (`src/lyrics/providers/musixmatch/`)**:
   - Tier 1: Round-robin pool from `MUSIXMATCH_USERTOKEN` env var.
   - Tier 2: Auto-fetches anonymous token via `token.get` API if Tier 1 is unconfigured or exhausted.
   - Tier 3: Auto-purges invalid tokens on 401/402/403/429 responses, requests a fresh token, and retries once transparently.
+  - Rate Limiting: 1.5s request spacing gate + 10-minute cooldown on non-renewable 401/402/403/429. Disk token cached at `~/.cache/lyricsmpris/musixmatch_token.json`.
+  - Query Fallback Pipeline:
+    1. Direct `macro.subtitles.get` combining metadata and track IDs (ISRC, Spotify ID, iTunes ID).
+    2. Pure metadata fallback (dropping IDs if ID lookup returns `TrackNotFound`).
+    3. Cleaned title fallback (stripping feat/remaster annotations via `clean_title_annotations`).
+    4. Candidate search (`track.search` via `search_and_fetch_best_candidate`).
+  - Candidate Selection Rules (`select_best_candidate_track_id`):
+    - Must have `has_richsync`, `has_subtitles`, `has_lyrics`, or `instrumental`.
+    - Version tag parity (`VERSION_RE`): studio tracks will not match candidates with live, acoustic, remix, mix, demo, or rehearsal annotations.
+    - Clamped within ±2.0s duration window; candidates with `track_length == 0.0` are rejected when target duration is known.
 - **Database Engine (`src/lyrics/database/`)**:
   - SQLite pool with `lyrics (id INTEGER PRIMARY KEY)`, multi-album alias table `track_aliases (artist, title, album, lyrics_id)` (`WITHOUT ROWID`), and unified `track_identifiers (kind, value, lyrics_id)` clustered table (`WITHOUT ROWID`) with cascading foreign keys.
   - Raw lyrics stored as zstd-compressed blobs with explicit `LyricsFormat` (`Richsync`, `Subtitles`, `Lrclib`).
