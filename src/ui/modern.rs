@@ -59,6 +59,12 @@ impl ModernUIState {
     }
 }
 
+impl Default for ModernUIState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // Compute a line index from an Arc<Vec<LyricLine>> for a given position.
 // Mirrors the binary-search logic used in `LyricState::get_index` but kept
 // small here; VisibleLines and gather_visible_lines live in `modern_helpers`.
@@ -156,15 +162,19 @@ pub async fn display_lyrics_modern(
             // MPRIS lyrics/position updates
             update = rx.recv() => {
                 process_update(update, &mut state)?;
-                redraw_and_reschedule(&mut terminal, &mut state, &styles, &mut next_word_sleep, max_visible_lines)?;
+                if !state.should_exit {
+                    redraw_and_reschedule(&mut terminal, &mut state, &styles, &mut next_word_sleep, max_visible_lines)?;
+                }
             }
 
             // User keyboard input (async crossterm event stream)
             maybe_event = event_stream.next() => {
                 match maybe_event {
                     Some(Ok(event)) => {
-                        process_event(event, &mut state)?;
-                        redraw_and_reschedule(&mut terminal, &mut state, &styles, &mut next_word_sleep, max_visible_lines)?;
+                        let needs_redraw = process_event(event, &mut state)?;
+                        if !state.should_exit && needs_redraw {
+                            redraw_and_reschedule(&mut terminal, &mut state, &styles, &mut next_word_sleep, max_visible_lines)?;
+                        }
                     }
                     Some(Err(e)) => {
                         tracing::warn!(error = %e, "Terminal event stream error");
@@ -278,9 +288,10 @@ fn update_state(state: &mut ModernUIState, update: Option<Update>) {
     // If nothing is currently displayed (fresh track, startup), surface the
     // error so the screen is not silently blank. If lyrics from this track are
     // already showing, keep them rather than clobbering good content with an
-    // error banner.
+    // error banner. If a new track has started and has an error, display the
+    // error rather than stale lyrics from the previous track.
     if update.lines.is_empty() && update.err.is_some() {
-        if state.last_update.is_none() {
+        if state.last_update.is_none() || is_new_track {
             update_cache_and_state(state, &update);
         }
         return;
@@ -289,6 +300,7 @@ fn update_state(state: &mut ModernUIState, update: Option<Update>) {
     // Empty update (no lyrics available)
     if update.lines.is_empty() {
         state.last_update = None;
+        state.wrapped_cache = None;
         return;
     }
 
@@ -307,57 +319,148 @@ fn process_update(
     Ok(())
 }
 
-/// Handle user input events (keyboard)
+/// Handle user input events (keyboard, resize, etc.)
+/// Returns `Ok(true)` if the event changed state and requires a UI redraw.
 fn process_event(
     event: Event,
     state: &mut ModernUIState,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Event::Key(key) = event {
-        // Ignore release/repeat events reported by terminals with enhanced
-        // keyboard protocols (e.g. kitty); only act on genuine presses.
-        if key.kind != KeyEventKind::Press {
-            return Ok(());
-        }
-        match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => {
-                state.should_exit = true;
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    match event {
+        Event::Key(key) => {
+            // Ignore release/repeat events reported by terminals with enhanced
+            // keyboard protocols (e.g. kitty); only act on genuine presses.
+            if key.kind != KeyEventKind::Press {
+                return Ok(false);
             }
-            KeyCode::Char('k') => {
-                // Toggle karaoke at runtime
-                state.karaoke_enabled = !state.karaoke_enabled;
-            }
-            KeyCode::Char('r') => {
-                // Toggle romanization at runtime
-                state.romanize_enabled = !state.romanize_enabled;
-                state.wrapped_cache = None;
-            }
-            KeyCode::Up => {
-                // Scroll up when paused
-                if let Some(ref update) = state.last_update
-                    && !update.playing
-                {
-                    state.scroll_offset = state.scroll_offset.saturating_sub(1);
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    state.should_exit = true;
+                    Ok(false)
                 }
-            }
-            KeyCode::Down => {
-                // Scroll down when paused
-                if let Some(ref update) = state.last_update
-                    && !update.playing
+                KeyCode::Char('c')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
-                    state.scroll_offset = state.scroll_offset.saturating_add(1);
+                    state.should_exit = true;
+                    Ok(false)
                 }
+                KeyCode::Char('k') => {
+                    // Toggle karaoke at runtime
+                    state.karaoke_enabled = !state.karaoke_enabled;
+                    Ok(true)
+                }
+                KeyCode::Char('r') => {
+                    // Toggle romanization at runtime
+                    state.romanize_enabled = !state.romanize_enabled;
+                    state.wrapped_cache = None;
+                    Ok(true)
+                }
+                KeyCode::Up => {
+                    // Scroll up (towards earlier lines) when paused, clamped to start
+                    if let Some(ref update) = state.last_update
+                        && !update.playing
+                        && !update.lines.is_empty()
+                    {
+                        let base_index = update.index.unwrap_or(0) as isize;
+                        let min_offset = -base_index;
+                        let old_offset = state.scroll_offset;
+                        state.scroll_offset =
+                            (state.scroll_offset.saturating_sub(1)).max(min_offset);
+                        Ok(state.scroll_offset != old_offset)
+                    } else {
+                        Ok(false)
+                    }
+                }
+                KeyCode::Down => {
+                    // Scroll down (towards later lines) when paused, clamped to end
+                    if let Some(ref update) = state.last_update
+                        && !update.playing
+                        && !update.lines.is_empty()
+                    {
+                        let base_index = update.index.unwrap_or(0) as isize;
+                        let max_offset =
+                            (update.lines.len().saturating_sub(1) as isize) - base_index;
+                        let old_offset = state.scroll_offset;
+                        state.scroll_offset =
+                            (state.scroll_offset.saturating_add(1)).min(max_offset);
+                        Ok(state.scroll_offset != old_offset)
+                    } else {
+                        Ok(false)
+                    }
+                }
+                KeyCode::PageUp => {
+                    // Scroll up 5 lines when paused, clamped to start
+                    if let Some(ref update) = state.last_update
+                        && !update.playing
+                        && !update.lines.is_empty()
+                    {
+                        let base_index = update.index.unwrap_or(0) as isize;
+                        let min_offset = -base_index;
+                        let old_offset = state.scroll_offset;
+                        state.scroll_offset =
+                            (state.scroll_offset.saturating_sub(5)).max(min_offset);
+                        Ok(state.scroll_offset != old_offset)
+                    } else {
+                        Ok(false)
+                    }
+                }
+                KeyCode::PageDown => {
+                    // Scroll down 5 lines when paused, clamped to end
+                    if let Some(ref update) = state.last_update
+                        && !update.playing
+                        && !update.lines.is_empty()
+                    {
+                        let base_index = update.index.unwrap_or(0) as isize;
+                        let max_offset =
+                            (update.lines.len().saturating_sub(1) as isize) - base_index;
+                        let old_offset = state.scroll_offset;
+                        state.scroll_offset =
+                            (state.scroll_offset.saturating_add(5)).min(max_offset);
+                        Ok(state.scroll_offset != old_offset)
+                    } else {
+                        Ok(false)
+                    }
+                }
+                KeyCode::Home => {
+                    // Jump to beginning of lyrics when paused
+                    if let Some(ref update) = state.last_update
+                        && !update.playing
+                        && !update.lines.is_empty()
+                    {
+                        let base_index = update.index.unwrap_or(0) as isize;
+                        let old_offset = state.scroll_offset;
+                        state.scroll_offset = -base_index;
+                        Ok(state.scroll_offset != old_offset)
+                    } else {
+                        Ok(false)
+                    }
+                }
+                KeyCode::End => {
+                    // Jump to end of lyrics when paused
+                    if let Some(ref update) = state.last_update
+                        && !update.playing
+                        && !update.lines.is_empty()
+                    {
+                        let base_index = update.index.unwrap_or(0) as isize;
+                        let max_offset =
+                            (update.lines.len().saturating_sub(1) as isize) - base_index;
+                        let old_offset = state.scroll_offset;
+                        state.scroll_offset = max_offset;
+                        Ok(state.scroll_offset != old_offset)
+                    } else {
+                        Ok(false)
+                    }
+                }
+                _ => Ok(false),
             }
-            KeyCode::Char('c')
-                if key
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
-            {
-                state.should_exit = true;
-            }
-            _ => {}
         }
+        Event::Resize(..) => {
+            // Terminal was resized; redraw is needed
+            Ok(true)
+        }
+        _ => Ok(false),
     }
-    Ok(())
 }
 
 fn to_boxed_err<E: std::error::Error + Send + Sync + 'static>(
@@ -492,5 +595,120 @@ mod tests {
 
         // Cache must be cleared for new lines
         assert!(state.wrapped_cache.is_none());
+    }
+
+    #[test]
+    fn test_error_update_on_new_track_replaces_old_track_lyrics() {
+        let mut state = ModernUIState::new();
+        // Track A has lyrics displayed
+        update_state(&mut state, Some(sample_update("Track A", 5, None)));
+        assert_eq!(
+            state.last_track_id,
+            Some(("Artist".into(), "Track A".into(), "Album".into()))
+        );
+        assert!(
+            state
+                .last_update
+                .as_ref()
+                .is_some_and(|u| !u.lines.is_empty())
+        );
+
+        // Track B arrives with an error and 0 lines
+        let err = "Lyrics not found for Track B".to_string();
+        update_state(
+            &mut state,
+            Some(sample_update("Track B", 0, Some(err.clone()))),
+        );
+
+        // Track B's error MUST replace Track A's lyrics!
+        assert_eq!(
+            state.last_track_id,
+            Some(("Artist".into(), "Track B".into(), "Album".into()))
+        );
+        assert_eq!(
+            state.last_update.as_ref().and_then(|u| u.err.clone()),
+            Some(err)
+        );
+    }
+
+    #[test]
+    fn test_empty_update_clears_wrapped_cache() {
+        let mut state = ModernUIState::new();
+        update_state(&mut state, Some(sample_update("Song", 3, None)));
+        state.wrapped_cache = Some((80, false, Vec::new()));
+
+        // Empty update arrives
+        update_state(&mut state, Some(sample_update("Song", 0, None)));
+        assert!(state.last_update.is_none());
+        assert!(state.wrapped_cache.is_none());
+    }
+
+    #[test]
+    fn test_process_event_scroll_bounds() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+        let key_event = |code: KeyCode| {
+            Event::Key(KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            })
+        };
+
+        let mut state = ModernUIState::new();
+        let mut update = sample_update("Track", 10, None);
+        update.playing = false;
+        update.index = Some(2); // base_index = 2, total = 10 (indices 0..9)
+        state.last_update = Some(update);
+
+        // Scroll up by 1: from offset 0 to -1 (effective index 2 - 1 = 1)
+        let redraw = process_event(key_event(KeyCode::Up), &mut state).unwrap();
+        assert!(redraw);
+        assert_eq!(state.scroll_offset, -1);
+
+        // Scroll up by 1: from offset -1 to -2 (effective index 2 - 2 = 0, top of lyrics)
+        let redraw = process_event(key_event(KeyCode::Up), &mut state).unwrap();
+        assert!(redraw);
+        assert_eq!(state.scroll_offset, -2);
+
+        // Scroll up past beginning: must be clamped at -2 (cannot exceed top bound)
+        let redraw = process_event(key_event(KeyCode::Up), &mut state).unwrap();
+        assert!(!redraw); // No state change -> no redraw needed!
+        assert_eq!(state.scroll_offset, -2);
+
+        // Immediate first Down key moves downward without dead zone!
+        let redraw = process_event(key_event(KeyCode::Down), &mut state).unwrap();
+        assert!(redraw);
+        assert_eq!(state.scroll_offset, -1);
+
+        // PageDown: scrolls down by 5 lines (clamped to max_offset = 10 - 1 - 2 = 7)
+        let redraw = process_event(key_event(KeyCode::PageDown), &mut state).unwrap();
+        assert!(redraw);
+        assert_eq!(state.scroll_offset, 4);
+
+        // End: jumps directly to the end of lyrics (offset = 7)
+        let redraw = process_event(key_event(KeyCode::End), &mut state).unwrap();
+        assert!(redraw);
+        assert_eq!(state.scroll_offset, 7);
+
+        // Down at end: clamped, no redraw
+        let redraw = process_event(key_event(KeyCode::Down), &mut state).unwrap();
+        assert!(!redraw);
+        assert_eq!(state.scroll_offset, 7);
+
+        // Home: jumps to beginning (offset = -2)
+        let redraw = process_event(key_event(KeyCode::Home), &mut state).unwrap();
+        assert!(redraw);
+        assert_eq!(state.scroll_offset, -2);
+    }
+
+    #[test]
+    fn test_modern_ui_state_default() {
+        let state = ModernUIState::default();
+        assert_eq!(state.scroll_offset, 0);
+        assert!(state.karaoke_enabled);
+        assert!(!state.romanize_enabled);
+        assert!(!state.should_exit);
     }
 }
