@@ -58,22 +58,45 @@ pub fn determine_background_first(
     line_text: &str,
     words: Option<&[crate::lyrics::types::WordTiming]>,
 ) -> bool {
-    if let Some(words) = words {
-        let (main_words, bg_words) = split_words_main_and_background(words);
-        if let (Some(first_bg), Some(first_main)) = (bg_words.first(), main_words.first())
-            && (first_bg.start - first_main.start).abs() > f64::EPSILON
+    if let Some(words) = words
+        && !words.is_empty()
+    {
+        let mut first_main_start = None;
+        let mut first_bg_start = None;
+        let mut in_bg = false;
+
+        for word in words {
+            let has_open = word.text.chars().any(is_open_paren);
+            let has_close = word.text.chars().any(is_close_paren);
+
+            if has_open {
+                in_bg = true;
+            }
+
+            if in_bg {
+                if first_bg_start.is_none() {
+                    first_bg_start = Some(word.start);
+                }
+            } else if first_main_start.is_none() {
+                first_main_start = Some(word.start);
+            }
+
+            if has_close {
+                in_bg = false;
+            }
+
+            if first_main_start.is_some() && first_bg_start.is_some() {
+                break;
+            }
+        }
+
+        if let (Some(first_bg), Some(first_main)) = (first_bg_start, first_main_start)
+            && (first_bg - first_main).abs() > f64::EPSILON
         {
-            return first_bg.start < first_main.start;
+            return first_bg < first_main;
         }
     }
     is_line_background_first(line_text)
-}
-
-/// A segment of text within an inline line, indicating whether it represents background vocals.
-#[derive(Clone, Debug, PartialEq)]
-pub struct InlineSegment {
-    pub text: String,
-    pub is_background: bool,
 }
 
 /// A wrapped lyric line block containing primary text lines, background vocal lines, and optional romanized lines.
@@ -83,10 +106,6 @@ pub struct WrappedBlock {
     pub background: Vec<String>,
     pub romanized_primary: Vec<String>,
     pub romanized_background: Vec<String>,
-    /// Wrapped lines for inline inactive rendering (main + parenthetical background vocals inline)
-    pub inline_lines: Vec<Vec<InlineSegment>>,
-    /// Wrapped romanized lines for inline inactive rendering
-    pub inline_romanized: Vec<Vec<InlineSegment>>,
     /// Whether background vocals precede primary vocals chronologically
     pub bg_first: bool,
 }
@@ -105,7 +124,6 @@ impl WrappedBlock {
             && self.background.is_empty()
             && self.romanized_primary.is_empty()
             && self.romanized_background.is_empty()
-            && self.inline_lines.is_empty()
     }
 
     pub fn styled_lines<'a>(
@@ -115,7 +133,16 @@ impl WrappedBlock {
     ) -> impl Iterator<Item = Line<'a>> {
         let rom_style = style.add_modifier(ratatui::style::Modifier::ITALIC);
         let rom_bg_style = bg_style.add_modifier(ratatui::style::Modifier::ITALIC);
+        self.styled_lines_with_rom(style, bg_style, rom_style, rom_bg_style)
+    }
 
+    pub fn styled_lines_with_rom<'a>(
+        &'a self,
+        style: ratatui::style::Style,
+        bg_style: ratatui::style::Style,
+        rom_style: ratatui::style::Style,
+        rom_bg_style: ratatui::style::Style,
+    ) -> impl Iterator<Item = Line<'a>> {
         let mut lines = Vec::with_capacity(self.len());
         if self.bg_first {
             for l in &self.background {
@@ -144,49 +171,6 @@ impl WrappedBlock {
                 lines.push(Line::from(Span::styled(l.as_str(), rom_bg_style)));
             }
         }
-
-        lines.into_iter()
-    }
-
-    /// Renders lines with parenthetical background vocals inline (dimmed italic),
-    /// used for inactive lines (before / after) to prevent vertical shifting and jumping.
-    #[cfg(test)]
-    pub fn styled_lines_inline<'a>(
-        &'a self,
-        style: ratatui::style::Style,
-        bg_style: ratatui::style::Style,
-    ) -> impl Iterator<Item = Line<'a>> {
-        let rom_style = style.add_modifier(ratatui::style::Modifier::ITALIC);
-        let rom_bg_style = bg_style.add_modifier(ratatui::style::Modifier::ITALIC);
-
-        let lines: Vec<Line<'a>> = self
-            .inline_lines
-            .iter()
-            .map(|segments| {
-                let spans: Vec<Span<'a>> = segments
-                    .iter()
-                    .map(|seg| {
-                        let s = if seg.is_background { bg_style } else { style };
-                        Span::styled(seg.text.as_str(), s)
-                    })
-                    .collect();
-                Line::from(spans)
-            })
-            .chain(self.inline_romanized.iter().map(|segments| {
-                let spans: Vec<Span<'a>> = segments
-                    .iter()
-                    .map(|seg| {
-                        let s = if seg.is_background {
-                            rom_bg_style
-                        } else {
-                            rom_style
-                        };
-                        Span::styled(seg.text.as_str(), s)
-                    })
-                    .collect();
-                Line::from(spans)
-            }))
-            .collect();
 
         lines.into_iter()
     }
@@ -264,7 +248,7 @@ fn compute_visible_spans<'a>(
     }
 
     // Check if we have lyrics
-    if update.lines.is_empty() || !update.index.map(|i| i < update.lines.len()).unwrap_or(true) {
+    if update.lines.is_empty() || update.index.is_some_and(|i| i >= update.lines.len()) {
         return Vec::new();
     }
 
@@ -315,40 +299,28 @@ fn ensure_wrapped_cache<'a>(
                     Vec::new()
                 };
 
-                let (rom_main, rom_bg) = if romanize_enabled && let Some(ref rom) = l.romanized {
-                    if bg_text.is_none() {
-                        (Some(rom.clone()), None)
-                    } else if main_text.is_none() {
-                        (None, Some(rom.clone()))
-                    } else {
-                        let (r_main, r_bg) = split_line_main_and_background(rom);
-                        if r_bg.is_some() {
-                            (r_main, r_bg)
+                let (romanized_primary, romanized_background) =
+                    if romanize_enabled && let Some(ref rom) = l.romanized {
+                        if bg_text.is_none() {
+                            (wrap_text(rom, width), Vec::new())
+                        } else if main_text.is_none() {
+                            (Vec::new(), wrap_text(rom, width))
                         } else {
-                            (Some(rom.clone()), None)
+                            let (r_main, r_bg) = split_line_main_and_background(rom);
+                            if let Some(bg) = r_bg {
+                                let prim = r_main
+                                    .as_ref()
+                                    .map(|m| wrap_text(m, width))
+                                    .unwrap_or_default();
+                                let back = wrap_text(&bg, width);
+                                (prim, back)
+                            } else {
+                                (wrap_text(rom, width), Vec::new())
+                            }
                         }
-                    }
-                } else {
-                    (None, None)
-                };
-
-                let romanized_primary = if let Some(m) = rom_main {
-                    wrap_text(&m, width)
-                } else {
-                    Vec::new()
-                };
-                let romanized_background = if let Some(b) = rom_bg {
-                    wrap_text(&b, width)
-                } else {
-                    Vec::new()
-                };
-
-                let inline_lines = wrap_inline_segments(&l.text, width);
-                let inline_romanized = if romanize_enabled && let Some(ref rom) = l.romanized {
-                    wrap_inline_segments(rom, width)
-                } else {
-                    Vec::new()
-                };
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
 
                 let bg_first = determine_background_first(&l.text, l.words.as_deref());
 
@@ -357,8 +329,6 @@ fn ensure_wrapped_cache<'a>(
                     background,
                     romanized_primary,
                     romanized_background,
-                    inline_lines,
-                    inline_romanized,
                     bg_first,
                 }
             })
@@ -420,8 +390,6 @@ fn collect_before_spans<'a>(
     mut lines_needed: usize,
     styles: &'a LyricStyles,
 ) -> Vec<Line<'a>> {
-    // Walk backwards collecting per-block tails; blocks are gathered bottom-up
-    // and reversed once at the end (avoids O(n^2) front-splicing).
     let mut chunks: Vec<Vec<Line<'a>>> = Vec::new();
 
     let mut i = current_index;
@@ -431,10 +399,16 @@ fn collect_before_spans<'a>(
         let style = styles.get_line_style_by_distance(dist, true);
         let bg_style = styles.get_background_style_by_distance(dist, true);
         let block = &wrapped_blocks[i];
-        let block_lines: Vec<Line<'a>> = block.styled_lines(style, bg_style).collect();
-        let take = block_lines.len().min(lines_needed);
-        let start = block_lines.len() - take;
-        chunks.push(block_lines[start..].to_vec());
+        let block_len = block.len();
+        let take = block_len.min(lines_needed);
+        let skip = block_len - take;
+        chunks.push(
+            block
+                .styled_lines(style, bg_style)
+                .skip(skip)
+                .take(take)
+                .collect(),
+        );
         lines_needed -= take;
     }
 
@@ -456,11 +430,8 @@ fn collect_after_spans<'a>(
         let style = styles.get_line_style_by_distance(dist, false);
         let bg_style = styles.get_background_style_by_distance(dist, false);
         let block = &wrapped_blocks[j];
-        let block_lines: Vec<Line<'a>> = block.styled_lines(style, bg_style).collect();
-        let take = block_lines.len().min(lines_needed);
-        for line in block_lines.into_iter().take(take) {
-            result.push(line);
-        }
+        let take = block.len().min(lines_needed);
+        result.extend(block.styled_lines(style, bg_style).take(take));
         lines_needed -= take;
         j += 1;
     }
@@ -475,23 +446,22 @@ fn collect_before_blocks<'a>(
     blocks_needed: usize,
     styles: &'a LyricStyles,
 ) -> Vec<Line<'a>> {
-    // Blocks are gathered bottom-up and reversed once at the end.
-    let mut chunks: Vec<Vec<Line<'a>>> = Vec::new();
+    let mut result = Vec::new();
     let start_index = current_index.saturating_sub(blocks_needed);
 
-    for block_idx in (start_index..current_index).rev() {
+    for (block_idx, block) in wrapped_blocks
+        .iter()
+        .enumerate()
+        .take(current_index)
+        .skip(start_index)
+    {
         let dist = current_index - block_idx;
         let style = styles.get_line_style_by_distance(dist, true);
         let bg_style = styles.get_background_style_by_distance(dist, true);
-        chunks.push(
-            wrapped_blocks[block_idx]
-                .styled_lines(style, bg_style)
-                .collect(),
-        );
+        result.extend(block.styled_lines(style, bg_style));
     }
 
-    chunks.reverse();
-    chunks.into_iter().flatten().collect()
+    result
 }
 
 /// Collect complete lyric blocks after the current index (for max_visible_lines mode).
@@ -531,16 +501,13 @@ fn split_words_into_lines<'b>(
 
     for &w in words {
         let wlen = w.text.as_str().width();
-        let space_len = if current.is_empty() {
-            0
+        let add_space = if let Some(prev) = current.last() {
+            should_add_space_between(&prev.text, &w.text)
         } else {
-            let prev = current.last().unwrap();
-            if should_add_space_between(&prev.text, &w.text) {
-                1
-            } else {
-                0
-            }
+            false
         };
+        let space_len = if add_space { 1 } else { 0 };
+
         let candidate = if current.is_empty() {
             wlen
         } else {
@@ -555,10 +522,8 @@ fn split_words_into_lines<'b>(
             current.push(w);
             cur_len = wlen;
         } else {
-            let prev = current.last().unwrap();
-            let add_space = should_add_space_between(&prev.text, &w.text);
             current.push(w);
-            cur_len += (if add_space { 1 } else { 0 }) + wlen;
+            cur_len += space_len + wlen;
         }
     }
 
@@ -612,17 +577,8 @@ pub fn gather_visible_lines<'a>(
         None => Vec::new(),
     };
 
-    // Calculate available height considering max_visible_lines
-    let available_height = if let Some(max) = max_visible_lines {
-        // max_visible_lines is in terms of lyric blocks, not wrapped screen lines
-        // We need to limit the total number of blocks (before + current + after)
-        h.min(max)
-    } else {
-        h
-    };
-
-    // If current block fills the available space, no context needed
-    if current_height >= available_height {
+    // If current block fills or exceeds available terminal height, no context can fit
+    if current_height >= h {
         return VisibleLines {
             before: Vec::new(),
             current: current_spans,
@@ -632,17 +588,32 @@ pub fn gather_visible_lines<'a>(
 
     // Calculate context lines for max_visible_lines
     let (lines_before, lines_after) = if let Some(max) = max_visible_lines {
-        // Limit to max blocks total
-        let context_blocks = max.saturating_sub(1); // -1 for current block
-        let before_blocks = context_blocks / 2;
-        let after_blocks = context_blocks - before_blocks;
+        // Limit to available context blocks constrained by max_visible_lines and remaining screen rows
+        let max_context_blocks = max.saturating_sub(1);
+        let total_context = max_context_blocks.min(h.saturating_sub(current_height));
+        let ideal_before = total_context / 2;
+        let ideal_after = total_context - ideal_before;
 
-        // Count how many wrapped lines each block would contribute
-        // For simplicity, we'll use a heuristic approach
+        let available_before = effective_index;
+        let available_after = wrapped_blocks.len().saturating_sub(effective_index + 1);
+
+        // Dynamically rebalance context if either side is starved at boundaries (e.g. at track start or end)
+        let (before_blocks, after_blocks) = if available_before < ideal_before {
+            let deficit = ideal_before - available_before;
+            let after = (ideal_after + deficit).min(available_after);
+            (available_before, after)
+        } else if available_after < ideal_after {
+            let deficit = ideal_after - available_after;
+            let before = (ideal_before + deficit).min(available_before);
+            (before, available_after)
+        } else {
+            (ideal_before, ideal_after)
+        };
+
         (before_blocks, after_blocks)
     } else {
-        // Original behavior: fill screen with wrapped lines
-        let context_lines = available_height.saturating_sub(current_height);
+        // Unlimited blocks: fill available screen height with wrapped lines
+        let context_lines = h.saturating_sub(current_height);
         let lines_before = context_lines / 2;
         let lines_after = context_lines - lines_before;
         (lines_before, lines_after)
@@ -727,35 +698,9 @@ fn build_current_spans<'a>(
             (styles.after, styles.background_after)
         };
 
-        let mut lines = Vec::new();
-        if current_block.bg_first {
-            for line in &current_block.background {
-                lines.push(Line::from(Span::styled(line.as_str(), bg_style)));
-            }
-            for rom in &current_block.romanized_background {
-                lines.push(Line::from(Span::styled(rom.as_str(), rom_bg_style)));
-            }
-            for line in &current_block.primary {
-                lines.push(Line::from(Span::styled(line.as_str(), style)));
-            }
-            for rom in &current_block.romanized_primary {
-                lines.push(Line::from(Span::styled(rom.as_str(), rom_style)));
-            }
-        } else {
-            for line in &current_block.primary {
-                lines.push(Line::from(Span::styled(line.as_str(), style)));
-            }
-            for rom in &current_block.romanized_primary {
-                lines.push(Line::from(Span::styled(rom.as_str(), rom_style)));
-            }
-            for line in &current_block.background {
-                lines.push(Line::from(Span::styled(line.as_str(), bg_style)));
-            }
-            for rom in &current_block.romanized_background {
-                lines.push(Line::from(Span::styled(rom.as_str(), rom_bg_style)));
-            }
-        }
-        lines
+        current_block
+            .styled_lines_with_rom(style, bg_style, rom_style, rom_bg_style)
+            .collect()
     }
 }
 
@@ -960,134 +905,6 @@ pub fn matching_close_paren(c: char) -> Option<char> {
     }
 }
 
-/// Returns the byte ranges within `text` that represent parenthetical background vocals.
-pub fn get_background_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::new();
-    let char_indices: Vec<(usize, char)> = text.char_indices().collect();
-    let mut i = 0;
-
-    while i < char_indices.len() {
-        let (byte_pos, ch) = char_indices[i];
-        if is_open_paren(ch) {
-            let target_close = matching_close_paren(ch).unwrap_or(')');
-            let mut depth = 1;
-            let mut j = i + 1;
-            let mut close_info = None;
-            while j < char_indices.len() {
-                let (c_byte, c_ch) = char_indices[j];
-                if c_ch == ch {
-                    depth += 1;
-                } else if c_ch == target_close {
-                    depth -= 1;
-                    if depth == 0 {
-                        close_info = Some((c_byte, c_ch.len_utf8(), j));
-                        break;
-                    }
-                }
-                j += 1;
-            }
-
-            if let Some((close_byte, close_len, close_j)) = close_info {
-                ranges.push(byte_pos..close_byte + close_len);
-                i = close_j + 1;
-            } else {
-                ranges.push(byte_pos..text.len());
-                break;
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    ranges
-}
-
-/// Wraps text into lines where each line is composed of `InlineSegment`s,
-/// distinguishing lead vocals from parenthetical background vocals.
-pub fn wrap_inline_segments(text: &str, width: usize) -> Vec<Vec<InlineSegment>> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Vec::new();
-    }
-
-    let bg_ranges = get_background_ranges(text);
-    let wrapped_lines = wrap_text(text, width);
-
-    if bg_ranges.is_empty() {
-        return wrapped_lines
-            .into_iter()
-            .map(|line| {
-                vec![InlineSegment {
-                    text: line,
-                    is_background: false,
-                }]
-            })
-            .collect();
-    }
-
-    let is_byte_bg = |byte_idx: usize| -> bool { bg_ranges.iter().any(|r| r.contains(&byte_idx)) };
-
-    let mut result = Vec::new();
-    let mut search_byte = 0;
-
-    for line in wrapped_lines {
-        let mut segments: Vec<InlineSegment> = Vec::new();
-        let mut cur_seg_text = String::new();
-        let mut cur_seg_is_bg = None;
-
-        for ch in line.chars() {
-            let ch_len = ch.len_utf8();
-            let mut found_byte = search_byte;
-            while found_byte < text.len() {
-                if text[found_byte..].starts_with(ch) {
-                    break;
-                }
-                found_byte += text[found_byte..]
-                    .chars()
-                    .next()
-                    .map(|c| c.len_utf8())
-                    .unwrap_or(1);
-            }
-
-            let ch_is_bg = if found_byte < text.len() {
-                search_byte = found_byte + ch_len;
-                is_byte_bg(found_byte)
-            } else {
-                false
-            };
-
-            match cur_seg_is_bg {
-                Some(is_bg) if is_bg == ch_is_bg => {
-                    cur_seg_text.push(ch);
-                }
-                Some(is_bg) => {
-                    segments.push(InlineSegment {
-                        text: std::mem::take(&mut cur_seg_text),
-                        is_background: is_bg,
-                    });
-                    cur_seg_text.push(ch);
-                    cur_seg_is_bg = Some(ch_is_bg);
-                }
-                None => {
-                    cur_seg_text.push(ch);
-                    cur_seg_is_bg = Some(ch_is_bg);
-                }
-            }
-        }
-
-        if !cur_seg_text.is_empty() {
-            segments.push(InlineSegment {
-                text: cur_seg_text,
-                is_background: cur_seg_is_bg.unwrap_or(false),
-            });
-        }
-
-        result.push(segments);
-    }
-
-    result
-}
-
 /// Partitions word timings into main vocal words and background vocal words based on parentheses.
 /// Supports ASCII `()` `[]` and CJK `（）` `【】` `「」`.
 pub fn split_words_main_and_background(
@@ -1213,18 +1030,36 @@ pub fn split_line_main_and_background(text: &str) -> (Option<String>, Option<Str
     } else {
         let mut stitched = String::new();
         for part in main_parts {
-            if stitched.is_empty()
-                || part.starts_with(',')
-                || part.starts_with('.')
-                || part.starts_with(';')
-                || part.starts_with(':')
-                || part.starts_with('!')
-                || part.starts_with('?')
-            {
+            if stitched.is_empty() {
                 stitched.push_str(part);
             } else {
-                stitched.push(' ');
-                stitched.push_str(part);
+                let first_ch = part.chars().next().unwrap();
+                let is_leading_punct = matches!(
+                    first_ch,
+                    ',' | '.'
+                        | ';'
+                        | ':'
+                        | '!'
+                        | '?'
+                        | '，'
+                        | '。'
+                        | '！'
+                        | '？'
+                        | '；'
+                        | '：'
+                        | '、'
+                        | ')'
+                        | '）'
+                        | ']'
+                        | '】'
+                        | '」'
+                );
+                if is_leading_punct || !should_add_space_between(&stitched, part) {
+                    stitched.push_str(part);
+                } else {
+                    stitched.push(' ');
+                    stitched.push_str(part);
+                }
             }
         }
         let trimmed_main = stitched.trim();
@@ -1255,14 +1090,6 @@ mod tests {
             background: Vec::new(),
             romanized_primary: vec!["konnichiwa".to_string()],
             romanized_background: Vec::new(),
-            inline_lines: vec![vec![InlineSegment {
-                text: "こんにちは".to_string(),
-                is_background: false,
-            }]],
-            inline_romanized: vec![vec![InlineSegment {
-                text: "konnichiwa".to_string(),
-                is_background: false,
-            }]],
             bg_first: false,
         };
 
@@ -1310,6 +1137,24 @@ mod tests {
         let (main, bg) = split_line_main_and_background("（今夜だけ）");
         assert_eq!(main, None);
         assert_eq!(bg.as_deref(), Some("（今夜だけ）"));
+    }
+
+    #[test]
+    fn test_split_line_cjk_punctuation_no_extra_space() {
+        // CJK full stop after parenthetical background vocal
+        let (main, bg) = split_line_main_and_background("夜空に光る（星のように）。");
+        assert_eq!(main.as_deref(), Some("夜空に光る。"));
+        assert_eq!(bg.as_deref(), Some("（星のように）"));
+
+        // CJK comma between parts
+        let (main, bg) = split_line_main_and_background("光る（星）、そして月");
+        assert_eq!(main.as_deref(), Some("光る、そして月"));
+        assert_eq!(bg.as_deref(), Some("（星）"));
+
+        // Adjacent CJK characters without punctuation
+        let (main, bg) = split_line_main_and_background("夜空（星）光る");
+        assert_eq!(main.as_deref(), Some("夜空光る"));
+        assert_eq!(bg.as_deref(), Some("（星）"));
     }
 
     #[test]
@@ -1363,40 +1208,38 @@ mod tests {
     }
 
     #[test]
-    fn test_wrap_inline_segments_and_styled_lines_inline() {
-        let text = "'Cause all I need (all I need is love) is a beat";
-        let segments = wrap_inline_segments(text, 80);
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].len(), 3);
-        assert_eq!(segments[0][0].text, "'Cause all I need ");
-        assert!(!segments[0][0].is_background);
-        assert_eq!(segments[0][1].text, "(all I need is love)");
-        assert!(segments[0][1].is_background);
-        assert_eq!(segments[0][2].text, " is a beat");
-        assert!(!segments[0][2].is_background);
-
-        let block = WrappedBlock {
-            primary: vec!["'Cause all I need is a beat".to_string()],
-            background: vec!["(all I need is love)".to_string()],
-            romanized_primary: Vec::new(),
-            romanized_background: Vec::new(),
-            inline_lines: segments,
-            inline_romanized: Vec::new(),
-            bg_first: false,
+    fn test_determine_background_first_zero_alloc() {
+        let lead_word = crate::lyrics::types::WordTiming {
+            start: 1.0,
+            end: 2.0,
+            text: "Hello".to_string(),
+            grapheme_boundaries: vec![0, 5],
+            grapheme_times: vec![],
         };
-
-        let styles = LyricStyles::default();
-        let rendered: Vec<Line> = block
-            .styled_lines_inline(styles.after, styles.background_after)
-            .collect();
-        assert_eq!(rendered.len(), 1);
-        assert_eq!(rendered[0].spans.len(), 3);
-        assert_eq!(rendered[0].spans[0].content, "'Cause all I need ");
-        assert_eq!(rendered[0].spans[0].style, styles.after);
-        assert_eq!(rendered[0].spans[1].content, "(all I need is love)");
-        assert_eq!(rendered[0].spans[1].style, styles.background_after);
-        assert_eq!(rendered[0].spans[2].content, " is a beat");
-        assert_eq!(rendered[0].spans[2].style, styles.after);
+        let bg_word = crate::lyrics::types::WordTiming {
+            start: 0.5,
+            end: 1.5,
+            text: "(harmony)".to_string(),
+            grapheme_boundaries: vec![0, 9],
+            grapheme_times: vec![],
+        };
+        // Background starts earlier: 0.5 < 1.0
+        assert!(determine_background_first(
+            "Hello (harmony)",
+            Some(&[lead_word.clone(), bg_word.clone()])
+        ));
+        // Reverse order timestamps: lead starts earlier: 0.2 < 0.5
+        let lead_earlier = crate::lyrics::types::WordTiming {
+            start: 0.2,
+            end: 1.0,
+            text: "Hello".to_string(),
+            grapheme_boundaries: vec![0, 5],
+            grapheme_times: vec![],
+        };
+        assert!(!determine_background_first(
+            "Hello (harmony)",
+            Some(&[lead_earlier, bg_word])
+        ));
     }
 
     #[test]
@@ -1672,8 +1515,6 @@ mod tests {
             background: vec!["(Backing vocal harmony)".to_string()],
             romanized_primary: Vec::new(),
             romanized_background: Vec::new(),
-            inline_lines: Vec::new(),
-            inline_romanized: Vec::new(),
             bg_first: false,
         };
 
@@ -1743,8 +1584,6 @@ mod tests {
             background: vec!["(Look out for yourself)".to_string()],
             romanized_primary: Vec::new(),
             romanized_background: Vec::new(),
-            inline_lines: Vec::new(),
-            inline_romanized: Vec::new(),
             bg_first: true,
         };
 
@@ -1778,5 +1617,117 @@ mod tests {
         // Second line is lead vocal, not yet reached (dim)
         assert_eq!(spans[1].spans[0].content, "ready");
         assert_eq!(spans[1].spans[0].style, styles.after);
+    }
+
+    #[test]
+    fn test_gather_visible_lines_max_visible_lines_boundary_rebalancing() {
+        let styles = LyricStyles::default();
+        let lines: Vec<crate::lyrics::LyricLine> = (0..10)
+            .map(|i| crate::lyrics::LyricLine::new(i as f64 * 5.0, format!("Line {i}")))
+            .collect();
+        let blocks: Vec<WrappedBlock> = lines
+            .iter()
+            .map(|l| WrappedBlock {
+                primary: vec![l.text.clone()],
+                background: Vec::new(),
+                romanized_primary: Vec::new(),
+                romanized_background: Vec::new(),
+                bg_first: false,
+            })
+            .collect();
+
+        // 1. At start of track (index 0): rebalances to 0 before, 1 current, 3 after = 4 lines
+        let mut update = Update {
+            lines: std::sync::Arc::new(lines.clone()),
+            index: Some(0),
+            position: 0.0,
+            playing: true,
+            ..Default::default()
+        };
+        let visible =
+            gather_visible_lines(&update, &blocks, 80, 24, &styles, 0.0, false, Some(4), 0);
+        let total = visible.before.len() + visible.current.len() + visible.after.len();
+        assert_eq!(total, 4);
+        assert_eq!(visible.before.len(), 0);
+        assert_eq!(visible.current.len(), 1);
+        assert_eq!(visible.after.len(), 3);
+
+        // 2. In middle of track (index 2): 1 before, 1 current, 2 after = 4 lines
+        update.index = Some(2);
+        update.position = 10.0;
+        let visible =
+            gather_visible_lines(&update, &blocks, 80, 24, &styles, 10.0, false, Some(4), 0);
+        let total = visible.before.len() + visible.current.len() + visible.after.len();
+        assert_eq!(total, 4);
+        assert_eq!(visible.before.len(), 1);
+        assert_eq!(visible.current.len(), 1);
+        assert_eq!(visible.after.len(), 2);
+
+        // 3. Near end of track (index 8 = second to last): 2 before, 1 current, 1 after = 4 lines
+        update.index = Some(8);
+        update.position = 40.0;
+        let visible =
+            gather_visible_lines(&update, &blocks, 80, 24, &styles, 40.0, false, Some(4), 0);
+        let total = visible.before.len() + visible.current.len() + visible.after.len();
+        assert_eq!(total, 4);
+        assert_eq!(visible.before.len(), 2);
+        assert_eq!(visible.current.len(), 1);
+        assert_eq!(visible.after.len(), 1);
+
+        // 4. At very last line (index 9): 3 before, 1 current, 0 after = 4 lines
+        update.index = Some(9);
+        update.position = 45.0;
+        let visible =
+            gather_visible_lines(&update, &blocks, 80, 24, &styles, 45.0, false, Some(4), 0);
+        let total = visible.before.len() + visible.current.len() + visible.after.len();
+        assert_eq!(total, 4);
+        assert_eq!(visible.before.len(), 3);
+        assert_eq!(visible.current.len(), 1);
+        assert_eq!(visible.after.len(), 0);
+    }
+
+    #[test]
+    fn test_gather_visible_lines_multiline_block_with_max_visible_lines() {
+        let styles = LyricStyles::default();
+        // Create 5 blocks, where block 2 has 3 lines (e.g. wrapped primary + background + romanized)
+        let mut blocks: Vec<WrappedBlock> = (0..5)
+            .map(|i| WrappedBlock {
+                primary: vec![format!("Line {i}")],
+                background: Vec::new(),
+                romanized_primary: Vec::new(),
+                romanized_background: Vec::new(),
+                bg_first: false,
+            })
+            .collect();
+
+        blocks[2] = WrappedBlock {
+            primary: vec!["Line 2 part 1".to_string(), "Line 2 part 2".to_string()],
+            background: vec!["(Backing)".to_string()],
+            romanized_primary: Vec::new(),
+            romanized_background: Vec::new(),
+            bg_first: false,
+        };
+        assert_eq!(blocks[2].len(), 3); // 3 screen lines tall
+
+        let lines: Vec<crate::lyrics::LyricLine> = (0..5)
+            .map(|i| crate::lyrics::LyricLine::new(i as f64 * 5.0, format!("Line {i}")))
+            .collect();
+
+        let update = Update {
+            lines: std::sync::Arc::new(lines),
+            index: Some(2),
+            position: 10.0,
+            playing: true,
+            ..Default::default()
+        };
+
+        // On a 30-line terminal with max_visible_lines = Some(3),
+        // previously current_height (3) >= available_height (3) incorrectly suppressed all context!
+        // Now it must show 1 block before, 1 current block (3 lines), and 1 block after!
+        let visible =
+            gather_visible_lines(&update, &blocks, 80, 30, &styles, 10.0, false, Some(3), 0);
+        assert_eq!(visible.before.len(), 1);
+        assert_eq!(visible.current.len(), 3);
+        assert_eq!(visible.after.len(), 1);
     }
 }
