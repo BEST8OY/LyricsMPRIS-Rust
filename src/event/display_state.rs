@@ -238,7 +238,6 @@ mod tests {
             lyrics: make_lyrics("Genius", 0, "Plain line"),
             match_score: 95,
             is_blind: false,
-            video_id_keyed: false,
         };
         assert!(!strict.accept(plain.clone(), 0, true));
         assert!(strict.candidates.is_empty());
@@ -257,7 +256,6 @@ mod tests {
             lyrics: make_lyrics("LRCLIB", 1, "Synced line"),
             match_score: 90,
             is_blind: false,
-            video_id_keyed: false,
         };
         assert!(!state.accept(line_cand, 0, true));
         // Held while < 800ms elapsed
@@ -273,7 +271,6 @@ mod tests {
             lyrics: make_lyrics("Apple Music", 2, "Word line"),
             match_score: 95,
             is_blind: false,
-            video_id_keyed: false,
         };
         assert!(state.accept(word_cand, 0, true));
         let upgraded = state
@@ -292,7 +289,6 @@ mod tests {
                 lyrics: dup.clone(),
                 match_score: 85,
                 is_blind: false,
-                video_id_keyed: false,
             },
             0,
             true,
@@ -302,7 +298,6 @@ mod tests {
                 lyrics: dup,
                 match_score: 85,
                 is_blind: false,
-                video_id_keyed: false,
             },
             0,
             true,
@@ -312,7 +307,6 @@ mod tests {
                 lyrics: word,
                 match_score: 90,
                 is_blind: false,
-                video_id_keyed: false,
             },
             0,
             true,

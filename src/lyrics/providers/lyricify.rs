@@ -275,7 +275,6 @@ impl LyricsProvider for LyricifyProvider {
                     lyrics,
                     match_score: v.score,
                     is_blind: true,
-                    video_id_keyed: false,
                 }]);
             }
 

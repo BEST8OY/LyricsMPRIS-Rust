@@ -26,7 +26,7 @@ pub mod ytmusic;
 
 use crate::config::RuntimeSettings;
 use crate::lyrics::types::{Lyrics, LyricsError, TrackInfo, TrackMatchInfo, http_client};
-use crate::text_utils::{normalize_for_match, to_simplified_chinese};
+use crate::text_utils::normalize_for_match;
 use regex::Regex;
 use reqwest::Client;
 use std::collections::HashSet;
@@ -36,8 +36,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const CHROME_DESKTOP_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36";
-#[allow(dead_code)]
-pub const MORPHE_UA: &str = "LyricsMPRIS/3.0 https://github.com/best8oy/LyricsMPRIS-Rust";
 pub const ITUNES_SEARCH_URL: &str = "https://itunes.apple.com/search";
 
 pub const SOFT_MIN: i32 = 2;
@@ -78,8 +76,6 @@ pub struct FetchedCandidate {
     pub lyrics: Lyrics,
     pub match_score: i32,
     pub is_blind: bool,
-    #[allow(dead_code)]
-    pub video_id_keyed: bool,
 }
 
 impl FetchedCandidate {
@@ -104,7 +100,6 @@ impl FetchedCandidate {
             lyrics,
             match_score: verdict.score,
             is_blind: false,
-            video_id_keyed: false,
         })
     }
 
@@ -116,7 +111,6 @@ impl FetchedCandidate {
             lyrics,
             match_score: NEUTRAL,
             is_blind: true,
-            video_id_keyed: false,
         })
     }
 
@@ -128,7 +122,6 @@ impl FetchedCandidate {
             lyrics,
             match_score: VIDEO_ID_TRUST,
             is_blind: false,
-            video_id_keyed: true,
         })
     }
 }
@@ -481,11 +474,6 @@ fn jaccard(a: &str, b: &str) -> f64 {
     } else {
         inter as f64 / union as f64
     }
-}
-
-#[allow(dead_code)]
-pub fn normalize_simplified_for_match(s: &str) -> String {
-    to_simplified_chinese(&s.to_lowercase())
 }
 
 #[cfg(test)]

@@ -657,7 +657,6 @@ impl LyricsProvider for SpotifyProvider {
                         lyrics,
                         match_score: v.score,
                         is_blind: true,
-                        video_id_keyed: false,
                     }]);
                 }
                 return Ok(Vec::new());

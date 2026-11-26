@@ -241,7 +241,6 @@ pub(crate) fn score_musixmatch_candidate(
         match_score: base_score + lyrics.sync_rank(),
         lyrics,
         is_blind: false,
-        video_id_keyed: false,
     })
 }
 

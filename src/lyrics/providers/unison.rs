@@ -151,7 +151,6 @@ impl LyricsProvider for UnisonProvider {
                             match_score: VIDEO_ID_TRUST,
                             lyrics: l,
                             is_blind: false,
-                            video_id_keyed: true,
                         });
                     }
                 }
@@ -293,7 +292,6 @@ impl LyricsProvider for UnisonProvider {
                         lyrics,
                         match_score: score.max(0),
                         is_blind: false,
-                        video_id_keyed: false,
                     });
                 }
             }

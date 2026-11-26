@@ -432,7 +432,6 @@ impl LyricsProvider for LRCRedProvider {
                         lyrics,
                         match_score: score,
                         is_blind: false,
-                        video_id_keyed: false,
                     }]);
                 }
             }
@@ -466,7 +465,6 @@ impl LyricsProvider for LRCRedProvider {
                     lyrics,
                     match_score: score.max(0),
                     is_blind: false,
-                    video_id_keyed: false,
                 });
             }
             out.sort_by_key(|a| std::cmp::Reverse(a.match_score));

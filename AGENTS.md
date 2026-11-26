@@ -60,10 +60,9 @@ src/ui/ (modern.rs Ratatui TUI or pipe.rs stdout)
   - Tier 3: Auto-purges invalid tokens on 401/402/403/429 responses, requests a fresh token, and retries once transparently.
   - Rate Limiting: 500ms Morphe request pacing per API call (no 10-minute cooldown lockout); expired Tier-1 tokens (`401` with `hint: renew`) are pruned for the session. Disk token cached at `~/.cache/lyricsmpris/musixmatch_token.json`.
   - Query Fallback Pipeline:
-    1. Direct `macro.subtitles.get` combining metadata and track IDs (ISRC, Spotify ID).
-    2. Pure metadata fallback (dropping IDs if ID lookup returns `TrackNotFound`).
-    3. Cleaned title fallback (stripping feat/remaster annotations via `clean_title_annotations`).
-    4. Candidate search (`track.search` via `search_and_fetch_best_candidate`).
+    1. Direct `macro.subtitles.get` combining metadata and track IDs (ISRC, Spotify ID), validated against target metadata.
+    2. Pure metadata fallback (dropping IDs if ID lookup misses or mismatches).
+    3. Candidate search (`track.search` via `search_and_fetch_best_candidate`).
   - Candidate Selection Rules (`select_best_candidate_track_id`):
     - Must have `has_richsync`, `has_subtitles`, `has_lyrics`, or `instrumental`.
     - Version tag parity (`VERSION_RE`): studio tracks will not match candidates with live, acoustic, remix, mix, demo, or rehearsal annotations.

@@ -6,8 +6,8 @@ use crate::lyrics::providers::{FetchedCandidate, LyricsProvider, ProviderContext
 use crate::lyrics::types::{Lyrics, LyricsError, TrackInfo, TrackMatchInfo, is_retryable_status};
 use crate::mpris::TrackMetadata;
 use crate::text_utils::{
-    any_dash_split, any_dash_split_reversed, clean_title_annotations, script_variants,
-    split_artists, trusted_dash_split,
+    any_dash_split, any_dash_split_reversed, apply_decoration_regex_preserve_original,
+    parse_clean_title_and_artist, script_variants, split_artists, trusted_dash_split,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -80,7 +80,23 @@ struct VariantQuery {
     penalty: i32,
 }
 
-fn build_query_tiers(track: &TrackInfo) -> (Vec<VariantQuery>, Vec<VariantQuery>) {
+fn build_split_track(
+    title: &str,
+    artist: &str,
+    album: &str,
+    duration_secs: i64,
+    custom_regex: Option<&regex::Regex>,
+) -> TrackInfo {
+    let (clean_t, clean_a) = parse_clean_title_and_artist(title, artist, custom_regex);
+    TrackInfo::new(clean_t, clean_a, album, duration_secs)
+}
+
+fn build_query_tiers(
+    track: &TrackInfo,
+    raw_title: &str,
+    raw_artist: &str,
+    custom_regex: Option<&regex::Regex>,
+) -> (Vec<VariantQuery>, Vec<VariantQuery>) {
     let mut original_tier = Vec::new();
     let mut derived_tier = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
@@ -94,18 +110,14 @@ fn build_query_tiers(track: &TrackInfo) -> (Vec<VariantQuery>, Vec<VariantQuery>
 
     push_unique(&mut original_tier, track.clone(), 0);
 
-    // Strip featuring/remaster noise if title changes meaningfully.
-    if let Some(cleaned_title) = clean_title_annotations(&track.title)
-        && !cleaned_title.is_empty()
-        && cleaned_title != track.title
-    {
-        let mut ct = track.clone();
-        ct.title = cleaned_title;
-        push_unique(&mut original_tier, ct, 1);
-    }
-
-    if let Some((t_artist, t_title)) = trusted_dash_split(&track.title, &track.artist) {
-        let trusted = TrackInfo::new(t_title, t_artist, track.album.clone(), track.duration_secs);
+    if let Some((t_title, t_artist)) = trusted_dash_split(raw_title, raw_artist) {
+        let trusted = build_split_track(
+            &t_title,
+            &t_artist,
+            &track.album,
+            track.duration_secs,
+            custom_regex,
+        );
         push_unique(&mut original_tier, trusted, 1);
     }
 
@@ -127,12 +139,13 @@ fn build_query_tiers(track: &TrackInfo) -> (Vec<VariantQuery>, Vec<VariantQuery>
         }
     }
 
-    // Derived split multi-artist queries
-    for artist in split_artists(&track.artist) {
-        if artist != track.artist {
+    // Derived split multi-artist queries (split from raw_artist so clean_artist truncation doesn't hide collaborators)
+    for artist in split_artists(raw_artist) {
+        let clean_part = apply_decoration_regex_preserve_original(&artist, custom_regex);
+        if !clean_part.is_empty() && clean_part != track.artist {
             let v = TrackInfo::new(
                 track.title.clone(),
-                artist,
+                clean_part,
                 track.album.clone(),
                 track.duration_secs,
             );
@@ -140,13 +153,25 @@ fn build_query_tiers(track: &TrackInfo) -> (Vec<VariantQuery>, Vec<VariantQuery>
         }
     }
 
-    // Derived dash splits (any-dash & reversed)
-    if let Some((a, t)) = any_dash_split(&track.title) {
-        let v = TrackInfo::new(t, a, track.album.clone(), track.duration_secs);
+    // Derived dash splits (any-dash & reversed) run on raw_title
+    if let Some((t_title, t_artist)) = any_dash_split(raw_title) {
+        let v = build_split_track(
+            &t_title,
+            &t_artist,
+            &track.album,
+            track.duration_secs,
+            custom_regex,
+        );
         push_unique(&mut derived_tier, v, 2);
     }
-    if let Some((a, t)) = any_dash_split_reversed(&track.title) {
-        let v = TrackInfo::new(t, a, track.album.clone(), track.duration_secs);
+    if let Some((t_title, t_artist)) = any_dash_split_reversed(raw_title) {
+        let v = build_split_track(
+            &t_title,
+            &t_artist,
+            &track.album,
+            track.duration_secs,
+            custom_regex,
+        );
         push_unique(&mut derived_tier, v, 2);
     }
 
@@ -361,7 +386,7 @@ pub fn spawn_fetch(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let ctx = Arc::new(ProviderContext::from_settings(settings));
-        let track = TrackInfo::from_metadata(&meta);
+        let track = TrackInfo::cleaned_from_metadata(&meta, ctx.custom_regex.as_ref());
         let ids = Arc::new(build_ids(&meta));
 
         let mut active_providers: Vec<Arc<dyn LyricsProvider>> = Vec::new();
@@ -389,7 +414,8 @@ pub fn spawn_fetch(
             return;
         }
 
-        let (original_tier, derived_tier) = build_query_tiers(&track);
+        let (original_tier, derived_tier) =
+            build_query_tiers(&track, &meta.title, &meta.artist, ctx.custom_regex.as_ref());
         let (blind, non_blind): (Vec<_>, Vec<_>) =
             active_providers.into_iter().partition(|p| p.is_blind());
 
@@ -688,15 +714,27 @@ mod tests {
 
     #[test]
     fn test_query_tiers_and_cutoff() {
-        let track = TrackInfo::new(
-            "Artist - Track Name (Remastered 2020)",
-            "Artist feat. Guest",
-            "Album",
-            240,
+        let meta = TrackMetadata {
+            title: "Artist - Track Name (Remastered 2020) (Official Video)".into(),
+            artist: "Artist feat. Guest".into(),
+            album: "Album [Official Audio]".into(),
+            length: Some(240.0),
+            ..Default::default()
+        };
+        let track = TrackInfo::cleaned_from_metadata(&meta, None);
+        assert_eq!(track.title, "Artist - Track Name");
+        assert_eq!(track.artist, "Artist");
+        assert_eq!(track.album, "Album");
+
+        let (orig, derived) = build_query_tiers(&track, &meta.title, &meta.artist, None);
+        assert_eq!(orig.len(), 2);
+        assert_eq!(orig[0].track.title, "Artist - Track Name");
+        assert_eq!(orig[1].track.title, "Track Name");
+        assert_eq!(orig[1].track.artist, "Artist");
+        assert!(
+            derived.iter().any(|v| v.track.artist == "Guest"),
+            "Expected collaborator split from raw_artist in derived_tier"
         );
-        let (orig, derived) = build_query_tiers(&track);
-        assert!(!orig.is_empty());
-        assert!(!derived.is_empty());
 
         let mut short_lyrics = Lyrics::new(
             vec![crate::lyrics::types::LyricLine::new(5.0, "Early line").with_end(Some(10.0))],
@@ -725,7 +763,7 @@ mod tests {
     #[test]
     fn test_build_query_tiers_single_side_han() {
         let track = TrackInfo::new("English Title", "周杰倫", "Album", 240);
-        let (_orig, derived) = build_query_tiers(&track);
+        let (_orig, derived) = build_query_tiers(&track, &track.title, &track.artist, None);
         assert!(
             derived
                 .iter()

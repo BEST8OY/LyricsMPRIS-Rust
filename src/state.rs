@@ -82,7 +82,7 @@ impl Provider {
     }
 
     /// Returns the display name of this provider.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn display_name(&self) -> &str {
         match self {
             Self::Lrclib => "LRCLIB",

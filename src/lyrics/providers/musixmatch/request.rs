@@ -279,20 +279,7 @@ pub(crate) async fn fetch_lyrics_with_token_at(
         return Ok(outcome);
     }
 
-    // Step A: If title has annotations (e.g. "(feat. ...)", "[Remaster]"), try macro with clean title
-    if let Some(clean) = clean_title_annotations(&track.title) {
-        let clean_params = build_macro_params(&track.artist, &clean, &track.album, duration, token);
-        let clean_outcome = filter_outcome_for_track(
-            try_macro_for_lyrics(client, api_base, &clean_params).await?,
-            track,
-            custom_regex,
-        );
-        if !matches!(clean_outcome, FetchOutcome::TrackNotFound) {
-            return Ok(clean_outcome);
-        }
-    }
-
-    // Step B: Fallback to track.search to find candidates with duration matching and scoring
+    // Fallback to track.search to find candidates with duration matching and scoring
     if let Some(candidate_outcome) =
         search_and_fetch_best_candidate(client, api_base, token, track, duration, custom_regex)
             .await?
@@ -534,73 +521,64 @@ pub(crate) async fn search_and_fetch_best_candidate(
     duration: Option<f64>,
     custom_regex: Option<&regex::Regex>,
 ) -> Result<Option<FetchOutcome>, LyricsError> {
-    let mut queries = vec![track.title.clone()];
-    if let Some(clean) = clean_title_annotations(&track.title)
-        && clean != track.title
+    let req_id = request_id();
+    let mut search_url = format!(
+        "{api_base}track.search?page_size=10&page=1&s_track_rating=desc&q_artist={}&q_track={}&usertoken={}&format=json&app_id={APP_ID}&t={req_id}",
+        urlencoding::encode(&track.artist),
+        urlencoding::encode(&track.title),
+        urlencoding::encode(token),
+    );
+    if let Some(d) = duration
+        && d > 0.0
     {
-        queries.push(clean);
+        search_url.push_str(&format!("&q_duration={}", d.round() as i64));
     }
 
-    for query_title in queries {
-        let req_id = request_id();
-        let mut search_url = format!(
-            "{api_base}track.search?page_size=10&page=1&s_track_rating=desc&q_artist={}&q_track={}&usertoken={}&format=json&app_id={APP_ID}&t={req_id}",
-            urlencoding::encode(&track.artist),
-            urlencoding::encode(&query_title),
-            urlencoding::encode(token),
-        );
-        if let Some(d) = duration
-            && d > 0.0
-        {
-            search_url.push_str(&format!("&q_duration={}", d.round() as i64));
-        }
+    throttle_request().await;
+    let resp = open_api_get(client, &search_url).send().await?;
 
-        throttle_request().await;
-        let resp = open_api_get(client, &search_url).send().await?;
+    let status = resp.status();
+    if status.is_server_error() {
+        return Err(LyricsError::Http(status.as_u16()));
+    }
 
-        let status = resp.status();
-        if status.is_server_error() {
-            return Err(LyricsError::Http(status.as_u16()));
-        }
+    let json: Option<Value> = resp.json().await.ok();
+    if let Some(outcome) = evaluate_token_outcome(status, json.as_ref()) {
+        return Ok(Some(outcome));
+    }
 
-        let json: Option<Value> = resp.json().await.ok();
-        if let Some(outcome) = evaluate_token_outcome(status, json.as_ref()) {
-            return Ok(Some(outcome));
-        }
+    let Some(track_list) = json
+        .as_ref()
+        .and_then(|j| j.pointer("/message/body/track_list"))
+        .and_then(|v| v.as_array())
+    else {
+        return Ok(None);
+    };
 
-        let Some(json) = json else { continue };
-        let track_list = json
-            .pointer("/message/body/track_list")
-            .and_then(|v| v.as_array());
-
-        let Some(track_list) = track_list else {
-            continue;
-        };
-        for (best_track_id, cand_meta) in
-            ranked_candidate_tracks(track_list, &track.title, &track.album, duration)
-                .into_iter()
-                .take(MAX_CANDIDATES)
-        {
-            let id_params = vec![
-                ("track_id".to_string(), best_track_id.to_string()),
-                ("usertoken".to_string(), token.to_string()),
-            ];
-            let outcome = try_macro_for_lyrics(client, api_base, &id_params).await?;
-            match outcome {
-                FetchOutcome::Success(lines, raw, ids, macro_meta) => {
-                    let meta = macro_meta.or_else(|| {
-                        (!cand_meta.title.is_empty() || !cand_meta.artist.is_empty())
-                            .then_some(cand_meta)
-                    });
-                    let candidate = FetchOutcome::Success(lines, raw, ids, meta);
-                    let checked = filter_outcome_for_track(candidate, track, custom_regex);
-                    if !matches!(checked, FetchOutcome::TrackNotFound) {
-                        return Ok(Some(checked));
-                    }
+    for (best_track_id, cand_meta) in
+        ranked_candidate_tracks(track_list, &track.title, &track.album, duration)
+            .into_iter()
+            .take(MAX_CANDIDATES)
+    {
+        let id_params = vec![
+            ("track_id".to_string(), best_track_id.to_string()),
+            ("usertoken".to_string(), token.to_string()),
+        ];
+        let outcome = try_macro_for_lyrics(client, api_base, &id_params).await?;
+        match outcome {
+            FetchOutcome::Success(lines, raw, ids, macro_meta) => {
+                let meta = macro_meta.or_else(|| {
+                    (!cand_meta.title.is_empty() || !cand_meta.artist.is_empty())
+                        .then_some(cand_meta)
+                });
+                let candidate = FetchOutcome::Success(lines, raw, ids, meta);
+                let checked = filter_outcome_for_track(candidate, track, custom_regex);
+                if !matches!(checked, FetchOutcome::TrackNotFound) {
+                    return Ok(Some(checked));
                 }
-                FetchOutcome::TokenError { .. } => return Ok(Some(outcome)),
-                FetchOutcome::TrackNotFound => continue,
             }
+            FetchOutcome::TokenError { .. } => return Ok(Some(outcome)),
+            FetchOutcome::TrackNotFound => continue,
         }
     }
 

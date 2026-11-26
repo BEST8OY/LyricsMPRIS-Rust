@@ -274,7 +274,6 @@ impl LyricsProvider for SimpMusicProvider {
                         lyrics: l,
                         match_score: VIDEO_ID_TRUST,
                         is_blind: false,
-                        video_id_keyed: true,
                     })
                     .collect();
                 if !out.is_empty() {
@@ -403,7 +402,6 @@ impl LyricsProvider for SimpMusicProvider {
                         lyrics,
                         match_score: score.max(0),
                         is_blind: false,
-                        video_id_keyed: false,
                     });
                 }
             }

@@ -222,7 +222,6 @@ impl LyricsProvider for LrcLibProvider {
                             lyrics,
                             match_score: score,
                             is_blind: false,
-                            video_id_keyed: false,
                         });
                     }
                 }

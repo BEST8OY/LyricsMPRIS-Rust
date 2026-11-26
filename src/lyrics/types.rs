@@ -45,6 +45,25 @@ impl TrackInfo {
             duration_secs: meta.length.map(|l| l.round() as i64).unwrap_or(0),
         }
     }
+
+    /// Builds a query-normalized `TrackInfo` via Morphe's `parseCleanTitleAndArtist` + `cleanAlbum`.
+    pub fn cleaned_from_metadata(
+        meta: &crate::mpris::TrackMetadata,
+        custom_regex: Option<&regex::Regex>,
+    ) -> Self {
+        let (title, artist) = crate::text_utils::parse_clean_title_and_artist(
+            &meta.title,
+            &meta.artist,
+            custom_regex,
+        );
+        let album = crate::text_utils::clean_album(&meta.album, custom_regex);
+        Self {
+            title,
+            artist,
+            album,
+            duration_secs: meta.length.map(|l| l.round() as i64).unwrap_or(0),
+        }
+    }
 }
 
 /// Track identifiers extracted from or provided for a lyrics lookup.
@@ -119,11 +138,6 @@ impl LyricLine {
             let trimmed = id.trim();
             trimmed.eq_ignore_ascii_case("v1000") || trimmed.eq_ignore_ascii_case("v2000")
         })
-    }
-
-    #[allow(dead_code)]
-    pub fn is_centered(&self) -> bool {
-        Self::is_centered_agent_id(self.agent_id.as_deref())
     }
 
     /// Returns the earliest vocal onset timestamp (`first_word.start`, falling back to `self.time`).

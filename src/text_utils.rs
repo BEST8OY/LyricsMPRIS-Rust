@@ -185,18 +185,37 @@ pub fn split_artists(artist: &str) -> Vec<String> {
     out
 }
 
-/// Cleans `(title, artist)` via `MetadataCleaner.parseCleanTitleAndArtist` rules.
-#[allow(dead_code)]
+fn clean_with_fallback(raw: &str, f: impl FnOnce(&str) -> String) -> String {
+    let trimmed = raw.trim();
+    let cleaned = f(trimmed);
+    if cleaned.is_empty() && !trimmed.is_empty() {
+        trimmed.to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// Cleans `(title, artist)` via `MetadataCleaner.parseCleanTitleAndArtist` rules,
+/// falling back to trimmed raw values if cleaning strips the entire string.
 pub fn parse_clean_title_and_artist(
     raw_title: &str,
     raw_artist: &str,
     custom_regex: Option<&Regex>,
 ) -> (String, String) {
-    let title = apply_decoration_regex_preserve_original(raw_title, custom_regex);
-    let title = clean_title_annotations(&title).unwrap_or(title);
-    let artist = apply_decoration_regex_preserve_original(raw_artist, custom_regex);
-    let artist = clean_artist(&artist);
+    let title = clean_with_fallback(raw_title, |raw_t| {
+        let decorated = apply_decoration_regex_preserve_original(raw_t, custom_regex);
+        clean_title_annotations(&decorated).unwrap_or(decorated)
+    });
+    let artist = clean_with_fallback(raw_artist, |raw_a| {
+        let decorated = apply_decoration_regex_preserve_original(raw_a, custom_regex);
+        clean_artist(&decorated)
+    });
     (title, artist)
+}
+
+/// Cleans an album string via `MetadataCleaner.cleanAlbum` rules.
+pub fn clean_album(raw_album: &str, custom_regex: Option<&Regex>) -> String {
+    apply_decoration_regex_preserve_original(raw_album, custom_regex)
 }
 
 /// Checks if `title` has a `"left - right"` dash split where one side matches `raw_artist`.

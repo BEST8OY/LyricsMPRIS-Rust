@@ -575,7 +575,6 @@ impl LyricsProvider for LyricsPlusProvider {
                             lyrics,
                             match_score: score,
                             is_blind: true,
-                            video_id_keyed: false,
                         });
                     }
                 }

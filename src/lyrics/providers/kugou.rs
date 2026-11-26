@@ -254,7 +254,6 @@ impl LyricsProvider for KuGouProvider {
                     lyrics,
                     match_score: score.max(0),
                     is_blind: false,
-                    video_id_keyed: false,
                 });
             }
 

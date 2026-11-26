@@ -5,7 +5,6 @@ use crate::lyrics::providers::{
     BoxFuture, FetchedCandidate, LyricsProvider, PreparedTrack, ProviderContext, throttle_ms,
 };
 use crate::lyrics::types::{LyricsError, TrackInfo, TrackMatchInfo};
-use crate::text_utils::clean_artist;
 use serde_json::Value;
 use std::sync::atomic::AtomicU64;
 
@@ -108,19 +107,9 @@ impl LyricsProvider for AMLLProvider {
             }
 
             let base = base_url(ctx);
-            let cleaned_artist = clean_artist(raw_artist);
-            let artist = if cleaned_artist.is_empty() {
-                raw_artist
-            } else {
-                cleaned_artist.as_str()
-            };
-
             let album = (!track.album.is_empty()).then_some(track.album.as_str());
-            let mut best = search_best(ctx, &base, raw_title, artist, album).await;
+            let mut best = search_best(ctx, &base, raw_title, raw_artist, album).await;
             if best.is_none() && album.is_some() {
-                best = search_best(ctx, &base, raw_title, artist, None).await;
-            }
-            if best.is_none() && !artist.eq_ignore_ascii_case(raw_artist) {
                 best = search_best(ctx, &base, raw_title, raw_artist, None).await;
             }
 
@@ -192,7 +181,6 @@ impl LyricsProvider for AMLLProvider {
                     lyrics,
                     match_score: verdict.score,
                     is_blind: true,
-                    video_id_keyed: false,
                 }]);
             }
 
