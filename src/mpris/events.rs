@@ -2,14 +2,15 @@
 
 use crate::mpris::connection::{MprisError, find_best_active_service, get_dbus_conn};
 use crate::mpris::metadata::{TrackMetadata, extract_metadata};
+use crate::mpris::playback::get_position_from_proxy;
 use crate::mpris::proxies::{MediaPlayer2PlayerProxy, PlayerctldProxy};
 use futures_util::StreamExt;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::time::Duration;
-use zbus::{MatchRule, MessageStream};
-use zvariant::OwnedValue;
+use zbus::{MatchRule, MessageStream, OwnedVariant, Variant};
 
 /// Tuning constants for transient buffering position calibration.
 pub const CALIBRATION_INITIAL_DELAY: Duration = Duration::from_millis(50);
@@ -130,6 +131,10 @@ impl CalibrationTracker {
     }
 }
 
+fn should_calibrate_track(playback_status: &str, is_local: bool) -> bool {
+    playback_status == "Playing" && !is_local
+}
+
 /// Callback trait for MPRIS events
 pub trait MprisEventCallback: Send + 'static {
     fn on_track_change(
@@ -153,6 +158,7 @@ pub trait MprisEventCallback: Send + 'static {
         position: f64,
         sampled_at: std::time::Instant,
     );
+    fn on_rate_change(&mut self, position: f64, rate: f64, sampled_at: std::time::Instant);
 }
 
 impl MprisEventCallback for tokio::sync::mpsc::Sender<crate::event::Event> {
@@ -201,6 +207,16 @@ impl MprisEventCallback for tokio::sync::mpsc::Sender<crate::event::Event> {
             sampled_at,
         }) {
             tracing::warn!(error = %e, "Failed to send Calibrated event to event loop channel");
+        }
+    }
+
+    fn on_rate_change(&mut self, position: f64, rate: f64, sampled_at: std::time::Instant) {
+        if let Err(e) = self.try_send(crate::event::Event::RateChange {
+            position,
+            rate,
+            sampled_at,
+        }) {
+            tracing::warn!(error = %e, "Failed to send RateChange event to event loop channel");
         }
     }
 }
@@ -261,24 +277,26 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
         // Subscribe to standard D-Bus daemon NameOwnerChanged signals filtered by MPRIS namespace at broker level
         let mpris_name_rule = MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
-            .interface("org.freedesktop.DBus")?
-            .member("NameOwnerChanged")?
-            .arg0ns("org.mpris.MediaPlayer2")?
-            .build();
+            .interface("org.freedesktop.DBus")
+            .member("NameOwnerChanged")
+            .arg0ns("org.mpris.MediaPlayer2")
+            .build()?;
         let mut name_owner_stream =
-            MessageStream::for_match_rule(mpris_name_rule, &self.conn, None).await?;
+            MessageStream::for_match_rule(mpris_name_rule, &self.conn, NonZeroUsize::new(64))
+                .await?;
         tracing::debug!("Subscribed to broker-level MPRIS NameOwnerChanged signals");
 
         // Broker-level match rule for PropertiesChanged on /org/mpris/MediaPlayer2
         let mpris_prop_rule = MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
-            .interface("org.freedesktop.DBus.Properties")?
-            .member("PropertiesChanged")?
-            .path("/org/mpris/MediaPlayer2")?
-            .arg(0, "org.mpris.MediaPlayer2.Player")?
-            .build();
+            .interface("org.freedesktop.DBus.Properties")
+            .member("PropertiesChanged")
+            .path("/org/mpris/MediaPlayer2")
+            .arg(0, "org.mpris.MediaPlayer2.Player")
+            .build()?;
         let mut global_prop_stream =
-            MessageStream::for_match_rule(mpris_prop_rule, &self.conn, None).await?;
+            MessageStream::for_match_rule(mpris_prop_rule, &self.conn, NonZeroUsize::new(64))
+                .await?;
         tracing::debug!("Subscribed to broker-level MPRIS PropertiesChanged signals");
 
         // Main event processing loop
@@ -314,7 +332,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
         tracing::debug!(service = %service, "Subscribing to player events");
 
         let proxy = MediaPlayer2PlayerProxy::builder(&self.conn)
-            .destination(service.as_str())?
+            .destination(service.as_str())
             .build()
             .await?;
 
@@ -334,6 +352,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
         let mut seeked_stream = proxy.receive_seeked().await?;
         let mut metadata_stream = proxy.receive_metadata_changed().await;
         let mut status_stream = proxy.receive_playback_status_changed().await;
+        let mut rate_stream = proxy.receive_rate_changed().await;
 
         // Subscribe to playerctld if available (checking ownership to prevent autostart)
         let playerctld_proxy = if dbus_proxy
@@ -357,17 +376,15 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
         let _ = self.handle_status_change(&proxy).await;
         let _ = self.handle_metadata_change(&proxy).await;
 
-        let mut tracker =
-            CalibrationTracker::new(self.state.playback_status == "Playing", self.state.position);
+        let mut tracker = CalibrationTracker::new(self.should_calibrate(), self.state.position);
 
         loop {
             tokio::select! {
                 // 0. Transient post-buffering position calibration for streaming players (e.g. Spotify)
                 _ = tracker.tick() => {
-                    if self.state.playback_status == "Playing" && self.state.is_active() {
-                        match proxy.position().await {
-                            Ok(microsecs) => {
-                                let real_pos = microsecs as f64 / 1_000_000.0;
+                    if self.should_calibrate() && self.state.is_active() {
+                        match get_position_from_proxy(&proxy).await {
+                            Ok(real_pos) => {
                                 let sampled_at = std::time::Instant::now();
                                 self.state.position = real_pos;
                                 if tracker.on_step(real_pos) {
@@ -403,10 +420,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                     if self.sync_active_service(&service).await? {
                         break;
                     } else if let Ok(true) = self.handle_status_change(&proxy).await {
-                        tracker.sync_playback(
-                            self.state.playback_status == "Playing",
-                            self.state.position,
-                        );
+                        self.sync_tracker_for_playback(&mut tracker, self.state.position);
                     }
                 }
 
@@ -450,12 +464,8 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                 Some(signal) = seeked_stream.next() => {
                     if let Ok(args) = signal.args() {
                         tracing::debug!(service = %service, position = args.position, "Seeked signal received");
-                        let pos_sec = args.position as f64 / 1_000_000.0;
-                        if self.state.playback_status == "Playing" {
-                            tracker.arm(pos_sec);
-                        } else {
-                            tracker.disarm();
-                        }
+                        let pos_sec = (args.position.max(0) as f64) / 1_000_000.0;
+                        self.sync_tracker_for_playback(&mut tracker, pos_sec);
                         self.handle_seek_signal(args.position).await;
                     }
                 }
@@ -465,10 +475,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                     tracing::debug!(service = %service, "Metadata changed signal received");
                     match self.handle_metadata_change(&proxy).await {
                         Ok(true) => {
-                            tracker.sync_playback(
-                                self.state.playback_status == "Playing",
-                                self.state.position,
-                            );
+                            self.sync_tracker_for_playback(&mut tracker, self.state.position);
                         }
                         Ok(false) => {}
                         Err(e) => {
@@ -489,10 +496,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                     tracing::debug!(service = %service, "Playback status changed signal received");
                     match self.handle_status_change(&proxy).await {
                         Ok(true) => {
-                            tracker.sync_playback(
-                                self.state.playback_status == "Playing",
-                                self.state.position,
-                            );
+                            self.sync_tracker_for_playback(&mut tracker, self.state.position);
 
                             // If current player transitioned to Stopped, check if another player is currently Playing
                             if self.state.playback_status == "Stopped"
@@ -526,13 +530,24 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                     }
                 }
 
-                // 6. Global MPRIS PropertiesChanged (cross-player transitions)
+                // 6. Player Rate property change (preserve calibration state)
+                Some(_) = rate_stream.next() => {
+                    let rate = proxy.rate().await.unwrap_or(1.0);
+                    let position = get_position_from_proxy(&proxy)
+                        .await
+                        .unwrap_or(self.state.position);
+                    self.state.position = position;
+                    let sampled_at = std::time::Instant::now();
+                    self.callback.on_rate_change(position, rate, sampled_at);
+                }
+
+                // 7. Global MPRIS PropertiesChanged (cross-player transitions)
                 Some(Ok(msg)) = global_prop_stream.next() => {
                     if let Ok((_iface, changed, _invalidated)) =
-                        msg.body().deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+                        msg.body().deserialize::<(String, HashMap<String, OwnedVariant>, Vec<String>)>()
                         && let Some(val) = changed.get("PlaybackStatus") {
                             let is_playing = match val.deref() {
-                                zvariant::Value::Str(s) => s.as_str() == "Playing",
+                                Variant::Str(s) => s.as_str() == "Playing",
                                 _ => false,
                             };
                             if is_playing {
@@ -628,7 +643,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
                 // Broker-level MPRIS PropertiesChanged (player was already running and started playing or changed track)
                 Some(Ok(msg)) = global_prop_stream.next() => {
                     if let Ok((_iface, changed, _invalidated)) =
-                        msg.body().deserialize::<(String, HashMap<String, OwnedValue>, Vec<String>)>()
+                        msg.body().deserialize::<(String, HashMap<String, OwnedVariant>, Vec<String>)>()
                         && (changed.contains_key("PlaybackStatus") || changed.contains_key("Metadata"))
                     {
                         let header = msg.header();
@@ -643,8 +658,16 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
         Ok(())
     }
 
+    fn should_calibrate(&self) -> bool {
+        should_calibrate_track(&self.state.playback_status, self.state.track.is_local)
+    }
+
+    fn sync_tracker_for_playback(&self, tracker: &mut CalibrationTracker, anchor_pos: f64) {
+        tracker.sync_playback(self.should_calibrate(), anchor_pos);
+    }
+
     async fn handle_seek_signal(&mut self, position_microsecs: i64) {
-        let position = position_microsecs as f64 / 1_000_000.0;
+        let position = (position_microsecs.max(0) as f64) / 1_000_000.0;
         self.state.position = position;
         let sampled_at = std::time::Instant::now();
         self.callback.on_seek(
@@ -665,10 +688,9 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
         if new_track != self.state.track {
             self.state.track = new_track;
 
-            // Also update position when track changes via uncached query
-            if let Ok(microsecs) = proxy.position().await {
-                self.state.position = microsecs as f64 / 1_000_000.0;
-            }
+            // Update position when track changes via timeout-protected uncached query;
+            // reset to 0.0 on timeout so the previous track's position never leaks.
+            self.state.position = get_position_from_proxy(proxy).await.unwrap_or(0.0);
 
             let sampled_at = std::time::Instant::now();
             self.callback.on_track_change(
@@ -699,8 +721,8 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             self.state.playback_status = status.clone();
 
             // Query fresh authoritative position from D-Bus on any status transition (Playing or Paused)
-            if let Ok(microsecs) = proxy.position().await {
-                self.state.position = microsecs as f64 / 1_000_000.0;
+            if let Ok(pos) = get_position_from_proxy(proxy).await {
+                self.state.position = pos;
             }
             let position = self.state.position;
 
@@ -808,7 +830,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
 
     async fn switch_to_player(&mut self, service: &str) -> Result<(), MprisError> {
         let proxy = MediaPlayer2PlayerProxy::builder(&self.conn)
-            .destination(service)?
+            .destination(service)
             .build()
             .await?;
 
@@ -819,16 +841,13 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             .map(|map| extract_metadata(&map))
             .unwrap_or_default();
 
-        let position = proxy
-            .position()
-            .await
-            .map(|us| us as f64 / 1_000_000.0)
-            .unwrap_or(0.0);
+        let position = get_position_from_proxy(&proxy).await.unwrap_or(0.0);
 
         let playback_status = proxy
             .playback_status()
             .await
             .unwrap_or_else(|_| "Stopped".to_string());
+        let rate = proxy.rate().await.unwrap_or(1.0);
 
         tracing::debug!(
             service = %service,
@@ -836,6 +855,7 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             artist = %metadata.artist,
             position = position,
             status = %playback_status,
+            rate = rate,
             "Switched to player"
         );
 
@@ -854,6 +874,9 @@ impl<C: MprisEventCallback> MprisEventHandler<C> {
             Some(playback_status),
             sampled_at,
         );
+        if rate.is_finite() && rate > 0.0 && (rate - 1.0).abs() > f64::EPSILON {
+            self.callback.on_rate_change(position, rate, sampled_at);
+        }
 
         Ok(())
     }
@@ -1002,6 +1025,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_local_track_skips_calibration_tracker() {
+        assert!(!should_calibrate_track("Playing", true));
+        assert!(!should_calibrate_track("Paused", true));
+        assert!(!should_calibrate_track("Paused", false));
+        assert!(should_calibrate_track("Playing", false));
+
+        let mut tracker = CalibrationTracker::new(should_calibrate_track("Playing", true), 0.0);
+        assert!(tracker.timer.is_none());
+
+        tracker.sync_playback(should_calibrate_track("Playing", false), 0.0);
+        assert!(tracker.timer.is_some());
+
+        tracker.sync_playback(should_calibrate_track("Playing", true), 12.0);
+        assert!(tracker.timer.is_none());
+    }
+
+    #[tokio::test]
     #[ignore = "Live D-Bus session test requiring active D-Bus daemon"]
     async fn test_live_dbus_broker_match_rule_and_player_queries() {
         let Ok(conn) = zbus::Connection::session().await else {
@@ -1013,15 +1053,14 @@ mod tests {
         let mpris_name_rule = MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
             .interface("org.freedesktop.DBus")
-            .unwrap()
             .member("NameOwnerChanged")
-            .unwrap()
             .arg0ns("org.mpris.MediaPlayer2")
-            .unwrap()
-            .build();
-        let mut mpris_stream = MessageStream::for_match_rule(mpris_name_rule, &conn, None)
-            .await
+            .build()
             .unwrap();
+        let mut mpris_stream =
+            MessageStream::for_match_rule(mpris_name_rule, &conn, NonZeroUsize::new(64))
+                .await
+                .unwrap();
 
         // 2. Query active players on the bus right now
         let active = find_best_active_service(&[], &[], None, None).await;
@@ -1047,7 +1086,7 @@ mod tests {
         let _ = dbus_proxy
             .request_name(
                 non_mpris_name.as_ref(),
-                zbus::fdo::RequestNameFlags::ReplaceExisting.into(),
+                zbus::fdo::RequestNameFlags::REPLACE_EXISTING,
             )
             .await
             .unwrap();
@@ -1079,7 +1118,7 @@ mod tests {
         let reply = dbus_proxy
             .request_name(
                 test_bus_name.as_ref(),
-                zbus::fdo::RequestNameFlags::ReplaceExisting.into(),
+                zbus::fdo::RequestNameFlags::REPLACE_EXISTING,
             )
             .await
             .unwrap();

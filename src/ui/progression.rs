@@ -15,15 +15,28 @@ use tokio::time::Sleep;
 /// For richsync lyrics, schedules wakeups at word/grapheme boundaries.
 /// For standard lyrics, schedules wakeups at line transitions.
 /// Returns `None` when playback is paused or no future boundary exists.
+#[cfg(test)]
 pub fn compute_next_word_sleep_from_update(upd: &Update) -> Option<Pin<Box<Sleep>>> {
+    compute_next_sleep_with_mode(upd, true)
+}
+
+fn compute_next_sleep_with_mode(upd: &Update, karaoke_enabled: bool) -> Option<Pin<Box<Sleep>>> {
     if !upd.playing || upd.lines.is_empty() || !upd.position.is_finite() {
         return None;
     }
 
-    let is_richsync = matches!(
-        upd.provider,
-        Some(crate::state::Provider::MusixmatchRichsync)
-    );
+    if !karaoke_enabled {
+        return schedule_next_line_start(upd);
+    }
+
+    let is_richsync = upd
+        .provider
+        .as_ref()
+        .is_some_and(crate::state::Provider::is_word_synced)
+        || upd
+            .lines
+            .iter()
+            .any(crate::lyrics::LyricLine::has_word_timings);
 
     if is_richsync {
         schedule_next_richsync_boundary(upd)
@@ -35,11 +48,12 @@ pub fn compute_next_word_sleep_from_update(upd: &Update) -> Option<Pin<Box<Sleep
 /// Schedule a wakeup at the next line start (non-richsync).
 fn schedule_next_line_start(upd: &Update) -> Option<Pin<Box<Sleep>>> {
     let start_idx = upd.index.unwrap_or(0);
+    let rate = effective_rate(upd);
 
     // Search from current line onward for next line after current position
     for line in upd.lines.iter().skip(start_idx) {
         if line.time.is_finite() && line.time > upd.position {
-            let delay = (line.time - upd.position).max(0.0);
+            let delay = (line.time - upd.position).max(0.0) / rate;
             return Some(create_sleep(delay));
         }
     }
@@ -50,6 +64,7 @@ fn schedule_next_line_start(upd: &Update) -> Option<Pin<Box<Sleep>>> {
 /// Schedule a wakeup at the next word/grapheme boundary (richsync).
 fn schedule_next_richsync_boundary(upd: &Update) -> Option<Pin<Box<Sleep>>> {
     let start_idx = upd.index.unwrap_or(0);
+    let rate = effective_rate(upd);
     let mut best_delay: Option<f64> = None;
 
     // Scan from current line forward for the nearest future boundary
@@ -89,7 +104,16 @@ fn schedule_next_richsync_boundary(upd: &Update) -> Option<Pin<Box<Sleep>>> {
         }
     }
 
-    best_delay.map(create_sleep)
+    best_delay.map(|d| create_sleep(d / rate))
+}
+
+fn effective_rate(upd: &Update) -> f64 {
+    let rate = upd.time_anchor.rate;
+    if rate.is_finite() && rate > 0.0 {
+        rate
+    } else {
+        1.0
+    }
 }
 
 /// Update best_delay if boundary is in the future and closer than current best.
@@ -120,11 +144,10 @@ fn create_sleep(delay_secs: f64) -> Pin<Box<Sleep>> {
 /// 2. Recomputes the current line index via binary search
 /// 3. Schedules the next timer wakeup for smooth rendering
 ///
-/// The `_karaoke_enabled` parameter is unused here (affects rendering only).
 pub fn estimate_update_and_next_sleep(
     last_update: &Option<Update>,
     last_update_instant: Option<Instant>,
-    _karaoke_enabled: bool,
+    karaoke_enabled: bool,
 ) -> (Option<Update>, Option<Pin<Box<Sleep>>>) {
     let Some(update) = last_update else {
         return (None, None);
@@ -144,8 +167,8 @@ pub fn estimate_update_and_next_sleep(
     // Recompute current line index from estimated position
     estimated.index = compute_line_index(&estimated);
 
-    // Schedule next boundary for smooth rendering
-    let next_sleep = compute_next_word_sleep_from_update(&estimated);
+    // Schedule next boundary for smooth rendering (skip grapheme wakeups when karaoke is disabled)
+    let next_sleep = compute_next_sleep_with_mode(&estimated, karaoke_enabled);
 
     (Some(estimated), next_sleep)
 }
@@ -154,18 +177,13 @@ pub fn estimate_update_and_next_sleep(
 ///
 /// Returns `None` if:
 /// - No lyrics
-/// - Position is invalid (NaN)
-/// - Any line time is invalid (NaN)
+/// - Position is invalid (`!is_finite()`)
 /// - Position is before the first line
 ///
 /// Delegates to the shared [`active_line_index`] binary search also used by
 /// `LyricState::get_index`, keeping authoritative state and UI estimation in sync.
 fn compute_line_index(update: &Update) -> Option<usize> {
-    // Validate position and line times before searching
-    if update.lines.is_empty()
-        || update.position.is_nan()
-        || update.lines.iter().any(|l| l.time.is_nan())
-    {
+    if update.lines.is_empty() || !update.position.is_finite() {
         return None;
     }
 
@@ -188,6 +206,7 @@ mod tests {
                 text: "Hello".into(),
                 grapheme_boundaries: vec![0, 5],
                 grapheme_times: vec![],
+                ..Default::default()
             },
         ]));
         let line1 = crate::lyrics::LyricLine::new(10.0, "Line 1").with_words(Some(vec![
@@ -197,6 +216,7 @@ mod tests {
                 text: "World".into(),
                 grapheme_boundaries: vec![0, 5],
                 grapheme_times: vec![],
+                ..Default::default()
             },
         ]));
 
@@ -268,5 +288,36 @@ mod tests {
 
         let sleep = compute_next_word_sleep_from_update(&update);
         assert!(sleep.is_none(), "Should not schedule when paused");
+    }
+
+    #[tokio::test]
+    async fn test_non_karaoke_schedules_line_start_instead_of_word_wakeup() {
+        let line0 = crate::lyrics::LyricLine::new(0.0, "Hello world").with_words(Some(vec![
+            crate::lyrics::types::create_word_timing(1.0, 2.0, "Hello"),
+            crate::lyrics::types::create_word_timing(2.0, 3.0, "world"),
+        ]));
+        let line1 = crate::lyrics::LyricLine::new(10.0, "Next line");
+        let update = Update {
+            lines: Arc::new(vec![line0, line1]),
+            index: Some(0),
+            position: 0.5,
+            playing: true,
+            ..Default::default()
+        };
+
+        let (_, karaoke_sleep) = estimate_update_and_next_sleep(&Some(update.clone()), None, true);
+        let (_, line_sleep) = estimate_update_and_next_sleep(&Some(update), None, false);
+        // Word boundary is at 1.0s (~0.5s away); line transition is at 10.0s (~9.5s away)
+        let now = tokio::time::Instant::now();
+        let k_dur = karaoke_sleep
+            .unwrap()
+            .deadline()
+            .saturating_duration_since(now);
+        let l_dur = line_sleep
+            .unwrap()
+            .deadline()
+            .saturating_duration_since(now);
+        assert!(k_dur < Duration::from_secs(2));
+        assert!(l_dur > Duration::from_secs(8));
     }
 }

@@ -1,10 +1,10 @@
 //! Token management and dynamic acquisition for Musixmatch API.
 
 use crate::lyrics::types::LyricsError;
-use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde_json::Value;
 use std::env;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -173,9 +173,19 @@ impl TokenManager {
         }
     }
 
-    /// Returns available configured env tokens count.
+    /// Returns available configured env/TOML tokens count.
     pub(crate) fn env_token_count(&self) -> usize {
         self.tokens.len()
+    }
+
+    /// Merges comma-separated tokens from TOML/CLI config once without duplicating env entries.
+    pub(crate) fn seed_configured_tokens(&mut self, csv: &str) {
+        for raw in csv.split(',') {
+            let tok = raw.trim();
+            if !tok.is_empty() && !self.tokens.iter().any(|existing| existing == tok) {
+                self.tokens.push(tok.to_string());
+            }
+        }
     }
 
     /// Get the next env token in round-robin fashion if available.
@@ -227,8 +237,8 @@ impl TokenManager {
     }
 }
 
-pub(crate) static TOKEN_MANAGER: Lazy<Mutex<TokenManager>> =
-    Lazy::new(|| Mutex::new(TokenManager::new()));
+pub(crate) static TOKEN_MANAGER: LazyLock<Mutex<TokenManager>> =
+    LazyLock::new(|| Mutex::new(TokenManager::new()));
 
 /// Waits for rate-limiting spacing between requests.
 /// Returns false if Musixmatch is blocked under network cooldown.

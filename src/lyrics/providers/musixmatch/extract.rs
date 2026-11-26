@@ -107,6 +107,7 @@ pub(crate) fn extract_track_ids_from_json(track: &Value) -> TrackMatchInfo {
         track_isrcs: isrcs,
         track_spotify_ids: spotify_ids,
         track_itunes_ids: itunes_ids,
+        youtube_video_id: None,
     }
 }
 

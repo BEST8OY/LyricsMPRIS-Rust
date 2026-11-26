@@ -11,8 +11,8 @@ cargo fmt --check && cargo clippy && cargo test
 ```
 
 - **Build release**: `cargo build --release` (binary at `target/release/lyricsmpris`)
-- **Single test run**: `cargo test -- <test_name_filter>` (e.g., `cargo test -- test_database_crud`)
-- No Makefile, CI runner, or external database setup required. Inline tests use in-memory SQLite and local mocks.
+- **Single test run**: `cargo test -- <test_name_filter>` (e.g., `cargo test -- test_prepared_track_scoring`)
+- No Makefile, CI runner, or external database setup required. Tests run inline without external services.
 
 ## Architecture & Data Flow
 
@@ -21,14 +21,13 @@ D-Bus signals / MPRIS polling
       │
       ▼
 src/mpris/ (events.rs, metadata.rs, connection.rs)
-      │  (extracts TrackMetadata + local ISRC via lofty if --isrc)
+      │  (extracts TrackMetadata + YouTube videoId + local ISRC via lofty if --isrc)
       ▼
-src/pool.rs (event loop orchestrator)
+src/pool.rs (event loop orchestrator & 'r' candidate cycling)
       │
       ▼
-src/event/ (fetch.rs, handlers.rs) (lyrics lookup pipeline)
-      ├─▶ SQLite DB cache (src/lyrics/database/)
-      └─▶ External providers (src/lyrics/providers/: lrclib.rs, musixmatch/)
+src/event/ (fetch.rs, display_state.rs, handlers.rs) (3-stage concurrent pipeline)
+      └─▶ 23 External providers (src/lyrics/providers/ + crypto/parsers/filter)
       │
       ▼
 src/state.rs (StateBundle -> Update snapshot broadcast)
@@ -39,7 +38,8 @@ src/ui/ (modern.rs Ratatui TUI or pipe.rs stdout)
 
 ## Key Components & Conventions
 
-- **Rust Edition 2024** (`edition = "2024"` in Cargo.toml). Enables Edition 2024 let chains (`if let ... && let ...`).
+- **Rust Edition 2024** (`edition = "2024"` in Cargo.toml). Enables Edition 2024 let chains (`if let ... && let ...`). Uses `std::sync::LazyLock`.
+- **Configuration (`src/config.rs`)**: Layered precedence (`CLI > env > TOML (~/.config/lyricsmpris/config.toml or --config) > defaults`). Supports `-provider` exclusion tokens, `--allow-plain`, `--no-split-bg`, custom base URLs, and provider tokens.
 - **MPRIS & D-Bus Engine (`src/mpris/`, `src/pool.rs`)**:
   - Consolidated Proxies: All D-Bus proxy interfaces (`MediaPlayer2Player`, `Playerctld`) are centralized in `src/mpris/proxies.rs`.
   - Discovery Priority: Queries `playerctld` (recency-ordered) first; falls back to standard D-Bus `ListNames` (`org.mpris.MediaPlayer2.*`, excluding `playerctld`) when `playerctld` is absent or returns empty, ranking candidates by `PlaybackPriority` (`Playing` > `Paused` > `Stopped` > `Unresponsive`) with concurrent status probing.
@@ -49,6 +49,11 @@ src/ui/ (modern.rs Ratatui TUI or pipe.rs stdout)
   - Real-Time Position & Property Streams: `Metadata` and `PlaybackStatus` use standard caching (`CacheProperties::Lazily`) enabling property change streams. Dynamic `Position` is queried via `get_position()` using direct D-Bus `Properties.Get` (via `conn.call_method()`) to avoid stale cached position data and eliminate proxy construction overhead, propagating errors so callers retain estimated positions on transient failures.
   - Resilience: The watcher task in `pool.rs` retries with exponential backoff (500 ms → ×2, cap 30 s), resetting only after sustained uptime (≥ 5 s). The event loop backs off on error to prevent CPU spin.
   - Multi-Threaded Tag Reading: ISRC extraction checks `runtime_flavor() == RuntimeFlavor::MultiThread` before invoking `block_in_place`.
+- **Multi-Provider & Parsers Pipeline (`src/event/{fetch.rs, display_state.rs}`, `src/lyrics/{crypto.rs, filter.rs, parsers/, providers/, types.rs}`)**:
+  - 23 Morphe-ordered providers (`SUPPORTED_PROVIDERS` in `src/config.rs`), racing in 3 stages (`2s` / `4s` / `9s` deadlines, `5s` endgame, `800ms` word-sync `FIRST_PAINT_HOLD`, `15%` cut-off retry).
+  - Full candidate queue fill runs in background only when interactive TUI cycling (`'r'`) is active; skipped in `--pipe` mode once published.
+  - Parsers cover LRC/ELRC, TTML2, KRC, Lyricify (Lines/Syllable/Translation), and LyricsFile YAML (`crypto.rs` handles AES-ECB/PKCS#7, Kugou XOR+zlib, QRC 3DES-ECB, PetitLyrics LSY XOR).
+  - Display prep (`prepare_lyrics_for_display`): credit filtering, text filtering, parenthesized background vocal splitting, overlap retiming, and anomalous word timing repairs.
 - **Musixmatch Engine (`src/lyrics/providers/musixmatch/`)**:
   - Tier 1: Round-robin pool from `MUSIXMATCH_USERTOKEN` env var.
   - Tier 2: Auto-fetches anonymous token via `token.get` API if Tier 1 is unconfigured or exhausted.
@@ -63,12 +68,6 @@ src/ui/ (modern.rs Ratatui TUI or pipe.rs stdout)
     - Must have `has_richsync`, `has_subtitles`, `has_lyrics`, or `instrumental`.
     - Version tag parity (`VERSION_RE`): studio tracks will not match candidates with live, acoustic, remix, mix, demo, or rehearsal annotations.
     - Clamped within ±2.0s duration window; candidates with `track_length == 0.0` are rejected when target duration is known.
-- **Database Engine (`src/lyrics/database/`)**:
-  - SQLite pool with `lyrics (id INTEGER PRIMARY KEY)`, multi-album alias table `track_aliases (artist, title, album, lyrics_id)` (`WITHOUT ROWID`), and unified `track_identifiers (kind, value, lyrics_id)` clustered table (`WITHOUT ROWID`) with cascading foreign keys.
-  - Raw lyrics stored as zstd-compressed blobs with explicit `LyricsFormat` (`Richsync`, `Subtitles`, `Lrclib`).
-  - Lookup priority: ISRC (`track_identifiers`) → `track_aliases (artist, title, album)` → Spotify ID → iTunes ID → fuzzy `(artist, title)` across any album.
-  - Duration matching: Clamped within 2.0s tolerance window; duration-mismatched entries are retained (multi-version matching); only corrupt/unparseable entries are purged.
-  - Format fidelity ranking: Richsync (3) > Subtitles (2) > Lrclib (1); incoming lower-fidelity formats never downgrade cached higher-fidelity lyrics.
 - **ISRC Extraction (`src/mpris/metadata.rs`)**:
-  - `--isrc` inspects `file://` or path in `xesam:url` using `lofty` to extract ISRC tags. Uses `block_in_place` conditionally inside Tokio runtime.
+  - `--isrc` inspects `file://` or path in `xesam:url` using `lofty` to extract ISRC tags. Also extracts `youtube_video_id` from YouTube URLs/trackids.
 - **Logging**: Goes exclusively to `stderr` via `tracing` + `tracing-subscriber`. Enable with `RUST_LOG=debug`. Keep `stdout` clean for `--pipe` mode.

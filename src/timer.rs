@@ -226,7 +226,6 @@ impl PlaybackTimer {
 
     /// Sets the playback rate (e.g. 1.0 = 100%, 1.5 = 150%).
     /// Automatically realigns the anchor position if currently playing.
-    #[cfg(test)]
     pub fn set_rate(&mut self, rate: f64) {
         if rate.is_finite() && rate > 0.0 {
             if self.anchor_instant.is_some() {
@@ -555,7 +554,6 @@ mod tests {
 
         let proxy = match crate::mpris::proxies::MediaPlayer2PlayerProxy::builder(&conn)
             .destination(service.as_str())
-            .unwrap()
             .build()
             .await
         {
@@ -694,7 +692,6 @@ mod tests {
 
         let proxy = match crate::mpris::proxies::MediaPlayer2PlayerProxy::builder(&conn)
             .destination(service.as_str())
-            .unwrap()
             .build()
             .await
         {
@@ -740,8 +737,8 @@ mod tests {
             .get("mpris:trackid")
             .and_then(crate::mpris::metadata::extract_string_or_first_item)
             .unwrap_or_default();
-        let obj_path = zvariant::ObjectPath::try_from(track_id_str.as_str())
-            .unwrap_or_else(|_| zvariant::ObjectPath::from_static_str("/").unwrap());
+        let obj_path = zbus::ObjectPath::try_from(track_id_str.as_str())
+            .unwrap_or_else(|_| zbus::ObjectPath::from_static_str("/").unwrap());
         let pos_us = (seek_target * 1_000_000.0) as i64;
         let _ = conn
             .call_method(

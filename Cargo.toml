@@ -4,30 +4,38 @@ version = "3.0.0"
 edition = "2024"
 
 [dependencies]
-zbus = { version = "5", default-features = false, features = ["tokio"] }
-zvariant = "5"
-reqwest = { version = "0.13", features = ["json"] }
-tokio = { version = "1.53", features = ["full"] }
+zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] }
+reqwest = { version = "0.13", features = ["json", "gzip"] }
+tokio = { version = "1.54", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "signal"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 ratatui = "0.30"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+toml = "0.8"
+dirs = "6.0"
 regex = "1.13"
 urlencoding = "2.1"
 clap = { version = "4.6", features = ["derive"] }
 futures-util = "0.3"
-once_cell = "1.21"
 thiserror = "2.0"
 textwrap = "0.16"
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
+unicode-normalization = "0.1"
+zhconv = "0.4"
+quick-xml = "0.37"
+flate2 = "1.1"
+base64 = "0.22"
+encoding_rs = "0.8"
+aes = "0.8"
+ecb = "0.1"
+md-5 = "0.10"
+hmac = "0.12"
+sha1 = "0.10"
+sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
-zstd = "0.13"
 lofty = "0.25"
-deunicode = "1.6"
-kakasi = "0.1.0"
 uuid = { version = "1", features = ["v4"] }
 
 # [profile.release]

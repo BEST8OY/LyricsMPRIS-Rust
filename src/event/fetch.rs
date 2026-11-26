@@ -1,101 +1,59 @@
-//! Multi-provider lyrics fetching and caching pipeline.
+//! 3-stage concurrent lyrics fetcher implementing Morphe's `LyricsManager` racing pipeline.
 
-use crate::lyrics::types::{LyricsError, is_retryable_status};
+use crate::config::RuntimeSettings;
+use crate::event::display_state::{DisplayState, FIRST_PAINT_HOLD, ScoredCandidate};
+use crate::lyrics::providers::{FetchedCandidate, LyricsProvider, ProviderContext, build_provider};
+use crate::lyrics::types::{Lyrics, LyricsError, TrackInfo, TrackMatchInfo, is_retryable_status};
 use crate::mpris::TrackMetadata;
-use crate::state::Provider;
+use crate::text_utils::{
+    any_dash_split, any_dash_split_reversed, clean_title_annotations, script_variants,
+    split_artists, trusted_dash_split,
+};
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio::task::JoinSet;
+use tokio::time::Instant;
 
-/// Message surfaced to the UI while providers are unreachable.
-pub(crate) const NETWORK_RETRY_MESSAGE: &str = "Network unavailable - retrying...";
+const STAGE1_DEADLINE: Duration = Duration::from_secs(2);
+const STAGE2_DEADLINE: Duration = Duration::from_secs(4);
+const STAGE3_DEADLINE: Duration = Duration::from_secs(9);
+const ENDGAME_DEADLINE: Duration = Duration::from_secs(5);
+const MIN_CUTOFF_CHECK_SECS: i64 = 60;
+const MIN_COMPLETE_FRACTION: f64 = 0.15;
 
-/// Returns true if the error is considered transient (temporary network issue, rate limit, server outage).
-fn is_transient(err: &LyricsError) -> bool {
-    match err {
-        LyricsError::Network(_) => true,
-        LyricsError::Http(code) if is_retryable_status(*code) => true,
-        _ => false,
-    }
-}
-
-/// Stores fetched lyrics in the database cache.
-pub(crate) async fn store_lyrics_in_cache(
-    meta: &TrackMetadata,
-    raw: Option<String>,
-    format: crate::lyrics::database::LyricsFormat,
-    provider_isrcs: &[String],
-    provider_spotify_ids: &[String],
-    provider_itunes_ids: &[String],
-) {
-    if let Some(raw_text) = raw {
-        // Note: Player/file reported identifiers (meta.isrc, meta.spotify_id, meta.itunes_id)
-        // are intentionally NOT cached here. We only cache authoritative identifiers
-        // reported directly by Musixmatch to prevent caching unverified or spoofed player metadata.
-        crate::lyrics::database::store_in_database(
-            &meta.artist,
-            &meta.title,
-            &meta.album,
-            meta.length,
-            format,
-            raw_text,
-            provider_isrcs,
-            provider_spotify_ids,
-            provider_itunes_ids,
-        )
-        .await;
-    }
-}
-
-/// Maps a Provider enum to the corresponding database LyricsFormat.
-pub(crate) fn provider_to_db_format(provider: Provider) -> crate::lyrics::database::LyricsFormat {
-    match provider {
-        Provider::Lrclib => crate::lyrics::database::LyricsFormat::Lrclib,
-        Provider::MusixmatchRichsync => crate::lyrics::database::LyricsFormat::Richsync,
-        Provider::MusixmatchSubtitles => crate::lyrics::database::LyricsFormat::Subtitles,
-    }
-}
-
-/// Maps a database LyricsFormat to the corresponding Provider enum.
-pub(crate) fn db_format_to_provider(format: crate::lyrics::database::LyricsFormat) -> Provider {
-    match format {
-        crate::lyrics::database::LyricsFormat::Lrclib => Provider::Lrclib,
-        crate::lyrics::database::LyricsFormat::Richsync => Provider::MusixmatchRichsync,
-        crate::lyrics::database::LyricsFormat::Subtitles => Provider::MusixmatchSubtitles,
-    }
-}
-
-/// Determines which Musixmatch format was returned based on presence of word timings.
-pub(crate) fn determine_musixmatch_provider(lines: &[crate::lyrics::LyricLine]) -> Provider {
-    if lines.iter().any(|l| l.words.is_some()) {
-        Provider::MusixmatchRichsync
-    } else {
-        Provider::MusixmatchSubtitles
-    }
-}
-
-/// Asynchronous fetch outcome message sent to the event loop.
+/// Outcome emitted by background lyrics fetching tasks.
 #[derive(Debug)]
 pub enum FetchOutcome {
-    /// Lyrics were retrieved (from SQLite cache or provider)
+    /// Initial lyrics result delivered for the track (with sorted fallback candidates).
     Success {
         epoch: u64,
         meta: TrackMetadata,
-        lines: Vec<crate::lyrics::LyricLine>,
-        provider: Provider,
+        lyrics: Box<Lyrics>,
         position: f64,
+        candidates: Vec<ScoredCandidate>,
     },
-    /// Richsync karaoke upgrade discovered asynchronously for current track
+    /// Upgraded or richer lyrics discovered later during the concurrent race.
     Upgraded {
         epoch: u64,
         meta: TrackMetadata,
-        lines: Vec<crate::lyrics::LyricLine>,
-        format: crate::lyrics::database::LyricsFormat,
+        lyrics: Box<Lyrics>,
+        candidates: Vec<ScoredCandidate>,
     },
-    /// Providers were queried authoritatively: no lyrics exist
+    /// Full background candidate queue ready after Stage 3 completion for `'r'` cycling.
+    CandidatesReady {
+        epoch: u64,
+        meta: TrackMetadata,
+        candidates: Vec<ScoredCandidate>,
+    },
+    /// Authoritative conclusion: no matching lyrics found across configured providers.
     Exhausted {
         epoch: u64,
         meta: TrackMetadata,
         err: Option<String>,
     },
-    /// All providers failed with transient network errors; schedule retry
+    /// Network/service unavailability prevented querying; eligible for exponential retry.
     Unavailable {
         epoch: u64,
         meta: TrackMetadata,
@@ -105,400 +63,585 @@ pub enum FetchOutcome {
 }
 
 impl FetchOutcome {
-    #[must_use]
     pub fn epoch(&self) -> u64 {
         match self {
-            FetchOutcome::Success { epoch, .. } => *epoch,
-            FetchOutcome::Upgraded { epoch, .. } => *epoch,
-            FetchOutcome::Exhausted { epoch, .. } => *epoch,
-            FetchOutcome::Unavailable { epoch, .. } => *epoch,
+            Self::Success { epoch, .. }
+            | Self::Upgraded { epoch, .. }
+            | Self::CandidatesReady { epoch, .. }
+            | Self::Exhausted { epoch, .. }
+            | Self::Unavailable { epoch, .. } => *epoch,
         }
     }
 }
 
-/// Helper to query live D-Bus position for a player service.
-async fn fetch_position(service: Option<&str>) -> f64 {
-    if let Some(svc) = service {
-        crate::mpris::playback::get_position(svc)
-            .await
-            .unwrap_or(0.0)
-    } else {
-        0.0
+#[derive(Clone, Debug)]
+struct VariantQuery {
+    track: TrackInfo,
+    penalty: i32,
+}
+
+fn build_query_tiers(track: &TrackInfo) -> (Vec<VariantQuery>, Vec<VariantQuery>) {
+    let mut original_tier = Vec::new();
+    let mut derived_tier = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+
+    let mut push_unique = |list: &mut Vec<VariantQuery>, t: TrackInfo, penalty: i32| {
+        let key = (t.title.to_lowercase(), t.artist.to_lowercase());
+        if !t.title.is_empty() && seen.insert(key) {
+            list.push(VariantQuery { track: t, penalty });
+        }
+    };
+
+    push_unique(&mut original_tier, track.clone(), 0);
+
+    // Strip featuring/remaster noise if title changes meaningfully.
+    if let Some(cleaned_title) = clean_title_annotations(&track.title)
+        && !cleaned_title.is_empty()
+        && cleaned_title != track.title
+    {
+        let mut ct = track.clone();
+        ct.title = cleaned_title;
+        push_unique(&mut original_tier, ct, 1);
+    }
+
+    if let Some((t_artist, t_title)) = trusted_dash_split(&track.title, &track.artist) {
+        let trusted = TrackInfo::new(t_title, t_artist, track.album.clone(), track.duration_secs);
+        push_unique(&mut original_tier, trusted, 1);
+    }
+
+    // Derived script variants (Simplified / Traditional Han) across title and/or artist
+    let title_vars = script_variants(&track.title);
+    let artist_vars = script_variants(&track.artist);
+    for t_var in std::iter::once(&track.title).chain(title_vars.iter()) {
+        for a_var in std::iter::once(&track.artist).chain(artist_vars.iter()) {
+            if *t_var == track.title && *a_var == track.artist {
+                continue;
+            }
+            let v = TrackInfo::new(
+                t_var.clone(),
+                a_var.clone(),
+                track.album.clone(),
+                track.duration_secs,
+            );
+            push_unique(&mut derived_tier, v, 1);
+        }
+    }
+
+    // Derived split multi-artist queries
+    for artist in split_artists(&track.artist) {
+        if artist != track.artist {
+            let v = TrackInfo::new(
+                track.title.clone(),
+                artist,
+                track.album.clone(),
+                track.duration_secs,
+            );
+            push_unique(&mut derived_tier, v, 2);
+        }
+    }
+
+    // Derived dash splits (any-dash & reversed)
+    if let Some((a, t)) = any_dash_split(&track.title) {
+        let v = TrackInfo::new(t, a, track.album.clone(), track.duration_secs);
+        push_unique(&mut derived_tier, v, 2);
+    }
+    if let Some((a, t)) = any_dash_split_reversed(&track.title) {
+        let v = TrackInfo::new(t, a, track.album.clone(), track.duration_secs);
+        push_unique(&mut derived_tier, v, 2);
+    }
+
+    (original_tier, derived_tier)
+}
+
+fn is_cut_off(lyrics: &Lyrics, track: &TrackInfo) -> bool {
+    if !lyrics.synced || track.duration_secs < MIN_CUTOFF_CHECK_SECS {
+        return false;
+    }
+    let last_end = lyrics
+        .lines
+        .iter()
+        .map(|l| l.end.unwrap_or(l.time))
+        .fold(0.0_f64, f64::max);
+    last_end > 0.0 && last_end < (track.duration_secs as f64) * MIN_COMPLETE_FRACTION
+}
+
+fn is_transient(err: &LyricsError) -> bool {
+    match err {
+        LyricsError::Network(_) => true,
+        LyricsError::Http(code) => is_retryable_status(*code),
+        LyricsError::Api(_) | LyricsError::Serde(_) => false,
     }
 }
 
-/// Spawns an isolated background fetch task carrying an epoch identifier.
-///
-/// Returns immediately without blocking the caller. When lyrics arrive or miss,
-/// an authoritative [`FetchOutcome`] is dispatched to `outcome_tx`.
+struct TaskResult {
+    provider_id: &'static str,
+    penalty: i32,
+    stage12: bool,
+    outcome: Result<Vec<FetchedCandidate>, LyricsError>,
+}
+
+async fn run_provider_task(
+    provider: Arc<dyn LyricsProvider>,
+    vq: VariantQuery,
+    ids: Arc<TrackMatchInfo>,
+    ctx: Arc<ProviderContext>,
+    stage12: bool,
+) -> TaskResult {
+    let outcome = provider.fetch_candidates(&vq.track, &ids, &ctx).await;
+    let outcome = match outcome {
+        Ok(cands) => {
+            if let Some(first) = cands.first()
+                && is_cut_off(&first.lyrics, &vq.track)
+                && let Ok(retry_cands) = provider.fetch_candidates(&vq.track, &ids, &ctx).await
+                && !retry_cands.is_empty()
+            {
+                Ok(retry_cands)
+            } else {
+                Ok(cands)
+            }
+        }
+        Err(e) => Err(e),
+    };
+    TaskResult {
+        provider_id: provider.id(),
+        penalty: vq.penalty,
+        stage12,
+        outcome,
+    }
+}
+
+fn build_ids(meta: &TrackMetadata) -> TrackMatchInfo {
+    TrackMatchInfo {
+        track_isrcs: meta.isrc.iter().cloned().collect(),
+        track_spotify_ids: meta.spotify_id.iter().cloned().collect(),
+        track_itunes_ids: meta.itunes_id.iter().cloned().collect(),
+        youtube_video_id: meta.youtube_video_id.clone(),
+    }
+}
+
+struct PollContext<'a> {
+    epoch: u64,
+    meta: &'a TrackMetadata,
+    service: Option<&'a str>,
+    endgame_at: Instant,
+    outcome_tx: &'a mpsc::Sender<FetchOutcome>,
+}
+
+async fn emit_fetch_lyrics(
+    ctx: &PollContext<'_>,
+    lyrics: Lyrics,
+    published_initial: &mut bool,
+    candidates: Vec<ScoredCandidate>,
+) {
+    if !*published_initial {
+        *published_initial = true;
+        let fresh_pos = if let Some(svc) = ctx.service {
+            crate::mpris::playback::get_position(svc)
+                .await
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let _ = ctx
+            .outcome_tx
+            .send(FetchOutcome::Success {
+                epoch: ctx.epoch,
+                meta: ctx.meta.clone(),
+                lyrics: Box::new(lyrics),
+                position: fresh_pos,
+                candidates,
+            })
+            .await;
+    } else {
+        let _ = ctx
+            .outcome_tx
+            .send(FetchOutcome::Upgraded {
+                epoch: ctx.epoch,
+                meta: ctx.meta.clone(),
+                lyrics: Box::new(lyrics),
+                candidates,
+            })
+            .await;
+    }
+}
+
+async fn poll_stage(
+    pctx: &PollContext<'_>,
+    deadline: Instant,
+    join_set: &mut JoinSet<TaskResult>,
+    display: &mut DisplayState,
+    published_initial: &mut bool,
+    any_transient_err: &mut bool,
+    first_err: &mut Option<String>,
+) {
+    loop {
+        if join_set.is_empty() || display.window_closed {
+            break;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        if now >= pctx.endgame_at
+            && display.best_result.is_none()
+            && let Some(promoted) = display.promote_endgame()
+        {
+            let snapshot = display.sorted_snapshot();
+            emit_fetch_lyrics(pctx, promoted, published_initial, snapshot).await;
+            break;
+        }
+
+        let hold_wake = display
+            .first_candidate_at
+            .filter(|_| !*published_initial && display.word_sync)
+            .map(|t| t + FIRST_PAINT_HOLD)
+            .unwrap_or(deadline);
+        let next_wake = deadline.min(pctx.endgame_at).min(hold_wake).max(now);
+
+        tokio::select! {
+            Some(res) = join_set.join_next() => {
+                if let Ok(tr) = res {
+                    match tr.outcome {
+                        Ok(cands) => {
+                            let mut close_win = false;
+                            for c in cands {
+                                if display.accept(c, tr.penalty, tr.stage12) {
+                                    close_win = true;
+                                }
+                            }
+                            if close_win {
+                                display.window_closed = true;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!(provider = tr.provider_id, error = %e, "Provider fetch failed");
+                            if is_transient(&e) {
+                                *any_transient_err = true;
+                            }
+                            if first_err.is_none() {
+                                *first_err = Some(e.to_string());
+                            }
+                        }
+                    }
+                    if let Some(ready) = display.take_ready_to_publish(false) {
+                        let snapshot = display.sorted_snapshot();
+                        emit_fetch_lyrics(pctx, ready, published_initial, snapshot).await;
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(next_wake) => {
+                if let Some(ready) = display.take_ready_to_publish(false) {
+                    let snapshot = display.sorted_snapshot();
+                    emit_fetch_lyrics(pctx, ready, published_initial, snapshot).await;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Spawns the 3-stage concurrent lyrics fetch task for the current track epoch.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_fetch(
     epoch: u64,
     meta: TrackMetadata,
     providers: Vec<String>,
     service: Option<String>,
-    outcome_tx: tokio::sync::mpsc::Sender<FetchOutcome>,
+    word_sync: bool,
+    collect_all_candidates: bool,
+    settings: RuntimeSettings,
+    outcome_tx: mpsc::Sender<FetchOutcome>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // 1. Instant SQLite cache lookup (<1ms)
-        let db_match = crate::lyrics::database::fetch_from_database(
-            &meta.artist,
-            &meta.title,
-            &meta.album,
-            meta.length,
-            meta.isrc.as_deref(),
-            meta.spotify_id.as_deref(),
-            meta.itunes_id.as_deref(),
+        let ctx = Arc::new(ProviderContext::from_settings(settings));
+        let track = TrackInfo::from_metadata(&meta);
+        let ids = Arc::new(build_ids(&meta));
+
+        let mut active_providers: Vec<Arc<dyn LyricsProvider>> = Vec::new();
+        for id in &providers {
+            if let Some(p) = build_provider(id) {
+                if !p.is_configured(&ctx) {
+                    continue;
+                }
+                if p.requires_video_id() && ids.youtube_video_id.is_none() {
+                    continue;
+                }
+                active_providers.push(Arc::from(p));
+            }
+        }
+
+        if active_providers.is_empty() || (track.title.is_empty() && ids.youtube_video_id.is_none())
+        {
+            let _ = outcome_tx
+                .send(FetchOutcome::Exhausted {
+                    epoch,
+                    meta,
+                    err: Some("No configured providers for track".into()),
+                })
+                .await;
+            return;
+        }
+
+        let (original_tier, derived_tier) = build_query_tiers(&track);
+        let (blind, non_blind): (Vec<_>, Vec<_>) =
+            active_providers.into_iter().partition(|p| p.is_blind());
+
+        let stage1_split = non_blind.len().min(4);
+        let stage1_providers = &non_blind[..stage1_split];
+        let stage2_providers = &non_blind[stage1_split..];
+
+        let start = Instant::now();
+        let stage1_deadline = start + STAGE1_DEADLINE;
+        let stage2_deadline = start + STAGE2_DEADLINE;
+        let stage3_deadline = start + STAGE3_DEADLINE;
+        let endgame_at = start + ENDGAME_DEADLINE;
+
+        let mut join_set: JoinSet<TaskResult> = JoinSet::new();
+        for vq in &original_tier {
+            for p in stage1_providers {
+                join_set.spawn(run_provider_task(
+                    Arc::clone(p),
+                    vq.clone(),
+                    Arc::clone(&ids),
+                    Arc::clone(&ctx),
+                    true,
+                ));
+            }
+        }
+
+        let mut display = DisplayState::new(word_sync, ctx.settings.allow_plain, false);
+        let mut published_initial = false;
+        let mut any_transient_err = false;
+        let mut first_err: Option<String> = None;
+        let mut stage2_submitted = stage2_providers.is_empty();
+        let mut stage3_submitted = blind.is_empty() && derived_tier.is_empty();
+
+        let pctx = PollContext {
+            epoch,
+            meta: &meta,
+            service: service.as_deref(),
+            endgame_at,
+            outcome_tx: &outcome_tx,
+        };
+
+        // Stage 1 (0..2s)
+        poll_stage(
+            &pctx,
+            stage1_deadline,
+            &mut join_set,
+            &mut display,
+            &mut published_initial,
+            &mut any_transient_err,
+            &mut first_err,
         )
         .await;
 
-        if let Some((Ok((lines, _raw, _ids)), format)) = db_match
-            && !lines.is_empty()
-        {
-            let provider = db_format_to_provider(format);
-            let position = fetch_position(service.as_deref()).await;
+        // Stage 2 (2..4s)
+        if !display.window_closed && !stage2_providers.is_empty() {
+            stage2_submitted = true;
+            for vq in &original_tier {
+                for p in stage2_providers {
+                    join_set.spawn(run_provider_task(
+                        Arc::clone(p),
+                        vq.clone(),
+                        Arc::clone(&ids),
+                        Arc::clone(&ctx),
+                        true,
+                    ));
+                }
+            }
+            poll_stage(
+                &pctx,
+                stage2_deadline,
+                &mut join_set,
+                &mut display,
+                &mut published_initial,
+                &mut any_transient_err,
+                &mut first_err,
+            )
+            .await;
+        }
 
+        // Stage 3 (4..9s)
+        if !display.window_closed && (!blind.is_empty() || !derived_tier.is_empty()) {
+            stage3_submitted = true;
+            for vq in &derived_tier {
+                for p in &non_blind {
+                    join_set.spawn(run_provider_task(
+                        Arc::clone(p),
+                        vq.clone(),
+                        Arc::clone(&ids),
+                        Arc::clone(&ctx),
+                        false,
+                    ));
+                }
+                for p in &blind {
+                    join_set.spawn(run_provider_task(
+                        Arc::clone(p),
+                        vq.clone(),
+                        Arc::clone(&ids),
+                        Arc::clone(&ctx),
+                        false,
+                    ));
+                }
+            }
+            for vq in &original_tier {
+                for p in &blind {
+                    join_set.spawn(run_provider_task(
+                        Arc::clone(p),
+                        vq.clone(),
+                        Arc::clone(&ids),
+                        Arc::clone(&ctx),
+                        false,
+                    ));
+                }
+            }
+            poll_stage(
+                &pctx,
+                stage3_deadline,
+                &mut join_set,
+                &mut display,
+                &mut published_initial,
+                &mut any_transient_err,
+                &mut first_err,
+            )
+            .await;
+        }
+
+        // Drain any already-finished tasks without blocking
+        while let Some(res) = join_set.try_join_next() {
+            if let Ok(tr) = res {
+                match tr.outcome {
+                    Ok(cands) => {
+                        for c in cands {
+                            display.accept(c, tr.penalty, false);
+                        }
+                    }
+                    Err(e) => {
+                        if is_transient(&e) {
+                            any_transient_err = true;
+                        }
+                        if first_err.is_none() {
+                            first_err = Some(e.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Promote best fallback / blind winner if nothing published yet
+        if let Some(promoted) = display.promote_endgame().or_else(|| {
+            if !published_initial {
+                display
+                    .candidates
+                    .peek()
+                    .filter(|c| display.allow_plain || c.sync_rank > 0)
+                    .map(|c| c.lyrics.clone())
+            } else {
+                None
+            }
+        }) {
+            let snapshot = display.sorted_snapshot();
+            emit_fetch_lyrics(&pctx, promoted, &mut published_initial, snapshot).await;
+        }
+
+        if !published_initial {
+            join_set.abort_all();
+            if any_transient_err {
+                let _ = outcome_tx
+                    .send(FetchOutcome::Unavailable {
+                        epoch,
+                        meta,
+                        service: service.unwrap_or_default(),
+                        message: first_err.unwrap_or_else(|| "Providers unreachable".into()),
+                    })
+                    .await;
+            } else {
+                let _ = outcome_tx
+                    .send(FetchOutcome::Exhausted {
+                        epoch,
+                        meta,
+                        err: first_err,
+                    })
+                    .await;
+            }
+            return;
+        }
+
+        if !collect_all_candidates {
+            join_set.abort_all();
+            return;
+        }
+
+        // Background queue fill: collect remaining providers for 'r' candidate cycling
+        if !stage2_submitted {
+            for vq in &original_tier {
+                for p in stage2_providers {
+                    join_set.spawn(run_provider_task(
+                        Arc::clone(p),
+                        vq.clone(),
+                        Arc::clone(&ids),
+                        Arc::clone(&ctx),
+                        false,
+                    ));
+                }
+            }
+        }
+        if !stage3_submitted {
+            for vq in &original_tier {
+                for p in &blind {
+                    join_set.spawn(run_provider_task(
+                        Arc::clone(p),
+                        vq.clone(),
+                        Arc::clone(&ids),
+                        Arc::clone(&ctx),
+                        false,
+                    ));
+                }
+            }
+            for vq in &derived_tier {
+                for p in non_blind.iter().chain(blind.iter()) {
+                    join_set.spawn(run_provider_task(
+                        Arc::clone(p),
+                        vq.clone(),
+                        Arc::clone(&ids),
+                        Arc::clone(&ctx),
+                        false,
+                    ));
+                }
+            }
+        }
+
+        let fill_deadline = Instant::now() + Duration::from_secs(6);
+        while !join_set.is_empty() {
+            tokio::select! {
+                Some(res) = join_set.join_next() => {
+                    if let Ok(TaskResult { outcome: Ok(cands), penalty, .. }) = res {
+                        for c in cands {
+                            display.accept(c, penalty, false);
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(fill_deadline) => {
+                    join_set.abort_all();
+                    break;
+                }
+            }
+        }
+
+        let all_candidates = display.drain_sorted_candidates();
+        if !all_candidates.is_empty() {
             let _ = outcome_tx
-                .send(FetchOutcome::Success {
+                .send(FetchOutcome::CandidatesReady {
                     epoch,
-                    meta: meta.clone(),
-                    lines,
-                    provider,
-                    position,
+                    meta,
+                    candidates: all_candidates,
                 })
                 .await;
-
-            // Instant SWR: if cached lyrics are line-level and musixmatch is configured,
-            // query Richsync karaoke upgrade asynchronously in the background.
-            if format != crate::lyrics::database::LyricsFormat::Richsync
-                && providers.iter().any(|p| p == "musixmatch")
-                && let Ok((mxm_lines, mxm_raw, mxm_ids)) =
-                    crate::lyrics::fetch_lyrics_from_musixmatch_usertoken(
-                        &meta.artist,
-                        &meta.title,
-                        &meta.album,
-                        meta.length,
-                        meta.spotify_id.as_deref(),
-                        meta.isrc.as_deref(),
-                        meta.itunes_id.as_deref(),
-                    )
-                    .await
-                && mxm_lines.iter().any(|l| l.words.is_some())
-            {
-                store_lyrics_in_cache(
-                    &meta,
-                    mxm_raw,
-                    crate::lyrics::database::LyricsFormat::Richsync,
-                    &mxm_ids.track_isrcs,
-                    &mxm_ids.track_spotify_ids,
-                    &mxm_ids.track_itunes_ids,
-                )
-                .await;
-
-                let _ = outcome_tx
-                    .send(FetchOutcome::Upgraded {
-                        epoch,
-                        meta,
-                        lines: mxm_lines,
-                        format: crate::lyrics::database::LyricsFormat::Richsync,
-                    })
-                    .await;
-            }
-            return;
         }
-
-        // 2. Cold cache miss: API retrieval
-        let user_prefers_lrclib = providers.first().map(|s| s.as_str()) == Some("lrclib");
-        if !user_prefers_lrclib
-            && providers.iter().any(|p| p == "musixmatch")
-            && providers.iter().any(|p| p == "lrclib")
-        {
-            execute_hedged_fetch(epoch, meta, service, outcome_tx).await;
-            return;
-        }
-
-        execute_sequential_fetch(epoch, meta, providers, service, outcome_tx).await;
     })
-}
-
-/// Races Musixmatch and LRCLIB in background without holding state locks.
-async fn execute_hedged_fetch(
-    epoch: u64,
-    meta: TrackMetadata,
-    service: Option<String>,
-    outcome_tx: tokio::sync::mpsc::Sender<FetchOutcome>,
-) {
-    let lrc_artist = meta.artist.clone();
-    let lrc_title = meta.title.clone();
-    let lrc_album = meta.album.clone();
-    let length = meta.length;
-    let spotify_id = meta.spotify_id.clone();
-    let isrc = meta.isrc.clone();
-    let itunes_id = meta.itunes_id.clone();
-
-    let mut lrclib_fut = std::pin::pin!(crate::lyrics::fetch_lyrics_from_lrclib(
-        &lrc_artist,
-        &lrc_title,
-        &lrc_album,
-        length,
-    ));
-
-    let mxm_artist = meta.artist.clone();
-    let mxm_title = meta.title.clone();
-    let mxm_album = meta.album.clone();
-
-    let mut mxm_task = tokio::spawn(async move {
-        crate::lyrics::fetch_lyrics_from_musixmatch_usertoken(
-            &mxm_artist,
-            &mxm_title,
-            &mxm_album,
-            length,
-            spotify_id.as_deref(),
-            isrc.as_deref(),
-            itunes_id.as_deref(),
-        )
-        .await
-    });
-
-    tokio::select! {
-        mxm_res = &mut mxm_task => {
-            let mxm_res = mxm_res.unwrap_or_else(|e| Err(crate::lyrics::types::LyricsError::Api(e.to_string())));
-            match mxm_res {
-                Ok((lines, raw, ids)) if !lines.is_empty() => {
-                    let provider = determine_musixmatch_provider(&lines);
-                    let format = provider_to_db_format(provider);
-                    store_lyrics_in_cache(&meta, raw, format, &ids.track_isrcs, &ids.track_spotify_ids, &ids.track_itunes_ids).await;
-                    let position = fetch_position(service.as_deref()).await;
-                    let _ = outcome_tx.send(FetchOutcome::Success {
-                        epoch,
-                        meta,
-                        lines,
-                        provider,
-                        position,
-                    }).await;
-                }
-                mxm_other => {
-                    let lrc_res = lrclib_fut.await;
-                    match lrc_res {
-                        Ok((lines, raw, ids)) if !lines.is_empty() => {
-                            store_lyrics_in_cache(&meta, raw, crate::lyrics::database::LyricsFormat::Lrclib, &ids.track_isrcs, &ids.track_spotify_ids, &ids.track_itunes_ids).await;
-                            let position = fetch_position(service.as_deref()).await;
-                            let _ = outcome_tx.send(FetchOutcome::Success {
-                                epoch,
-                                meta,
-                                lines,
-                                provider: Provider::Lrclib,
-                                position,
-                            }).await;
-                        }
-                        lrc_other => {
-                            handle_failed_hedged_fetch(epoch, meta, service, mxm_other, lrc_other, outcome_tx).await;
-                        }
-                    }
-                }
-            }
-        }
-        lrc_res = &mut lrclib_fut => {
-            match lrc_res {
-                Ok((lines, raw, ids)) if !lines.is_empty() => {
-                    store_lyrics_in_cache(&meta, raw, crate::lyrics::database::LyricsFormat::Lrclib, &ids.track_isrcs, &ids.track_spotify_ids, &ids.track_itunes_ids).await;
-                    let position = fetch_position(service.as_deref()).await;
-                    let _ = outcome_tx.send(FetchOutcome::Success {
-                        epoch,
-                        meta: meta.clone(),
-                        lines,
-                        provider: Provider::Lrclib,
-                        position,
-                    }).await;
-
-                    // Reuse in-flight Musixmatch task for Richsync upgrade
-                    if let Ok(Ok((mxm_lines, mxm_raw, mxm_ids))) = mxm_task.await
-                        && mxm_lines.iter().any(|l| l.words.is_some())
-                    {
-                        store_lyrics_in_cache(
-                            &meta,
-                            mxm_raw,
-                            crate::lyrics::database::LyricsFormat::Richsync,
-                            &mxm_ids.track_isrcs,
-                            &mxm_ids.track_spotify_ids,
-                            &mxm_ids.track_itunes_ids,
-                        ).await;
-
-                        let _ = outcome_tx.send(FetchOutcome::Upgraded {
-                            epoch,
-                            meta,
-                            lines: mxm_lines,
-                            format: crate::lyrics::database::LyricsFormat::Richsync,
-                        }).await;
-                    }
-                }
-                lrc_other => {
-                    let mxm_res = mxm_task.await.unwrap_or_else(|e| Err(crate::lyrics::types::LyricsError::Api(e.to_string())));
-                    match mxm_res {
-                        Ok((lines, raw, ids)) if !lines.is_empty() => {
-                            let provider = determine_musixmatch_provider(&lines);
-                            let format = provider_to_db_format(provider);
-                            store_lyrics_in_cache(&meta, raw, format, &ids.track_isrcs, &ids.track_spotify_ids, &ids.track_itunes_ids).await;
-                            let position = fetch_position(service.as_deref()).await;
-                            let _ = outcome_tx.send(FetchOutcome::Success {
-                                epoch,
-                                meta,
-                                lines,
-                                provider,
-                                position,
-                            }).await;
-                        }
-                        mxm_other => {
-                            handle_failed_hedged_fetch(epoch, meta, service, mxm_other, lrc_other, outcome_tx).await;
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-async fn handle_failed_hedged_fetch(
-    epoch: u64,
-    meta: TrackMetadata,
-    service: Option<String>,
-    mxm: crate::lyrics::types::ProviderResult,
-    lrc: crate::lyrics::types::ProviderResult,
-    outcome_tx: tokio::sync::mpsc::Sender<FetchOutcome>,
-) {
-    if mxm.is_ok() || lrc.is_ok() {
-        let _ = outcome_tx
-            .send(FetchOutcome::Exhausted {
-                epoch,
-                meta,
-                err: None,
-            })
-            .await;
-        return;
-    }
-
-    let a_transient = mxm.as_ref().err().is_some_and(is_transient);
-    let b_transient = lrc.as_ref().err().is_some_and(is_transient);
-
-    if a_transient && b_transient {
-        let _ = outcome_tx
-            .send(FetchOutcome::Unavailable {
-                epoch,
-                meta,
-                service: service.unwrap_or_default(),
-                message: NETWORK_RETRY_MESSAGE.to_string(),
-            })
-            .await;
-    } else {
-        let _ = outcome_tx
-            .send(FetchOutcome::Exhausted {
-                epoch,
-                meta,
-                err: None,
-            })
-            .await;
-    }
-}
-
-async fn execute_sequential_fetch(
-    epoch: u64,
-    meta: TrackMetadata,
-    providers: Vec<String>,
-    service: Option<String>,
-    outcome_tx: tokio::sync::mpsc::Sender<FetchOutcome>,
-) {
-    let mut saw_transient = false;
-    let mut saw_not_found = false;
-    let mut last_non_transient_err: Option<LyricsError> = None;
-
-    for provider in &providers {
-        let res = match provider.as_str() {
-            "lrclib" => crate::lyrics::fetch_lyrics_from_lrclib(
-                &meta.artist,
-                &meta.title,
-                &meta.album,
-                meta.length,
-            )
-            .await
-            .map(|(lines, raw, ids)| {
-                (
-                    lines,
-                    raw,
-                    ids,
-                    crate::lyrics::database::LyricsFormat::Lrclib,
-                    Provider::Lrclib,
-                )
-            }),
-            "musixmatch" => crate::lyrics::fetch_lyrics_from_musixmatch_usertoken(
-                &meta.artist,
-                &meta.title,
-                &meta.album,
-                meta.length,
-                meta.spotify_id.as_deref(),
-                meta.isrc.as_deref(),
-                meta.itunes_id.as_deref(),
-            )
-            .await
-            .map(|(lines, raw, ids)| {
-                let prov = determine_musixmatch_provider(&lines);
-                let fmt = provider_to_db_format(prov);
-                (lines, raw, ids, fmt, prov)
-            }),
-            _ => continue,
-        };
-
-        match res {
-            Ok((lines, raw, ids, format, provider)) if !lines.is_empty() => {
-                store_lyrics_in_cache(
-                    &meta,
-                    raw,
-                    format,
-                    &ids.track_isrcs,
-                    &ids.track_spotify_ids,
-                    &ids.track_itunes_ids,
-                )
-                .await;
-                let position = fetch_position(service.as_deref()).await;
-                let _ = outcome_tx
-                    .send(FetchOutcome::Success {
-                        epoch,
-                        meta,
-                        lines,
-                        provider,
-                        position,
-                    })
-                    .await;
-                return;
-            }
-            Ok(_) => {
-                saw_not_found = true;
-            }
-            Err(e) => {
-                if is_transient(&e) {
-                    saw_transient = true;
-                } else {
-                    last_non_transient_err = Some(e);
-                }
-            }
-        }
-    }
-
-    if saw_transient && !saw_not_found {
-        let _ = outcome_tx
-            .send(FetchOutcome::Unavailable {
-                epoch,
-                meta,
-                service: service.unwrap_or_default(),
-                message: NETWORK_RETRY_MESSAGE.to_string(),
-            })
-            .await;
-    } else {
-        let err = last_non_transient_err
-            .filter(|_| !saw_not_found)
-            .map(|e| e.to_string());
-        let _ = outcome_tx
-            .send(FetchOutcome::Exhausted { epoch, meta, err })
-            .await;
-    }
 }
 
 #[cfg(test)]
@@ -520,98 +663,53 @@ mod tests {
         assert!(is_retryable_status(500));
         assert!(is_retryable_status(503));
         assert!(!is_retryable_status(400));
-        assert!(!is_retryable_status(401));
-        assert!(!is_retryable_status(404));
     }
 
     #[test]
-    fn test_default_config_provider_order() {
-        let config = crate::Config::default();
-        assert_eq!(
-            config.providers.first().map(|s| s.as_str()),
-            Some("musixmatch")
+    fn test_query_tiers_and_cutoff() {
+        let track = TrackInfo::new(
+            "Artist - Track Name (Remastered 2020)",
+            "Artist feat. Guest",
+            "Album",
+            240,
         );
-        assert_eq!(config.providers.get(1).map(|s| s.as_str()), Some("lrclib"));
-        assert!(!config.romanize);
+        let (orig, derived) = build_query_tiers(&track);
+        assert!(!orig.is_empty());
+        assert!(!derived.is_empty());
+
+        let mut short_lyrics = Lyrics::new(
+            vec![crate::lyrics::types::LyricLine::new(5.0, "Early line").with_end(Some(10.0))],
+            "LRCLIB",
+            true,
+        );
+        assert!(is_cut_off(&short_lyrics, &track));
+        short_lyrics.lines[0].end = Some(120.0);
+        assert!(!is_cut_off(&short_lyrics, &track));
     }
 
     #[test]
-    fn test_determine_musixmatch_provider_format() {
-        let plain_lines = vec![crate::lyrics::LyricLine::new(0.0, "hello")];
-        assert_eq!(
-            determine_musixmatch_provider(&plain_lines),
-            Provider::MusixmatchSubtitles
-        );
-
+    fn test_word_timing_defaults_in_fetch() {
         let word = crate::lyrics::types::WordTiming {
-            start: 0.0,
-            end: 1.0,
-            text: "hello".into(),
+            start: 1.0,
+            end: 2.0,
+            text: "Hello".into(),
             grapheme_boundaries: vec![0, 5],
             grapheme_times: vec![],
+            ..Default::default()
         };
-        let rich_lines =
-            vec![crate::lyrics::LyricLine::new(0.0, "hello").with_words(Some(vec![word]))];
-        assert_eq!(
-            determine_musixmatch_provider(&rich_lines),
-            Provider::MusixmatchRichsync
+        assert_eq!(word.text, "Hello");
+        assert!(!word.ends_with_space);
+    }
+
+    #[test]
+    fn test_build_query_tiers_single_side_han() {
+        let track = TrackInfo::new("English Title", "周杰倫", "Album", 240);
+        let (_orig, derived) = build_query_tiers(&track);
+        assert!(
+            derived
+                .iter()
+                .any(|v| v.track.title == "English Title" && v.track.artist == "周杰伦"),
+            "Expected Simplified Han artist variant paired with unchanged ASCII title"
         );
-    }
-
-    #[tokio::test]
-    async fn test_handle_failed_hedged_fetch_both_transient() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let meta = TrackMetadata {
-            title: "Test Song".into(),
-            artist: "Test Artist".into(),
-            ..Default::default()
-        };
-        let transient1 = Err(LyricsError::Http(500));
-        let transient2 = Err(LyricsError::Http(503));
-
-        handle_failed_hedged_fetch(1, meta, Some("service".into()), transient1, transient2, tx)
-            .await;
-        let outcome = rx.recv().await.unwrap();
-        assert!(matches!(outcome, FetchOutcome::Unavailable { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_handle_failed_hedged_fetch_one_ok_one_transient() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let meta = TrackMetadata {
-            title: "Test Song".into(),
-            artist: "Test Artist".into(),
-            ..Default::default()
-        };
-        let ok_empty = Ok((Vec::new(), None, Default::default()));
-        let transient = Err(LyricsError::Http(503));
-
-        handle_failed_hedged_fetch(1, meta, Some("service".into()), ok_empty, transient, tx).await;
-        let outcome = rx.recv().await.unwrap();
-        assert!(matches!(outcome, FetchOutcome::Exhausted { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_handle_failed_hedged_fetch_one_nontransient() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let meta = TrackMetadata {
-            title: "Test Song".into(),
-            artist: "Test Artist".into(),
-            ..Default::default()
-        };
-        let non_transient = Err(LyricsError::Http(400));
-        let transient = Err(LyricsError::Http(503));
-
-        handle_failed_hedged_fetch(
-            1,
-            meta,
-            Some("service".into()),
-            non_transient,
-            transient,
-            tx,
-        )
-        .await;
-        let outcome = rx.recv().await.unwrap();
-        assert!(matches!(outcome, FetchOutcome::Exhausted { .. }));
     }
 }

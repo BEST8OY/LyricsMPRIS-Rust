@@ -5,7 +5,7 @@ use std::ops::Deref;
 use tokio::sync::OnceCell;
 use zbus::fdo::DBusProxy;
 use zbus::names::BusName;
-use zvariant::OwnedValue;
+use zbus::{OwnedVariant, Variant};
 
 /// Errors that can occur during MPRIS operations
 #[derive(thiserror::Error, Debug)]
@@ -126,9 +126,9 @@ pub async fn query_player_priority(conn: &zbus::Connection, service: &str) -> Pl
             )
             .await
             .ok()?;
-        let val: OwnedValue = reply.body().deserialize().ok()?;
+        let val: OwnedVariant = reply.body().deserialize().ok()?;
         let status = match val.deref() {
-            zvariant::Value::Str(s) => s.as_str(),
+            Variant::Str(s) => s.as_str(),
             _ => return None,
         };
         Some(PlaybackPriority::from_status_str(status))
@@ -179,12 +179,15 @@ pub async fn find_best_active_service(
                 && priority == PlaybackPriority::Playing
             {
                 if let Ok(bus_name) = BusName::try_from(svc.as_str()) {
-                    dbus_proxy
-                        .get_name_owner(bus_name)
-                        .await
-                        .ok()
-                        .map(|u| u.as_str() == target_unique)
-                        .unwrap_or(false)
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(50),
+                        dbus_proxy.get_name_owner(bus_name),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .map(|u| u.as_str() == target_unique)
+                    .unwrap_or(false)
                 } else {
                     false
                 }
@@ -223,6 +226,7 @@ pub async fn find_best_active_service(
         && !best_is_pref
         && let Some((_, curr_priority, _, _)) =
             scored.iter().find(|(s, _, _, _)| s.as_str() == curr)
+        && *curr_priority > PlaybackPriority::Unresponsive
         && *curr_priority >= best_priority
     {
         return Ok(Some(curr.to_string()));

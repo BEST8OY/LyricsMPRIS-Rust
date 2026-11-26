@@ -25,7 +25,7 @@ pub enum RetryDirective {
     Clear,
     /// A new track was detected; event loop increments epoch and spawns async fetch
     TrackChanged {
-        meta: TrackMetadata,
+        meta: Box<TrackMetadata>,
         service: String,
     },
 }
@@ -65,6 +65,23 @@ pub(crate) async fn handle_mpris_event(
             let effective_pos = position + queue_latency;
 
             handle_state_update(effective_pos, None, state, update_tx).await;
+            return RetryDirective::Keep;
+        }
+        Event::RateChange {
+            position,
+            rate,
+            sampled_at,
+        } => {
+            let queue_latency = if state.player_state.playing {
+                sampled_at.elapsed().as_secs_f64().min(2.0) * rate.max(0.0)
+            } else {
+                0.0
+            };
+            let effective_pos = guard_spurious_zero(position + queue_latency, state);
+            let (changed_index, changed_rate_or_pos) = state.update_rate(effective_pos, rate);
+            if changed_index || changed_rate_or_pos {
+                send_update(state, update_tx, changed_rate_or_pos).await;
+            }
             return RetryDirective::Keep;
         }
     };
@@ -220,7 +237,36 @@ pub(crate) async fn handle_new_track(ctx: NewTrackContext<'_>) -> RetryDirective
 
     send_update(state, update_tx, true).await;
 
-    RetryDirective::TrackChanged { meta, service }
+    RetryDirective::TrackChanged {
+        meta: Box::new(meta),
+        service,
+    }
+}
+
+/// Guard against spurious near-zero position reports while playback is already active past 1.0s,
+/// unless the track has reached the end and looped back to the beginning.
+fn guard_spurious_zero(position: f64, state: &StateBundle) -> f64 {
+    let current_pos = state.player_state.estimate_position();
+    let is_track_loop = state
+        .player_state
+        .length
+        .is_some_and(|len| current_pos >= (len - 3.0).max(1.0))
+        || state
+            .lyric_state
+            .lines
+            .last()
+            .is_some_and(|last| current_pos >= last.time && current_pos > 3.0);
+
+    if position <= 0.05 && !is_track_loop && current_pos > 1.0 {
+        tracing::debug!(
+            estimated = current_pos,
+            incoming = position,
+            "Ignoring 0.0s position report while track is already active at {current_pos}s"
+        );
+        current_pos
+    } else {
+        position
+    }
 }
 
 /// Handles position and playback state updates.
@@ -235,34 +281,7 @@ pub(crate) async fn handle_state_update(
         .map(|s| s == "Playing")
         .unwrap_or(state.player_state.playing);
 
-    // Guard: ignore 0.0s (or near-zero) position reports while playback is already active past 1.0s,
-    // whether playing or paused, avoiding retrograde desyncs from stale buffering events,
-    // UNLESS the track has reached the end and looped back to the beginning.
-    let current_pos = state.player_state.estimate_position();
-    let is_track_loop = state
-        .player_state
-        .length
-        .is_some_and(|len| current_pos >= (len - 3.0).max(1.0))
-        || state
-            .lyric_state
-            .lines
-            .last()
-            .is_some_and(|last| current_pos >= last.time && current_pos > 3.0);
-
-    let effective_position = if position <= 0.05 && !is_track_loop {
-        if current_pos > 1.0 {
-            tracing::debug!(
-                estimated = current_pos,
-                incoming = position,
-                "Ignoring 0.0s position report while track is already active at {current_pos}s"
-            );
-            current_pos
-        } else {
-            position
-        }
-    } else {
-        position
-    };
+    let effective_position = guard_spurious_zero(position, state);
 
     let (playing_changed, changed_index, position_jumped) =
         state.update_playback_and_position(playing, effective_position);
@@ -651,5 +670,42 @@ mod tests {
         let update = rx.recv().await.expect("Loop update emitted");
         assert!(update.position < 0.5);
         assert_eq!(update.index, None);
+    }
+
+    #[tokio::test]
+    async fn test_rate_change_updates_timer_rate_and_preserves_playing() {
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut state = StateBundle::new();
+
+        let lines = vec![
+            crate::lyrics::LyricLine::new(10.0, "Line 1"),
+            crate::lyrics::LyricLine::new(50.0, "Line 2"),
+        ];
+        state.lyric_state.update_lines(lines);
+        state.player_state.update_playback_dbus(true, 15.0);
+        state.update_index(15.0);
+        state.mark_state_sent();
+
+        let directive = handle_mpris_event(
+            Event::RateChange {
+                position: 15.0,
+                rate: 1.5,
+                sampled_at: std::time::Instant::now(),
+            },
+            &mut state,
+            &tx,
+        )
+        .await;
+
+        assert!(matches!(directive, RetryDirective::Keep));
+        assert!(state.player_state.playing);
+        assert_eq!(state.player_state.time_anchor().rate, 1.5);
+
+        let update = rx
+            .recv()
+            .await
+            .expect("RateChange update should be emitted");
+        assert_eq!(update.time_anchor.rate, 1.5);
+        assert!(update.playing);
     }
 }

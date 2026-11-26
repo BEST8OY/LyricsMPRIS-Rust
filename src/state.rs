@@ -31,7 +31,7 @@ use std::sync::Arc;
 /// - [`Provider::Lrclib`]: LRCLIB database (returns LRC timestamp format)
 /// - [`Provider::MusixmatchRichsync`]: Word-level synchronized lyrics (JSON)
 /// - [`Provider::MusixmatchSubtitles`]: Line-level synchronized lyrics (JSON)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Provider {
     /// LRCLIB provider - returns LRC format: `[MM:SS.CC]lyrics`
@@ -40,6 +40,57 @@ pub enum Provider {
     MusixmatchRichsync,
     /// Musixmatch provider - subtitle format with line-level timing (JSON)
     MusixmatchSubtitles,
+    /// Any dynamically resolved Morphe provider (Apple, LyricsPlus, QQ, KuGou, etc.)
+    Custom {
+        /// Human-readable provider display name
+        name: String,
+        /// Whether these lyrics include word-level timing
+        word_synced: bool,
+    },
+}
+
+impl Provider {
+    /// Builds a `Provider` badge from a parsed `Lyrics` container.
+    pub fn from_lyrics(lyrics: &crate::lyrics::types::Lyrics) -> Self {
+        let word_synced = lyrics.has_word_sync();
+        if lyrics.provider_name == "LRCLIB" {
+            Self::Lrclib
+        } else if lyrics.provider_name == "Musixmatch" {
+            if word_synced {
+                Self::MusixmatchRichsync
+            } else {
+                Self::MusixmatchSubtitles
+            }
+        } else {
+            Self::Custom {
+                name: lyrics.provider_name.clone(),
+                word_synced,
+            }
+        }
+    }
+
+    /// Returns true if this provider supplied word-synced timing.
+    pub fn is_word_synced(&self) -> bool {
+        matches!(
+            self,
+            Self::MusixmatchRichsync
+                | Self::Custom {
+                    word_synced: true,
+                    ..
+                }
+        )
+    }
+
+    /// Returns the display name of this provider.
+    #[allow(dead_code)]
+    pub fn display_name(&self) -> &str {
+        match self {
+            Self::Lrclib => "LRCLIB",
+            Self::MusixmatchRichsync => "Musixmatch (Richsync)",
+            Self::MusixmatchSubtitles => "Musixmatch (Subtitles)",
+            Self::Custom { name, .. } => name.as_str(),
+        }
+    }
 }
 
 // ============================================================================
@@ -186,6 +237,7 @@ impl PlayerState {
         self.artist.clone_from(&meta.artist);
         self.album.clone_from(&meta.album);
         self.length = meta.length;
+        self.timer.set_rate(1.0);
         self.timer.reset(0.0);
         self.position = 0.0;
         self.playing = false;
@@ -310,6 +362,12 @@ impl PlayerState {
             self.timer.reset(self.position);
             tracing::debug!(pos = self.position, "Playback paused");
         }
+    }
+
+    /// Updates playback rate and anchor position without altering playing/paused state.
+    pub fn set_rate(&mut self, position: f64, rate: f64) {
+        self.set_position(position);
+        self.timer.set_rate(rate);
     }
 
     /// Returns an immutable [`TimeAnchor`] for deterministic external position projection.
@@ -627,6 +685,27 @@ impl StateBundle {
         (playing_changed, changed_index, position_jumped)
     }
 
+    /// Updates playback rate and position, incrementing `version` when anything observable changed.
+    pub fn update_rate(&mut self, position: f64, rate: f64) -> (bool, bool) {
+        let prev_position = self.player_state.estimate_position();
+        let prev_rate = self.player_state.time_anchor().rate;
+
+        self.player_state.set_rate(position, rate);
+
+        let current_position = self.player_state.estimate_position();
+        let new_rate = self.player_state.time_anchor().rate;
+        let changed_index = self.update_index(current_position);
+        let position_jumped =
+            (current_position - prev_position).abs() > Self::POSITION_DRIFT_THRESHOLD_SECS;
+        let rate_changed = (new_rate - prev_rate).abs() > f64::EPSILON;
+
+        if !changed_index && (position_jumped || rate_changed) {
+            self.increment_version();
+        }
+
+        (changed_index, position_jumped || rate_changed)
+    }
+
     /// Increments the version counter, wrapping on overflow.
     ///
     /// This is called automatically by state-modifying methods.
@@ -662,7 +741,7 @@ impl StateBundle {
             artist: self.player_state.artist.clone(),
             title: self.player_state.title.clone(),
             album: self.player_state.album.clone(),
-            provider: self.provider,
+            provider: self.provider.clone(),
             time_anchor: anchor,
         }
     }

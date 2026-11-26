@@ -4,9 +4,8 @@ use std::sync::LazyLock;
 
 use super::extract::{extract_track_ids_from_macro, get_root_hint, get_root_status_code};
 use super::token::DEFAULT_USER_AGENT;
-use crate::lyrics::database::DURATION_TOLERANCE_SECS;
-use crate::lyrics::database::compress::{clean_title_annotations, normalize};
 use crate::lyrics::types::{LyricLine, LyricsError, TrackMatchInfo};
+use crate::text_utils::{DURATION_TOLERANCE_SECS, clean_title_annotations, normalize};
 use reqwest::Client;
 use serde_json::Value;
 
@@ -144,9 +143,8 @@ pub(crate) async fn try_macro_for_lyrics(
             && let Some(richsync_body) = calls
                 .pointer("/track.richsync.get/message/body/richsync/richsync_body")
                 .and_then(|v| v.as_str())
-            && let Some(mut parsed) = crate::lyrics::parse::parse_richsync_body(richsync_body)
+            && let Some(parsed) = crate::lyrics::parse::parse_richsync_body(richsync_body)
         {
-            crate::lyrics::romanize::apply_romanization(&mut parsed);
             return Ok(FetchOutcome::Success(
                 parsed,
                 Some(richsync_body.to_string()),
@@ -159,9 +157,8 @@ pub(crate) async fn try_macro_for_lyrics(
             && let Some(subtitle_body) = calls
                 .pointer("/track.subtitles.get/message/body/subtitle_list/0/subtitle/subtitle_body")
                 .and_then(|v| v.as_str())
-            && let Some(mut parsed) = crate::lyrics::parse::parse_subtitle_body(subtitle_body)
+            && let Some(parsed) = crate::lyrics::parse::parse_subtitle_body(subtitle_body)
         {
-            crate::lyrics::romanize::apply_romanization(&mut parsed);
             return Ok(FetchOutcome::Success(
                 parsed,
                 Some(subtitle_body.to_string()),

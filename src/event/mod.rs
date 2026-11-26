@@ -3,9 +3,11 @@
 //! Handles all player events (track changes, seeks, playback state updates)
 //! and coordinates lyrics fetching with state updates.
 
+pub mod display_state;
 pub mod fetch;
 pub mod handlers;
 
+pub use display_state::ScoredCandidate;
 pub use handlers::{RetryDirective, handle_no_player};
 
 use crate::mpris::TrackMetadata;
@@ -31,6 +33,13 @@ pub enum Event {
     Calibrated {
         meta: TrackMetadata,
         position: f64,
+        sampled_at: std::time::Instant,
+    },
+
+    /// Playback rate change event (without disturbing calibration state).
+    RateChange {
+        position: f64,
+        rate: f64,
         sampled_at: std::time::Instant,
     },
 }

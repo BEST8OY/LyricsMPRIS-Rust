@@ -1,10 +1,11 @@
-// lyrics/mod.rs - top-level lyrics module re-exporting submodules
-pub mod database;
+pub mod crypto;
+pub mod filter;
 pub mod parse;
+pub mod parsers;
 pub mod providers;
-pub mod romanize;
 pub mod types;
 
-// parse::parse_synced_lyrics is used via its full path in providers; no top-level re-export needed
+#[allow(unused_imports)]
 pub use providers::{fetch_lyrics_from_lrclib, fetch_lyrics_from_musixmatch_usertoken};
-pub use types::LyricLine;
+#[allow(unused_imports)]
+pub use types::{LyricLine, Lyrics, TrackInfo, TrackMatchInfo, WordTiming};

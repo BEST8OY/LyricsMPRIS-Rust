@@ -9,7 +9,7 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::block_in_place;
-use zvariant::OwnedValue;
+use zbus::{OwnedVariant, Variant};
 
 static ISRC_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -33,6 +33,17 @@ pub struct TrackMetadata {
     pub spotify_id: Option<String>,
     pub isrc: Option<String>,
     pub itunes_id: Option<String>,
+    pub youtube_video_id: Option<String>,
+    pub is_local: bool,
+}
+
+/// Returns true if an MPRIS `xesam:url` points to a local file (`file://` or `/`).
+pub fn is_local_media_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    trimmed
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file://"))
+        || trimmed.starts_with('/')
 }
 
 /// Try to read ISRC from a local audio file path or URL using lofty.
@@ -109,7 +120,7 @@ fn normalize_spotify_trackid(trackid: &str) -> Option<String> {
 /// Returns the ISRC code string if found in the file's metadata, or None.
 fn isrc_from_metadata(url: Option<&str>) -> Option<String> {
     let file_url = url?;
-    if file_url.starts_with("file://") || file_url.starts_with('/') {
+    if is_local_media_url(file_url) {
         return get_isrc_from_file(file_url);
     }
     None
@@ -132,10 +143,10 @@ pub fn is_no_track(trackid: &str) -> bool {
 }
 
 /// Extract the first non-empty trimmed string from either a string variant or an array of strings.
-/// Borrows `val.deref()` directly to avoid heap clones of `OwnedValue`.
-pub fn extract_string_or_first_item(val: &OwnedValue) -> Option<String> {
+/// Borrows `val.deref()` directly to avoid heap clones of `OwnedVariant`.
+pub fn extract_string_or_first_item(val: &OwnedVariant) -> Option<String> {
     match val.deref() {
-        zvariant::Value::Str(s) => {
+        Variant::Str(s) => {
             let trimmed = s.as_str().trim();
             if trimmed.is_empty() {
                 None
@@ -143,7 +154,7 @@ pub fn extract_string_or_first_item(val: &OwnedValue) -> Option<String> {
                 Some(trimmed.to_string())
             }
         }
-        zvariant::Value::ObjectPath(p) => {
+        Variant::ObjectPath(p) => {
             let trimmed = p.as_str().trim();
             if trimmed.is_empty() {
                 None
@@ -151,7 +162,7 @@ pub fn extract_string_or_first_item(val: &OwnedValue) -> Option<String> {
                 Some(trimmed.to_string())
             }
         }
-        zvariant::Value::Array(arr) => {
+        Variant::Array(arr) => {
             for elem in arr.iter() {
                 if let Ok(s) = <&str>::try_from(elem) {
                     let trimmed = s.trim();
@@ -167,9 +178,9 @@ pub fn extract_string_or_first_item(val: &OwnedValue) -> Option<String> {
 }
 
 /// Extract track length in seconds from either i64 or u64 microseconds.
-pub fn extract_length_seconds(val: &OwnedValue) -> Option<f64> {
+pub fn extract_length_seconds(val: &OwnedVariant) -> Option<f64> {
     if let Ok(microsecs) = i64::try_from(val) {
-        return Some(microsecs as f64 / 1_000_000.0);
+        return (microsecs >= 0).then_some(microsecs as f64 / 1_000_000.0);
     }
     if let Ok(microsecs) = u64::try_from(val) {
         return Some(microsecs as f64 / 1_000_000.0);
@@ -180,7 +191,7 @@ pub fn extract_length_seconds(val: &OwnedValue) -> Option<f64> {
 /// Extract metadata from a raw D-Bus property map
 ///
 /// This is used for signal handlers where we receive raw variant maps.
-pub fn extract_metadata(map: &HashMap<String, OwnedValue>) -> TrackMetadata {
+pub fn extract_metadata(map: &HashMap<String, OwnedVariant>) -> TrackMetadata {
     let trackid = map
         .get("mpris:trackid")
         .and_then(extract_string_or_first_item);
@@ -219,6 +230,10 @@ pub fn extract_metadata(map: &HashMap<String, OwnedValue>) -> TrackMetadata {
         .and_then(normalize_spotify_url)
         .or_else(|| trackid.as_deref().and_then(normalize_spotify_trackid));
 
+    let youtube_video_id = extract_youtube_video_id(url.as_deref(), trackid.as_deref());
+
+    let is_local = url.as_deref().is_some_and(is_local_media_url);
+
     let isrc = if isrc_enabled() {
         isrc_from_metadata(url.as_deref())
     } else {
@@ -233,7 +248,72 @@ pub fn extract_metadata(map: &HashMap<String, OwnedValue>) -> TrackMetadata {
         spotify_id,
         isrc,
         itunes_id: None,
+        youtube_video_id,
+        is_local,
     }
+}
+
+fn is_valid_yt_id(id: &str) -> bool {
+    id.len() == 11
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// Extracts an 11-character YouTube `videoId` from `xesam:url` or YouTube-specific `mpris:trackid`.
+pub fn extract_youtube_video_id(url: Option<&str>, trackid: Option<&str>) -> Option<String> {
+    if let Some(raw_url) = url {
+        let u = raw_url.trim();
+        let lower = u.to_ascii_lowercase();
+        if lower.contains("youtu.be/") {
+            if let Some(rest) = u
+                .split_once("youtu.be/")
+                .map(|(_, r)| r.split(['?', '#', '&', '/']).next().unwrap_or(""))
+                && is_valid_yt_id(rest)
+            {
+                return Some(rest.to_string());
+            }
+        } else if lower.contains("youtube.com/") || lower.contains("youtube-nocookie.com/") {
+            if let Some((_, query)) = u.split_once('?') {
+                for pair in query.split('&') {
+                    if let Some(("v", val)) = pair.split_once('=') {
+                        let id = val.split('#').next().unwrap_or("");
+                        if is_valid_yt_id(id) {
+                            return Some(id.to_string());
+                        }
+                    }
+                }
+            }
+            for marker in ["/shorts/", "/embed/", "/live/", "/v/"] {
+                if let Some((_, rest)) = u.split_once(marker) {
+                    let id = rest.split(['?', '#', '&', '/']).next().unwrap_or("");
+                    if is_valid_yt_id(id) {
+                        return Some(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(tid) = trackid {
+        let t = tid.trim();
+        if let Some((_, rest)) = t.split_once("youtube:video:") {
+            let id = rest.split(['?', '#', '&', '/']).next().unwrap_or("");
+            if is_valid_yt_id(id) {
+                return Some(id.to_string());
+            }
+        }
+        if t.to_ascii_lowercase().contains("youtube")
+            && let Some((_, query)) = t.split_once("v=")
+        {
+            let id = query.split(['&', '#', '/']).next().unwrap_or("");
+            if is_valid_yt_id(id) {
+                return Some(id.to_string());
+            }
+        }
+    }
+
+    None
 }
 
 /// Query metadata for a specific MPRIS player service
@@ -245,7 +325,7 @@ pub async fn get_metadata(service: &str) -> Result<TrackMetadata, MprisError> {
     let conn = get_dbus_conn().await?;
 
     let proxy = MediaPlayer2PlayerProxy::builder(&conn)
-        .destination(service)?
+        .destination(service)
         .build()
         .await?;
 
@@ -264,19 +344,19 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             "xesam:title".to_string(),
-            OwnedValue::try_from(zvariant::Value::from("Test Song")).unwrap(),
+            OwnedVariant::try_from(Variant::from("Test Song")).unwrap(),
         );
         map.insert(
             "xesam:artist".to_string(),
-            OwnedValue::try_from(zvariant::Value::from(vec!["Artist 1", "Artist 2"])).unwrap(),
+            OwnedVariant::try_from(Variant::from(vec!["Artist 1", "Artist 2"])).unwrap(),
         );
         map.insert(
             "xesam:album".to_string(),
-            OwnedValue::try_from(zvariant::Value::from("Test Album")).unwrap(),
+            OwnedVariant::try_from(Variant::from("Test Album")).unwrap(),
         );
         map.insert(
             "mpris:length".to_string(),
-            OwnedValue::try_from(zvariant::Value::from(180_000_000i64)).unwrap(),
+            OwnedVariant::try_from(Variant::from(180_000_000i64)).unwrap(),
         );
 
         let track = extract_metadata(&map);
@@ -309,18 +389,16 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             "mpris:trackid".to_string(),
-            OwnedValue::try_from(zvariant::Value::from(
-                "/org/mpris/MediaPlayer2/TrackList/NoTrack",
-            ))
-            .unwrap(),
+            OwnedVariant::try_from(Variant::from("/org/mpris/MediaPlayer2/TrackList/NoTrack"))
+                .unwrap(),
         );
         map.insert(
             "xesam:title".to_string(),
-            OwnedValue::try_from(zvariant::Value::from("Stale Lingering Title")).unwrap(),
+            OwnedVariant::try_from(Variant::from("Stale Lingering Title")).unwrap(),
         );
         map.insert(
             "xesam:artist".to_string(),
-            OwnedValue::try_from(zvariant::Value::from(vec!["Stale Artist"])).unwrap(),
+            OwnedVariant::try_from(Variant::from(vec!["Stale Artist"])).unwrap(),
         );
         let extracted = extract_metadata(&map);
         assert_eq!(extracted, TrackMetadata::default());
@@ -369,19 +447,19 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             "xesam:title".to_string(),
-            OwnedValue::try_from(zvariant::Value::from("Test Title")).unwrap(),
+            OwnedVariant::try_from(Variant::from("Test Title")).unwrap(),
         );
         map.insert(
             "xesam:artist".to_string(),
-            OwnedValue::try_from(zvariant::Value::from(vec!["Artist A", "Artist B"])).unwrap(),
+            OwnedVariant::try_from(Variant::from(vec!["Artist A", "Artist B"])).unwrap(),
         );
         map.insert(
             "xesam:album".to_string(),
-            OwnedValue::try_from(zvariant::Value::from("Album Name")).unwrap(),
+            OwnedVariant::try_from(Variant::from("Album Name")).unwrap(),
         );
         map.insert(
             "mpris:length".to_string(),
-            OwnedValue::try_from(zvariant::Value::from(210_000_000i64)).unwrap(),
+            OwnedVariant::try_from(Variant::from(210_000_000i64)).unwrap(),
         );
 
         let track = extract_metadata(&map);
@@ -400,6 +478,65 @@ mod tests {
         );
         assert_eq!(
             normalize_spotify_trackid("/org/videolan/vlc/track/1234567890123456789012"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_extract_metadata_local_vs_remote_url() {
+        assert!(is_local_media_url("file:///home/user/Music/song.flac"));
+        assert!(is_local_media_url("FILE:///tmp/test.mp3"));
+        assert!(is_local_media_url("/home/user/Music/song.ogg"));
+        assert!(!is_local_media_url("https://open.spotify.com/track/123"));
+        assert!(!is_local_media_url("http://stream.example.com/live"));
+        assert!(!is_local_media_url(""));
+
+        let mut local_map = HashMap::new();
+        local_map.insert(
+            "xesam:title".to_string(),
+            OwnedVariant::try_from(Variant::from("Local Song")).unwrap(),
+        );
+        local_map.insert(
+            "xesam:url".to_string(),
+            OwnedVariant::try_from(Variant::from("file:///music/local.ogg")).unwrap(),
+        );
+        assert!(extract_metadata(&local_map).is_local);
+
+        let mut remote_map = HashMap::new();
+        remote_map.insert(
+            "xesam:title".to_string(),
+            OwnedVariant::try_from(Variant::from("Stream Song")).unwrap(),
+        );
+        remote_map.insert(
+            "xesam:url".to_string(),
+            OwnedVariant::try_from(Variant::from("https://example.com/stream.opus")).unwrap(),
+        );
+        assert!(!extract_metadata(&remote_map).is_local);
+    }
+
+    #[test]
+    fn test_extract_youtube_video_id() {
+        assert_eq!(
+            extract_youtube_video_id(
+                Some("https://music.youtube.com/watch?v=dQw4w9WgXcQ&list=RD"),
+                None
+            ),
+            Some("dQw4w9WgXcQ".to_string())
+        );
+        assert_eq!(
+            extract_youtube_video_id(Some("https://youtu.be/dQw4w9WgXcQ?t=10"), None),
+            Some("dQw4w9WgXcQ".to_string())
+        );
+        assert_eq!(
+            extract_youtube_video_id(Some("https://www.youtube.com/shorts/abcDEF12_34"), None),
+            Some("abcDEF12_34".to_string())
+        );
+        assert_eq!(
+            extract_youtube_video_id(None, Some("youtube:video:dQw4w9WgXcQ")),
+            Some("dQw4w9WgXcQ".to_string())
+        );
+        assert_eq!(
+            extract_youtube_video_id(Some("https://open.spotify.com/track/123"), None),
             None
         );
     }

@@ -247,3 +247,72 @@ pub async fn fetch_lyrics_from_musixmatch_usertoken(
         }
     }
 }
+
+pub struct MusixmatchProvider;
+
+impl crate::lyrics::providers::LyricsProvider for MusixmatchProvider {
+    fn id(&self) -> &'static str {
+        "musixmatch"
+    }
+
+    fn display_name(&self) -> &'static str {
+        "Musixmatch"
+    }
+
+    fn fetch_candidates<'a>(
+        &'a self,
+        track: &'a crate::lyrics::types::TrackInfo,
+        ids: &'a TrackMatchInfo,
+        ctx: &'a crate::lyrics::providers::ProviderContext,
+    ) -> crate::lyrics::providers::BoxFuture<
+        'a,
+        Result<Vec<crate::lyrics::providers::FetchedCandidate>, LyricsError>,
+    > {
+        Box::pin(async move {
+            let duration = (track.duration_secs > 0).then_some(track.duration_secs as f64);
+
+            if let Some(raw_tokens) = ctx.settings.tokens.musixmatch_usertoken.as_deref()
+                && !raw_tokens.trim().is_empty()
+                && let Ok(mut mgr) = TOKEN_MANAGER.lock()
+            {
+                mgr.seed_configured_tokens(raw_tokens);
+            }
+
+            let (lines, raw, _) = fetch_lyrics_from_musixmatch_usertoken(
+                &track.artist,
+                &track.title,
+                &track.album,
+                duration,
+                ids.track_spotify_ids.first().map(String::as_str),
+                ids.track_isrcs.first().map(String::as_str),
+                ids.track_itunes_ids.first().map(String::as_str),
+            )
+            .await?;
+
+            if lines.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let synced = lines.iter().any(|l| l.time > 0.0 || l.has_word_timings());
+            let has_words = lines.iter().any(|l| l.has_word_timings());
+            let mut lyrics = crate::lyrics::types::Lyrics::new(lines, "Musixmatch", synced);
+            lyrics.raw_format = raw;
+            lyrics.format_type = Some(
+                if has_words {
+                    "richsync"
+                } else if synced {
+                    "subtitles"
+                } else {
+                    "txt"
+                }
+                .to_string(),
+            );
+            Ok(vec![crate::lyrics::providers::FetchedCandidate {
+                lyrics,
+                match_score: crate::lyrics::providers::NEUTRAL,
+                is_blind: false,
+                video_id_keyed: false,
+            }])
+        })
+    }
+}

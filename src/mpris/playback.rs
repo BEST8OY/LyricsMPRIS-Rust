@@ -1,12 +1,41 @@
 //! Playback status and position querying for MPRIS.
 
 use crate::mpris::connection::{MprisError, get_dbus_conn};
+use crate::mpris::proxies::MediaPlayer2PlayerProxy;
 use std::ops::Deref;
 use std::time::Duration;
-use zvariant::OwnedValue;
+use zbus::{OwnedVariant, Variant};
 
 /// Timeout applied to dynamic D-Bus queries to prevent frozen players from blocking the caller.
 const DBUS_QUERY_TIMEOUT: Duration = Duration::from_millis(150);
+
+fn decode_position_variant(val: &OwnedVariant) -> Result<f64, MprisError> {
+    let microsecs = match val.deref() {
+        Variant::I64(v) => *v,
+        Variant::U64(v) => i64::try_from(*v).unwrap_or(i64::MAX),
+        _ => {
+            return Err(MprisError::ZBus(zbus::Error::Failure(
+                "Unexpected Position property type from MPRIS player".into(),
+            )));
+        }
+    };
+
+    Ok((microsecs.max(0) as f64) / 1_000_000.0)
+}
+
+/// Query the playback position for an existing MPRIS player proxy with timeout protection.
+pub async fn get_position_from_proxy(
+    proxy: &MediaPlayer2PlayerProxy<'_>,
+) -> Result<f64, MprisError> {
+    let query = async {
+        let val: OwnedVariant = proxy.inner().get_property("Position").await?;
+        decode_position_variant(&val)
+    };
+
+    tokio::time::timeout(DBUS_QUERY_TIMEOUT, query)
+        .await
+        .map_err(|_| MprisError::Timeout)?
+}
 
 /// Query the playback position for a specific MPRIS player service.
 ///
@@ -29,18 +58,8 @@ pub async fn get_position(service: &str) -> Result<f64, MprisError> {
             )
             .await?;
 
-        let val: OwnedValue = reply.body().deserialize()?;
-        let microsecs = match val.deref() {
-            zvariant::Value::I64(v) => *v,
-            zvariant::Value::U64(v) => *v as i64,
-            _ => {
-                return Err(MprisError::ZBus(zbus::Error::Failure(
-                    "Unexpected Position property type from MPRIS player".into(),
-                )));
-            }
-        };
-
-        Ok(microsecs as f64 / 1_000_000.0)
+        let val: OwnedVariant = reply.body().deserialize()?;
+        decode_position_variant(&val)
     };
 
     tokio::time::timeout(DBUS_QUERY_TIMEOUT, query)
@@ -73,9 +92,9 @@ pub async fn get_playback_status(service: &str) -> String {
             .await
             .ok()?;
 
-        let val: OwnedValue = reply.body().deserialize().ok()?;
+        let val: OwnedVariant = reply.body().deserialize().ok()?;
         match val.deref() {
-            zvariant::Value::Str(s) => Some(s.as_str().to_string()),
+            Variant::Str(s) => Some(s.as_str().to_string()),
             _ => None,
         }
     };

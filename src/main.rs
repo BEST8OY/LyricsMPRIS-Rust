@@ -1,3 +1,4 @@
+mod config;
 mod event;
 mod lyrics;
 mod mpris;
@@ -7,19 +8,28 @@ mod text_utils;
 mod timer;
 mod ui;
 
+use crate::config::{
+    RuntimeSettings, SUPPORTED_PROVIDERS, load_toml_config, parse_provider_entry,
+    resolve_provider_order, resolve_runtime_settings,
+};
 use crate::mpris::metadata::set_isrc_enabled;
 use clap::Parser;
 use std::error::Error;
 use std::fs::OpenOptions;
+use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
-/// Application configuration from CLI
+/// Application configuration from CLI, env, and optional TOML file.
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about)]
 pub struct Config {
     /// Pipe current lyric line to stdout (default is modern UI)
     #[arg(long)]
     pipe: bool,
+
+    /// Path to optional TOML config file (default: ~/.config/lyricsmpris/config.toml)
+    #[arg(long, value_name = "PATH")]
+    pub config: Option<PathBuf>,
 
     /// Blocklist for MPRIS player service names (comma-separated, case-insensitive)
     #[arg(
@@ -40,57 +50,55 @@ pub struct Config {
     /// Disable karaoke highlighting (per-word). Use --no-karaoke to disable karaoke (default: enabled).
     #[arg(long = "no-karaoke")]
     pub no_karaoke: bool,
+
     /// Maximum number of visible lyric lines (treating wrapped lines as one line). Default: unlimited
     #[arg(long = "visible-lines", value_name = "COUNT")]
     pub visible_lines: Option<usize>,
-    /// Comma-separated list of lyric providers in preferred order (e.g. "musixmatch,lrclib").
-    /// Supported providers: "lrclib", "musixmatch".
-    /// If empty, the LYRIC_PROVIDERS env var will be used as a fallback.
-    #[arg(long, value_delimiter = ',', value_parser = parse_provider)]
+
+    /// Comma-separated list of lyric providers in preferred order (supports -provider exclusions).
+    /// If empty, LYRIC_PROVIDERS env var or config.toml is used, else Morphe's curated priority order.
+    #[arg(long, value_delimiter = ',', value_parser = parse_provider_entry)]
     pub providers: Vec<String>,
-    /// Path to SQLite lyrics cache database
-    #[arg(long = "database")]
-    pub database: Option<String>,
-    /// Enable ISRC lookup from metadata for musixmatch lyrics search
+
+    /// Enable ISRC lookup from local file metadata for lyrics search
     #[arg(long)]
     pub isrc: bool,
-    /// Enable Romanization subtitles for foreign scripts (e.g. Romaji/Pinyin)
-    #[arg(long)]
-    pub romanize: bool,
-}
 
-/// Supported lyrics providers.
-pub const SUPPORTED_PROVIDERS: &[&str] = &["lrclib", "musixmatch"];
+    /// Allow unsynced plain-text lyrics fallback (e.g. Genius / LRCLIB plainLyrics)
+    #[arg(long = "allow-plain")]
+    pub allow_plain: bool,
+
+    /// Disable splitting parenthesized background vocals onto separate lines
+    #[arg(long = "no-split-bg")]
+    pub no_split_bg: bool,
+
+    /// Resolved runtime settings (tokens, endpoints, filters)
+    #[arg(skip)]
+    pub settings: RuntimeSettings,
+}
 
 /// Validates and normalizes a lyrics provider name.
 pub fn parse_provider(s: &str) -> Result<String, String> {
-    let lower = s.trim().to_lowercase();
-    if SUPPORTED_PROVIDERS.contains(&lower.as_str()) {
-        Ok(lower)
-    } else {
-        Err(format!(
-            "unknown lyrics provider '{s}'. Supported providers are: {}",
-            SUPPORTED_PROVIDERS
-                .iter()
-                .map(|p| format!("'{p}'"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))
-    }
+    parse_provider_entry(s)
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             pipe: false,
+            config: None,
             block: vec![],
             target: vec![],
-            providers: vec!["musixmatch".to_string(), "lrclib".to_string()],
-            database: None,
+            providers: SUPPORTED_PROVIDERS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
             no_karaoke: false,
             visible_lines: None,
             isrc: false,
-            romanize: false,
+            allow_plain: false,
+            no_split_bg: false,
+            settings: RuntimeSettings::default(),
         }
     }
 }
@@ -110,11 +118,44 @@ fn providers_from_env_if_empty(cli: &mut Config) -> Result<(), String> {
     Ok(())
 }
 
-/// Initializes the database if a path is provided in the configuration.
-async fn initialize_database(config: &Config) {
-    if let Some(db_path) = &config.database {
-        lyrics::database::initialize(std::path::PathBuf::from(db_path)).await;
+fn apply_toml_and_env(cli: &mut Config) -> Result<(), String> {
+    let toml_cfg = load_toml_config(cli.config.as_deref())?;
+
+    providers_from_env_if_empty(cli)?;
+    if cli.providers.is_empty()
+        && let Some(ref toml_providers) = toml_cfg.providers
+    {
+        let mut parsed = Vec::new();
+        for p in toml_providers {
+            parsed.push(parse_provider(p)?);
+        }
+        cli.providers = parsed;
     }
+    cli.providers = resolve_provider_order(&cli.providers);
+
+    if cli.block.is_empty()
+        && let Some(block) = &toml_cfg.block
+    {
+        cli.block = block.clone();
+    }
+    if cli.target.is_empty()
+        && let Some(target) = &toml_cfg.target
+    {
+        cli.target = target.clone();
+    }
+    if !cli.no_karaoke && toml_cfg.karaoke == Some(false) {
+        cli.no_karaoke = true;
+    }
+    if cli.visible_lines.is_none() {
+        cli.visible_lines = toml_cfg.visible_lines;
+    }
+    if !cli.isrc && toml_cfg.isrc == Some(true) {
+        cli.isrc = true;
+    }
+
+    cli.settings = resolve_runtime_settings(&toml_cfg, cli.allow_plain, cli.no_split_bg);
+    cli.allow_plain = cli.settings.allow_plain;
+    Ok(())
 }
 
 /// Starts the appropriate UI mode based on configuration.
@@ -129,17 +170,6 @@ async fn start_ui(config: Config) -> Result<(), Box<dyn Error + Send + Sync>> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    // Initialize tracing with environment filter.
-    // Logs are OFF by default; enable with RUST_LOG=debug (or any level).
-    //
-    // In --pipe mode: logs go to stderr (safe; no TUI active).
-    // In TUI mode:    logs go to a file to avoid corrupting the Ratatui
-    //                 alternate screen. Default path: /tmp/lyricsmpris.log.
-    //                 Override with RUST_LOG_FILE=/path/to/file.
-    //
-    // To watch logs live while the TUI runs:
-    //   RUST_LOG=debug lyricsmpris &
-    //   tail -f /tmp/lyricsmpris.log
     let pipe_mode = std::env::args().any(|a| a == "--pipe");
     if pipe_mode {
         tracing_subscriber::fmt()
@@ -149,7 +179,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             .with_writer(std::io::stderr)
             .init();
     } else {
-        // Install panic hook to restore terminal cooked mode before panics print
         crate::ui::modern::install_panic_hook();
 
         let log_path =
@@ -169,16 +198,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     let mut cfg = Config::parse();
-    if let Err(err) = providers_from_env_if_empty(&mut cfg) {
+    if let Err(err) = apply_toml_and_env(&mut cfg) {
         eprintln!("error: {err}");
         std::process::exit(1);
     }
 
     set_isrc_enabled(cfg.isrc);
 
-    initialize_database(&cfg).await;
-
-    // Start UI and propagate any errors
     start_ui(cfg).await.map_err(|e| {
         tracing::error!(error = %e, "Application error");
         e
@@ -193,14 +219,13 @@ mod tests {
     fn test_parse_provider_valid() {
         assert_eq!(parse_provider("lrclib").unwrap(), "lrclib");
         assert_eq!(parse_provider("musixmatch").unwrap(), "musixmatch");
-        assert_eq!(parse_provider("LRCLIB").unwrap(), "lrclib");
-        assert_eq!(parse_provider(" MusixMatch ").unwrap(), "musixmatch");
+        assert_eq!(parse_provider("AMLL").unwrap(), "amll");
+        assert_eq!(parse_provider(" -Genius ").unwrap(), "-genius");
     }
 
     #[test]
     fn test_parse_provider_invalid() {
         assert!(parse_provider("lyricmpris").is_err());
-        assert!(parse_provider("spotify").is_err());
         assert!(parse_provider("").is_err());
     }
 

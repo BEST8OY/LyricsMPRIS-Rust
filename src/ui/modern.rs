@@ -30,18 +30,18 @@ use tokio::time::Sleep;
 /// UI state for the modern TUI mode
 pub struct ModernUIState {
     pub last_update: Option<Update>,
-    /// Cached wrapped blocks for the current terminal width: (width, romanize_enabled, wrapped_blocks)
-    pub wrapped_cache: Option<(usize, bool, Vec<crate::ui::modern_helpers::WrappedBlock>)>,
+    /// Cached wrapped blocks for the current terminal width: (width, wrapped_blocks)
+    pub wrapped_cache: Option<(usize, Vec<crate::ui::modern_helpers::WrappedBlock>)>,
     pub last_track_id: Option<(String, String, String)>,
     pub should_exit: bool,
     /// Instant when the last Update was received; used to estimate current position
     pub last_update_instant: Option<Instant>,
     /// Runtime karaoke toggle (can be toggled with 'k')
     pub karaoke_enabled: bool,
-    /// Runtime Romanization toggle (can be toggled with 'r')
-    pub romanize_enabled: bool,
     /// Manual scroll offset when paused (in lyric blocks, not wrapped lines)
     pub scroll_offset: isize,
+    /// Optional command channel to trigger candidate cycling ('r')
+    pub cmd_tx: Option<mpsc::Sender<crate::pool::UiCommand>>,
 }
 
 impl ModernUIState {
@@ -53,8 +53,8 @@ impl ModernUIState {
             should_exit: false,
             last_update_instant: None,
             karaoke_enabled: true,
-            romanize_enabled: false,
             scroll_offset: 0,
+            cmd_tx: None,
         }
     }
 }
@@ -116,7 +116,13 @@ pub async fn display_lyrics_modern(
     let max_visible_lines = mpris_config.visible_lines;
     let (tx, mut rx) = mpsc::channel(32);
     let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
-    tokio::spawn(pool::listen(tx, shutdown_rx, mpris_config.clone()));
+    let (cmd_tx, cmd_rx) = mpsc::channel(8);
+    tokio::spawn(pool::listen_with_commands(
+        tx,
+        shutdown_rx,
+        Some(cmd_rx),
+        mpris_config.clone(),
+    ));
     // Restores the terminal on scope exit no matter how we leave the loop
     let _terminal_guard = TerminalGuard::new()?;
     let backend = CrosstermBackend::new(io::stdout());
@@ -124,7 +130,7 @@ pub async fn display_lyrics_modern(
     let styles = LyricStyles::default();
     let mut state = ModernUIState::new();
     state.karaoke_enabled = karaoke_enabled;
-    state.romanize_enabled = mpris_config.romanize;
+    state.cmd_tx = Some(cmd_tx);
     // per-word sleep used to schedule redraws only at interesting times (word boundaries)
     let mut next_word_sleep: Option<Pin<Box<Sleep>>> = None;
     // Asynchronous crossterm event stream directly integrated into Tokio select loop.
@@ -241,7 +247,6 @@ where
         &mut state.wrapped_cache,
         styles,
         state.karaoke_enabled,
-        state.romanize_enabled,
         max_visible_lines,
         state.scroll_offset,
     )?;
@@ -351,10 +356,11 @@ fn process_event(
                     Ok(true)
                 }
                 KeyCode::Char('r') => {
-                    // Toggle romanization at runtime
-                    state.romanize_enabled = !state.romanize_enabled;
-                    state.wrapped_cache = None;
-                    Ok(true)
+                    // Cycle to the next candidate lyrics variant from the candidate queue
+                    if let Some(ref tx) = state.cmd_tx {
+                        let _ = tx.try_send(crate::pool::UiCommand::NextCandidate);
+                    }
+                    Ok(false)
                 }
                 KeyCode::Up => {
                     // Scroll up (towards earlier lines) when paused, clamped to start
@@ -578,7 +584,7 @@ mod tests {
         update_state(&mut state, Some(update1.clone()));
 
         // Simulate population of wrapped_cache
-        state.wrapped_cache = Some((80, false, Vec::new()));
+        state.wrapped_cache = Some((80, Vec::new()));
 
         // Position update arrives with identical lines Arc
         let mut update2 = update1.clone();
@@ -635,7 +641,7 @@ mod tests {
     fn test_empty_update_clears_wrapped_cache() {
         let mut state = ModernUIState::new();
         update_state(&mut state, Some(sample_update("Song", 3, None)));
-        state.wrapped_cache = Some((80, false, Vec::new()));
+        state.wrapped_cache = Some((80, Vec::new()));
 
         // Empty update arrives
         update_state(&mut state, Some(sample_update("Song", 0, None)));
@@ -708,7 +714,6 @@ mod tests {
         let state = ModernUIState::default();
         assert_eq!(state.scroll_offset, 0);
         assert!(state.karaoke_enabled);
-        assert!(!state.romanize_enabled);
         assert!(!state.should_exit);
     }
 }
