@@ -3,9 +3,9 @@
 //! Features:
 //! - Multi-tier usertoken engine (environment variables + dynamic token.get fallback + transparent error retry)
 //! - Disk-backed persistent dynamic token caching with automatic UpgradeOnly token rejection
-//! - Request pacing (1.5s) and 10-minute throttling cooldown gate to prevent IP bans
-//! - Header hint inspection differentiating between token expiration (`hint: renew`) and network throttling
-//! - Direct ID lookups (Spotify ID, ISRC, iTunes ID) and single-macro fuzzy track search
+//! - Request pacing matching Morphe (`500ms` per API call, no 10-minute ban)
+//! - Header hint inspection differentiating between token expiration (`hint: renew`) and throttling
+//! - Direct ID lookups (Spotify ID, ISRC) and single-macro fuzzy track search
 //! - Richsync word-level timing and Subtitles line-level timing support
 
 pub mod extract;
@@ -30,22 +30,11 @@ pub(crate) struct MusixmatchSuccess {
 }
 
 /// Multi-tier usertoken fetch (`MUSIXMATCH_USERTOKEN`/TOML round-robin + guest `token.get` + retry).
-#[allow(clippy::too_many_arguments)]
 async fn fetch_musixmatch_with_meta(
-    artist: &str,
-    title: &str,
-    album: &str,
-    duration: Option<f64>,
-    track_spotify_id: Option<&str>,
-    track_isrc: Option<&str>,
-    track_itunes_id: Option<&str>,
+    track: &TrackInfo,
+    ids: &TrackMatchInfo,
+    custom_regex: Option<&regex::Regex>,
 ) -> Result<Option<MusixmatchSuccess>, LyricsError> {
-    // Check rate-limiting gate (request pacing + 10-minute throttling cooldown)
-    if !token::wait_for_gate().await {
-        tracing::warn!("Musixmatch is currently under rate-limit cooldown; skipping request");
-        return Ok(None);
-    }
-
     let client = http_client();
     let env_token_count = {
         let manager = TOKEN_MANAGER.lock().ok();
@@ -75,19 +64,7 @@ async fn fetch_musixmatch_with_meta(
                 token_prefix = %&token[..token.len().min(8)],
                 "Musixmatch: using env usertoken (Tier 1)"
             );
-            match fetch_lyrics_with_token(
-                client,
-                &token,
-                artist,
-                title,
-                album,
-                duration,
-                track_spotify_id,
-                track_isrc,
-                track_itunes_id,
-            )
-            .await
-            {
+            match fetch_lyrics_with_token(client, &token, track, ids, custom_regex).await {
                 Ok(FetchOutcome::Success(lines, raw, _ids, meta)) => {
                     return Ok(Some(MusixmatchSuccess { lines, raw, meta }));
                 }
@@ -99,6 +76,9 @@ async fn fetch_musixmatch_with_meta(
                     is_renewable,
                 }) => {
                     non_network_outcomes += 1;
+                    if is_renewable && let Ok(mut manager) = TOKEN_MANAGER.lock() {
+                        manager.invalidate_env_token(&token);
+                    }
                     tracing::warn!(
                         attempt = attempts,
                         total = env_token_count,
@@ -171,19 +151,7 @@ async fn fetch_musixmatch_with_meta(
         }
     };
 
-    match fetch_lyrics_with_token(
-        client,
-        &dynamic_token,
-        artist,
-        title,
-        album,
-        duration,
-        track_spotify_id,
-        track_isrc,
-        track_itunes_id,
-    )
-    .await
-    {
+    match fetch_lyrics_with_token(client, &dynamic_token, track, ids, custom_regex).await {
         Ok(FetchOutcome::Success(lines, raw, _ids, meta)) => {
             Ok(Some(MusixmatchSuccess { lines, raw, meta }))
         }
@@ -192,12 +160,12 @@ async fn fetch_musixmatch_with_meta(
             reason,
             is_renewable,
         }) => {
+            token::clear_cached_dynamic_token();
             if !is_renewable {
                 tracing::warn!(
                     reason = %reason,
-                    "Musixmatch network/token is throttled; activating 10-minute cooldown"
+                    "Musixmatch dynamic token rejected without renew hint; skipping request"
                 );
-                token::trigger_gate_cooldown();
                 return Ok(None);
             }
 
@@ -211,28 +179,16 @@ async fn fetch_musixmatch_with_meta(
                     if let Ok(mut m) = TOKEN_MANAGER.lock() {
                         m.set_dynamic_token(fresh.clone());
                     }
-                    match fetch_lyrics_with_token(
-                        client,
-                        &fresh,
-                        artist,
-                        title,
-                        album,
-                        duration,
-                        track_spotify_id,
-                        track_isrc,
-                        track_itunes_id,
-                    )
-                    .await
-                    {
+                    match fetch_lyrics_with_token(client, &fresh, track, ids, custom_regex).await {
                         Ok(FetchOutcome::Success(lines, raw, _ids, meta)) => {
                             Ok(Some(MusixmatchSuccess { lines, raw, meta }))
                         }
                         Ok(FetchOutcome::TokenError { reason, .. }) => {
                             tracing::warn!(
                                 reason = %reason,
-                                "Freshly issued Musixmatch token was rejected; activating cooldown"
+                                "Freshly issued Musixmatch token was rejected"
                             );
-                            token::trigger_gate_cooldown();
+                            token::clear_cached_dynamic_token();
                             Ok(None)
                         }
                         Ok(FetchOutcome::TrackNotFound) => Ok(None),
@@ -252,6 +208,25 @@ async fn fetch_musixmatch_with_meta(
     }
 }
 
+pub(crate) fn metadata_match_score(
+    meta: Option<&MatchedTrackMeta>,
+    track: &TrackInfo,
+    custom_regex: Option<&regex::Regex>,
+) -> Option<i32> {
+    let Some(m) = meta else {
+        return Some(NEUTRAL);
+    };
+    let base_score = score_track_candidate(
+        &m.title,
+        &m.artist,
+        m.duration_secs,
+        (!m.album.is_empty()).then_some(m.album.as_str()),
+        track,
+        custom_regex,
+    );
+    (base_score >= 0).then_some(base_score)
+}
+
 pub(crate) fn score_musixmatch_candidate(
     lyrics: Lyrics,
     meta: Option<&MatchedTrackMeta>,
@@ -261,27 +236,7 @@ pub(crate) fn score_musixmatch_candidate(
     if lyrics.is_empty() {
         return None;
     }
-    let Some(m) = meta else {
-        return Some(FetchedCandidate {
-            lyrics,
-            match_score: NEUTRAL,
-            is_blind: false,
-            video_id_keyed: false,
-        });
-    };
-
-    let base_score = score_track_candidate(
-        &m.title,
-        &m.artist,
-        m.duration_secs,
-        (!m.album.is_empty()).then_some(m.album.as_str()),
-        track,
-        custom_regex,
-    );
-    if base_score < 0 {
-        return None;
-    }
-
+    let base_score = metadata_match_score(meta, track, custom_regex)?;
     Some(FetchedCandidate {
         match_score: base_score + lyrics.sync_rank(),
         lyrics,
@@ -308,8 +263,6 @@ impl LyricsProvider for MusixmatchProvider {
         ctx: &'a crate::lyrics::providers::ProviderContext,
     ) -> BoxFuture<'a, Result<Vec<FetchedCandidate>, LyricsError>> {
         Box::pin(async move {
-            let duration = (track.duration_secs > 0).then_some(track.duration_secs as f64);
-
             if let Some(raw_tokens) = ctx.settings.tokens.musixmatch_usertoken.as_deref()
                 && !raw_tokens.trim().is_empty()
                 && let Ok(mut mgr) = TOKEN_MANAGER.lock()
@@ -317,16 +270,8 @@ impl LyricsProvider for MusixmatchProvider {
                 mgr.seed_configured_tokens(raw_tokens);
             }
 
-            let Some(res) = fetch_musixmatch_with_meta(
-                &track.artist,
-                &track.title,
-                &track.album,
-                duration,
-                ids.track_spotify_ids.first().map(String::as_str),
-                ids.track_isrcs.first().map(String::as_str),
-                ids.track_itunes_ids.first().map(String::as_str),
-            )
-            .await?
+            let Some(res) =
+                fetch_musixmatch_with_meta(track, ids, ctx.custom_regex.as_ref()).await?
             else {
                 return Ok(Vec::new());
             };

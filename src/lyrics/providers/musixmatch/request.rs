@@ -6,9 +6,9 @@ use super::extract::{
     MatchedTrackMeta, extract_track_ids_from_macro, extract_track_meta_from_json,
     extract_track_meta_from_macro, get_root_hint, get_root_status_code,
 };
-use super::token::{API_BASE, APP_ID, open_api_get, request_id};
+use super::token::{API_BASE, APP_ID, open_api_get, request_id, throttle_request};
 use crate::lyrics::providers::MAX_CANDIDATES;
-use crate::lyrics::types::{LyricLine, LyricsError, TrackMatchInfo};
+use crate::lyrics::types::{LyricLine, LyricsError, TrackInfo, TrackMatchInfo};
 use crate::text_utils::{DURATION_TOLERANCE_SECS, clean_title_annotations, normalize};
 use reqwest::Client;
 use serde_json::Value;
@@ -84,14 +84,15 @@ pub(crate) fn is_success(macro_calls: &Value, endpoint: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Try to call macro.subtitles.get and extract richsync or subtitle_body.
+/// Try to call `macro.subtitles.get` at `api_base` and extract richsync or subtitle_body.
 pub(crate) async fn try_macro_for_lyrics(
     client: &Client,
+    api_base: &str,
     params: &[(String, String)],
 ) -> Result<FetchOutcome, LyricsError> {
     let req_id = request_id();
     let macro_base = format!(
-        "{API_BASE}macro.subtitles.get?namespace=lyrics_richsynched&optional_calls=track.richsync&subtitle_format=lrc&f_subtitle_length_max_deviation=40&format=json&app_id={APP_ID}&t={req_id}&"
+        "{api_base}macro.subtitles.get?namespace=lyrics_richsynched&optional_calls=track.richsync&subtitle_format=lrc&f_subtitle_length_max_deviation=40&format=json&app_id={APP_ID}&t={req_id}&"
     );
     let macro_url = macro_base
         + &params
@@ -100,6 +101,7 @@ pub(crate) async fn try_macro_for_lyrics(
             .collect::<Vec<_>>()
             .join("&");
 
+    throttle_request().await;
     let macro_resp = open_api_get(client, &macro_url).send().await?;
 
     let macro_status = macro_resp.status();
@@ -180,23 +182,13 @@ pub(crate) async fn try_macro_for_lyrics(
     Ok(FetchOutcome::TrackNotFound)
 }
 
-/// Fetch lyrics with a single token.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn fetch_lyrics_with_token(
-    client: &Client,
-    token: &str,
+fn build_macro_params(
     artist: &str,
     title: &str,
     album: &str,
     duration: Option<f64>,
-    track_spotify_id: Option<&str>,
-    track_isrc: Option<&str>,
-    track_itunes_id: Option<&str>,
-) -> Result<FetchOutcome, LyricsError> {
-    // Build unified single-shot query combining track identifiers and track metadata.
-    // Musixmatch resolves matcher.track.get, track.richsync.get, and track.subtitles.get
-    // in a single macro call, matching by ID if indexed and falling back seamlessly within
-    // the same round-trip.
+    token: &str,
+) -> Vec<(String, String)> {
     let mut params = vec![
         ("q_artist".to_string(), artist.to_string()),
         ("q_artists".to_string(), artist.to_string()),
@@ -206,43 +198,79 @@ pub(crate) async fn fetch_lyrics_with_token(
     if !album.is_empty() {
         params.push(("q_album".to_string(), album.to_string()));
     }
-    if let Some(d) = duration {
-        let secs = (d.round() as i64).to_string();
-        params.push(("q_duration".to_string(), secs));
+    if let Some(d) = duration
+        && d > 0.0
+    {
+        params.push(("q_duration".to_string(), (d.round() as i64).to_string()));
     }
+    params
+}
 
-    let has_ids = track_spotify_id.is_some() || track_isrc.is_some() || track_itunes_id.is_some();
+/// Validates direct-macro `Success` metadata against `track` so mismatched guesses fall
+/// through to `track.search` (`TokenError` and `TrackNotFound` pass through unchanged).
+fn filter_outcome_for_track(
+    outcome: FetchOutcome,
+    track: &TrackInfo,
+    custom_regex: Option<&regex::Regex>,
+) -> FetchOutcome {
+    let FetchOutcome::Success(ref lines, _, _, ref meta) = outcome else {
+        return outcome;
+    };
+    if lines.is_empty() || super::metadata_match_score(meta.as_ref(), track, custom_regex).is_none()
+    {
+        return FetchOutcome::TrackNotFound;
+    }
+    outcome
+}
+
+/// Fetch lyrics with a single token using the configured Musixmatch `API_BASE`.
+pub(crate) async fn fetch_lyrics_with_token(
+    client: &Client,
+    token: &str,
+    track: &TrackInfo,
+    ids: &TrackMatchInfo,
+    custom_regex: Option<&regex::Regex>,
+) -> Result<FetchOutcome, LyricsError> {
+    fetch_lyrics_with_token_at(client, API_BASE, token, track, ids, custom_regex).await
+}
+
+pub(crate) async fn fetch_lyrics_with_token_at(
+    client: &Client,
+    api_base: &str,
+    token: &str,
+    track: &TrackInfo,
+    ids: &TrackMatchInfo,
+    custom_regex: Option<&regex::Regex>,
+) -> Result<FetchOutcome, LyricsError> {
+    let duration = (track.duration_secs > 0).then_some(track.duration_secs as f64);
+    let track_spotify_id = ids.track_spotify_ids.first().map(String::as_str);
+    let track_isrc = ids.track_isrcs.first().map(String::as_str);
+
+    // Step 1: Single-shot macro query combining metadata and any known external IDs.
+    let mut params = build_macro_params(&track.artist, &track.title, &track.album, duration, token);
+    let has_ids = track_spotify_id.is_some() || track_isrc.is_some();
     if let Some(sid) = track_spotify_id {
         params.push(("track_spotify_id".to_string(), sid.to_string()));
     }
     if let Some(isrc) = track_isrc {
         params.push(("track_isrc".to_string(), isrc.to_string()));
     }
-    if let Some(itunes) = track_itunes_id {
-        params.push(("track_itunes_id".to_string(), itunes.to_string()));
-    }
 
-    let outcome = try_macro_for_lyrics(client, &params).await?;
+    let outcome = filter_outcome_for_track(
+        try_macro_for_lyrics(client, api_base, &params).await?,
+        track,
+        custom_regex,
+    );
 
-    // If an ID was supplied and the query resulted in TrackNotFound,
-    // execute a resilient fallback with pure metadata search (omitting IDs)
-    // in case the ID is unmapped or stale in Musixmatch's catalog.
+    // Step 2: Retry pure metadata (without IDs) if IDs were sent and Call 1 missed/mismatched.
     let outcome = if has_ids && matches!(outcome, FetchOutcome::TrackNotFound) {
-        let mut fallback_params = vec![
-            ("q_artist".to_string(), artist.to_string()),
-            ("q_artists".to_string(), artist.to_string()),
-            ("q_track".to_string(), title.to_string()),
-            ("usertoken".to_string(), token.to_string()),
-        ];
-        if !album.is_empty() {
-            fallback_params.push(("q_album".to_string(), album.to_string()));
-        }
-        if let Some(d) = duration {
-            let secs = (d.round() as i64).to_string();
-            fallback_params.push(("q_duration".to_string(), secs));
-        }
-
-        try_macro_for_lyrics(client, &fallback_params).await?
+        let fallback_params =
+            build_macro_params(&track.artist, &track.title, &track.album, duration, token);
+        filter_outcome_for_track(
+            try_macro_for_lyrics(client, api_base, &fallback_params).await?,
+            track,
+            custom_regex,
+        )
     } else {
         outcome
     };
@@ -252,30 +280,22 @@ pub(crate) async fn fetch_lyrics_with_token(
     }
 
     // Step A: If title has annotations (e.g. "(feat. ...)", "[Remaster]"), try macro with clean title
-    if let Some(clean) = clean_title_annotations(title) {
-        let mut clean_params = vec![
-            ("q_artist".to_string(), artist.to_string()),
-            ("q_artists".to_string(), artist.to_string()),
-            ("q_track".to_string(), clean),
-            ("usertoken".to_string(), token.to_string()),
-        ];
-        if !album.is_empty() {
-            clean_params.push(("q_album".to_string(), album.to_string()));
-        }
-        if let Some(d) = duration {
-            let secs = (d.round() as i64).to_string();
-            clean_params.push(("q_duration".to_string(), secs));
-        }
-        let clean_outcome = try_macro_for_lyrics(client, &clean_params).await?;
+    if let Some(clean) = clean_title_annotations(&track.title) {
+        let clean_params = build_macro_params(&track.artist, &clean, &track.album, duration, token);
+        let clean_outcome = filter_outcome_for_track(
+            try_macro_for_lyrics(client, api_base, &clean_params).await?,
+            track,
+            custom_regex,
+        );
         if !matches!(clean_outcome, FetchOutcome::TrackNotFound) {
             return Ok(clean_outcome);
         }
     }
 
-    // Step B: Fallback to track.search to find candidates with duration matching
-    // (recovering when matcher.track.get misidentifies tracks or selects unsynced singles)
+    // Step B: Fallback to track.search to find candidates with duration matching and scoring
     if let Some(candidate_outcome) =
-        search_and_fetch_best_candidate(client, token, artist, title, album, duration).await?
+        search_and_fetch_best_candidate(client, api_base, token, track, duration, custom_regex)
+            .await?
     {
         return Ok(candidate_outcome);
     }
@@ -508,15 +528,15 @@ pub(crate) fn select_best_candidate_track_id(
 /// Fallback helper: calls track.search to find candidates with duration matching and retrieves lyrics for the best candidate.
 pub(crate) async fn search_and_fetch_best_candidate(
     client: &Client,
+    api_base: &str,
     token: &str,
-    artist: &str,
-    title: &str,
-    album: &str,
+    track: &TrackInfo,
     duration: Option<f64>,
+    custom_regex: Option<&regex::Regex>,
 ) -> Result<Option<FetchOutcome>, LyricsError> {
-    let mut queries = vec![title.to_string()];
-    if let Some(clean) = clean_title_annotations(title)
-        && clean != title
+    let mut queries = vec![track.title.clone()];
+    if let Some(clean) = clean_title_annotations(&track.title)
+        && clean != track.title
     {
         queries.push(clean);
     }
@@ -524,8 +544,8 @@ pub(crate) async fn search_and_fetch_best_candidate(
     for query_title in queries {
         let req_id = request_id();
         let mut search_url = format!(
-            "{API_BASE}track.search?page_size=10&page=1&s_track_rating=desc&q_artist={}&q_track={}&usertoken={}&format=json&app_id={APP_ID}&t={req_id}",
-            urlencoding::encode(artist),
+            "{api_base}track.search?page_size=10&page=1&s_track_rating=desc&q_artist={}&q_track={}&usertoken={}&format=json&app_id={APP_ID}&t={req_id}",
+            urlencoding::encode(&track.artist),
             urlencoding::encode(&query_title),
             urlencoding::encode(token),
         );
@@ -535,6 +555,7 @@ pub(crate) async fn search_and_fetch_best_candidate(
             search_url.push_str(&format!("&q_duration={}", d.round() as i64));
         }
 
+        throttle_request().await;
         let resp = open_api_get(client, &search_url).send().await?;
 
         let status = resp.status();
@@ -556,7 +577,7 @@ pub(crate) async fn search_and_fetch_best_candidate(
             continue;
         };
         for (best_track_id, cand_meta) in
-            ranked_candidate_tracks(track_list, title, album, duration)
+            ranked_candidate_tracks(track_list, &track.title, &track.album, duration)
                 .into_iter()
                 .take(MAX_CANDIDATES)
         {
@@ -564,14 +585,18 @@ pub(crate) async fn search_and_fetch_best_candidate(
                 ("track_id".to_string(), best_track_id.to_string()),
                 ("usertoken".to_string(), token.to_string()),
             ];
-            let outcome = try_macro_for_lyrics(client, &id_params).await?;
+            let outcome = try_macro_for_lyrics(client, api_base, &id_params).await?;
             match outcome {
                 FetchOutcome::Success(lines, raw, ids, macro_meta) => {
                     let meta = macro_meta.or_else(|| {
                         (!cand_meta.title.is_empty() || !cand_meta.artist.is_empty())
                             .then_some(cand_meta)
                     });
-                    return Ok(Some(FetchOutcome::Success(lines, raw, ids, meta)));
+                    let candidate = FetchOutcome::Success(lines, raw, ids, meta);
+                    let checked = filter_outcome_for_track(candidate, track, custom_regex);
+                    if !matches!(checked, FetchOutcome::TrackNotFound) {
+                        return Ok(Some(checked));
+                    }
                 }
                 FetchOutcome::TokenError { .. } => return Ok(Some(outcome)),
                 FetchOutcome::TrackNotFound => continue,
@@ -851,5 +876,153 @@ mod tests {
             Some(198.173),
         );
         assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_direct_macro_rejection_falls_through_to_track_search() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = req.lines().next().unwrap_or("");
+
+                    let body = if first_line.contains("macro.subtitles.get")
+                        && first_line.contains("track_id=202")
+                    {
+                        serde_json::json!({
+                            "message": {
+                                "header": { "status_code": 200 },
+                                "body": {
+                                    "macro_calls": {
+                                        "matcher.track.get": {
+                                            "message": {
+                                                "header": { "status_code": 200 },
+                                                "body": {
+                                                    "track": {
+                                                        "track_name": "Red Flag",
+                                                        "artist_name": "Billy Talent",
+                                                        "album_name": "Billy Talent II",
+                                                        "track_length": 198
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "track.subtitles.get": {
+                                            "message": {
+                                                "header": { "status_code": 200 },
+                                                "body": {
+                                                    "subtitle_list": [{
+                                                        "subtitle": {
+                                                            "subtitle_body": "[00:05.00] Studio lyric line"
+                                                        }
+                                                    }]
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        })
+                    } else if first_line.contains("macro.subtitles.get") {
+                        // Direct macro returns wrong artist/version; must be rejected cleanly.
+                        serde_json::json!({
+                            "message": {
+                                "header": { "status_code": 200 },
+                                "body": {
+                                    "macro_calls": {
+                                        "matcher.track.get": {
+                                            "message": {
+                                                "header": { "status_code": 200 },
+                                                "body": {
+                                                    "track": {
+                                                        "track_name": "Red Flag (Live)",
+                                                        "artist_name": "Wrong Cover Band",
+                                                        "album_name": "Live",
+                                                        "track_length": 250
+                                                    }
+                                                }
+                                            }
+                                        },
+                                        "track.subtitles.get": {
+                                            "message": {
+                                                "header": { "status_code": 200 },
+                                                "body": {
+                                                    "subtitle_list": [{
+                                                        "subtitle": {
+                                                            "subtitle_body": "[00:01.00] Wrong cover line"
+                                                        }
+                                                    }]
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        })
+                    } else {
+                        serde_json::json!({
+                            "message": {
+                                "header": { "status_code": 200 },
+                                "body": {
+                                    "track_list": [{
+                                        "track": {
+                                            "track_id": 202,
+                                            "track_name": "Red Flag",
+                                            "artist_name": "Billy Talent",
+                                            "album_name": "Billy Talent II",
+                                            "track_length": 198,
+                                            "has_richsync": 0,
+                                            "has_subtitles": 1,
+                                            "has_lyrics": 1,
+                                            "instrumental": 0
+                                        }
+                                    }]
+                                }
+                            }
+                        })
+                    };
+
+                    let body_str = body.to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body_str.len(),
+                        body_str
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let api_base = format!("http://{addr}/ws/1.1/");
+        let track = TrackInfo::new("Red Flag", "Billy Talent", "Billy Talent II", 198);
+        let ids = TrackMatchInfo::default();
+        let outcome = fetch_lyrics_with_token_at(
+            crate::lyrics::types::http_client(),
+            &api_base,
+            "test_token",
+            &track,
+            &ids,
+            None,
+        )
+        .await
+        .unwrap();
+
+        match outcome {
+            FetchOutcome::Success(lines, _, _, meta) => {
+                assert_eq!(lines[0].text, "Studio lyric line");
+                assert_eq!(meta.unwrap().artist, "Billy Talent");
+            }
+            other => panic!("Expected fallback track.search Success, got {other:?}"),
+        }
+
+        server.abort();
     }
 }

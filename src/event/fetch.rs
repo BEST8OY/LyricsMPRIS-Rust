@@ -214,7 +214,6 @@ fn build_ids(meta: &TrackMetadata) -> TrackMatchInfo {
     TrackMatchInfo {
         track_isrcs: meta.isrc.iter().cloned().collect(),
         track_spotify_ids: meta.spotify_id.iter().cloned().collect(),
-        track_itunes_ids: meta.itunes_id.iter().cloned().collect(),
         youtube_video_id: meta.youtube_video_id.clone(),
     }
 }
@@ -295,8 +294,14 @@ async fn poll_stage(
             .first_candidate_at
             .filter(|_| !*published_initial && display.word_sync)
             .map(|t| t + FIRST_PAINT_HOLD)
+            .filter(|&w| now < w)
             .unwrap_or(deadline);
-        let next_wake = deadline.min(pctx.endgame_at).min(hold_wake).max(now);
+        let endgame_wake = if now < pctx.endgame_at && display.best_result.is_none() {
+            pctx.endgame_at
+        } else {
+            deadline
+        };
+        let next_wake = deadline.min(endgame_wake).min(hold_wake);
 
         tokio::select! {
             Some(res) = join_set.join_next() => {
@@ -510,6 +515,22 @@ pub fn spawn_fetch(
             .await;
         }
 
+        // If Stage 2 and/or Stage 3 were skipped (e.g. <= 4 configured providers with no
+        // blind/derived tasks), keep polling remaining in-flight tasks until stage3_deadline
+        // (with endgame promotion at 5s) instead of aborting them prematurely at 2s/4s.
+        if !display.window_closed && !join_set.is_empty() {
+            poll_stage(
+                &pctx,
+                stage3_deadline,
+                &mut join_set,
+                &mut display,
+                &mut published_initial,
+                &mut any_transient_err,
+                &mut first_err,
+            )
+            .await;
+        }
+
         // Drain any already-finished tasks without blocking
         while let Some(res) = join_set.try_join_next() {
             if let Ok(tr) = res {
@@ -711,5 +732,82 @@ mod tests {
                 .any(|v| v.track.title == "English Title" && v.track.artist == "周杰伦"),
             "Expected Simplified Han artist variant paired with unchanged ASCII title"
         );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_fetch_waits_past_stage1_deadline_when_later_stages_empty() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let exact_body = serde_json::json!({
+                "id": 1,
+                "trackName": "Test Song",
+                "artistName": "Test Artist",
+                "albumName": "Test Album",
+                "duration": 180,
+                "syncedLyrics": "[00:05.00] Hello past 2s deadline\n[02:30.00] Second line"
+            })
+            .to_string();
+
+            // Accept requests until the test completes; delay `/get` past STAGE1_DEADLINE (2.15s).
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let exact_body = exact_body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let body = if req.starts_with("GET /get") {
+                        tokio::time::sleep(Duration::from_millis(2150)).await;
+                        exact_body
+                    } else {
+                        "[]".to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let mut settings = RuntimeSettings::default();
+        settings.endpoints.lrclib = Some(format!("http://{addr}"));
+        let meta = TrackMetadata {
+            title: "Test Song".into(),
+            artist: "Test Artist".into(),
+            album: "Test Album".into(),
+            length: Some(180.0),
+            ..Default::default()
+        };
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let handle = spawn_fetch(
+            1,
+            meta,
+            vec!["lrclib".into()],
+            None,
+            false,
+            false,
+            settings,
+            tx,
+        );
+
+        let outcome = tokio::time::timeout(Duration::from_secs(6), rx.recv())
+            .await
+            .expect("spawn_fetch timed out")
+            .expect("outcome channel closed");
+        assert!(
+            matches!(outcome, FetchOutcome::Success { .. }),
+            "Expected Success past STAGE1_DEADLINE, got {outcome:?}"
+        );
+
+        let _ = handle.await;
+        server.abort();
     }
 }

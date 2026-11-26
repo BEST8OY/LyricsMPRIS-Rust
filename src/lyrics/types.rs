@@ -52,7 +52,6 @@ impl TrackInfo {
 pub struct TrackMatchInfo {
     pub track_isrcs: Vec<String>,
     pub track_spotify_ids: Vec<String>,
-    pub track_itunes_ids: Vec<String>,
     pub youtube_video_id: Option<String>,
 }
 

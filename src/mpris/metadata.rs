@@ -32,7 +32,6 @@ pub struct TrackMetadata {
     pub length: Option<f64>,
     pub spotify_id: Option<String>,
     pub isrc: Option<String>,
-    pub itunes_id: Option<String>,
     pub youtube_video_id: Option<String>,
     pub is_local: bool,
 }
@@ -247,7 +246,6 @@ pub fn extract_metadata(map: &HashMap<String, OwnedVariant>) -> TrackMetadata {
         length,
         spotify_id,
         isrc,
-        itunes_id: None,
         youtube_video_id,
         is_local,
     }

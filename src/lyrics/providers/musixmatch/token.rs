@@ -3,6 +3,7 @@
 use crate::lyrics::types::LyricsError;
 use reqwest::Client;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::env;
 use std::sync::LazyLock;
 use std::sync::Mutex;
@@ -25,8 +26,7 @@ pub(crate) fn open_api_get(client: &Client, url: &str) -> reqwest::RequestBuilde
         .header("Accept", "application/json")
 }
 
-pub(crate) const SPACING: Duration = Duration::from_millis(1500);
-pub(crate) const COOLDOWN: Duration = Duration::from_secs(600);
+pub(crate) const REQUEST_THROTTLE: Duration = Duration::from_millis(500);
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct HeldToken {
@@ -142,12 +142,12 @@ pub async fn fetch_fresh_musixmatch_token(client: &Client) -> Result<String, Lyr
 }
 
 /// Round-robin token manager for multiple Musixmatch usertokens,
-/// with automatic disk-backed dynamic caching, request spacing, and throttling cooldown.
+/// with automatic disk-backed dynamic caching and Morphe 500ms request pacing.
 pub(crate) struct TokenManager {
     tokens: Vec<String>,
+    invalid_tokens: HashSet<String>,
     current_index: usize,
     cached_dynamic_token: Option<String>,
-    blocked_until: Option<Instant>,
     last_request: Option<Instant>,
 }
 
@@ -168,9 +168,9 @@ impl TokenManager {
 
         TokenManager {
             tokens,
+            invalid_tokens: HashSet::new(),
             current_index: 0,
             cached_dynamic_token,
-            blocked_until: None,
             last_request: None,
         }
     }
@@ -180,12 +180,35 @@ impl TokenManager {
         self.tokens.len()
     }
 
-    /// Merges comma-separated tokens from TOML/CLI config once without duplicating env entries.
+    /// Merges comma-separated tokens from TOML/CLI config once without duplicating env entries
+    /// or re-adding tokens previously rejected as expired.
     pub(crate) fn seed_configured_tokens(&mut self, csv: &str) {
         for raw in csv.split(',') {
             let tok = raw.trim();
-            if !tok.is_empty() && !self.tokens.iter().any(|existing| existing == tok) {
+            if !tok.is_empty()
+                && !self.invalid_tokens.contains(tok)
+                && !self.tokens.iter().any(|existing| existing == tok)
+            {
                 self.tokens.push(tok.to_string());
+            }
+        }
+    }
+
+    /// Marks an explicit env/TOML token invalid for this session and removes it from rotation.
+    pub(crate) fn invalidate_env_token(&mut self, token: &str) {
+        let tok = token.trim();
+        if tok.is_empty() {
+            return;
+        }
+        self.invalid_tokens.insert(tok.to_string());
+        if let Some(pos) = self.tokens.iter().position(|t| t == tok) {
+            self.tokens.remove(pos);
+            if self.tokens.is_empty() {
+                self.current_index = 0;
+            } else if pos < self.current_index {
+                self.current_index -= 1;
+            } else if self.current_index >= self.tokens.len() {
+                self.current_index = 0;
             }
         }
     }
@@ -224,48 +247,22 @@ impl TokenManager {
         clear_disk_token();
         self.cached_dynamic_token = None;
     }
-
-    /// Returns true if currently in throttling cooldown.
-    #[cfg(test)]
-    pub(crate) fn is_cooling_down(&self) -> bool {
-        self.blocked_until
-            .is_some_and(|until| Instant::now() < until)
-    }
-
-    /// Triggers a 10-minute network cooldown and purges invalid dynamic tokens.
-    pub(crate) fn trigger_cooldown(&mut self) {
-        self.blocked_until = Some(Instant::now() + COOLDOWN);
-        self.clear_dynamic_token();
-    }
 }
 
 pub(crate) static TOKEN_MANAGER: LazyLock<Mutex<TokenManager>> =
     LazyLock::new(|| Mutex::new(TokenManager::new()));
 
-/// Waits for rate-limiting spacing between requests.
-/// Returns false if Musixmatch is blocked under network cooldown.
-pub(crate) async fn wait_for_gate() -> bool {
+/// Enforces Morphe's 500ms minimum spacing between Musixmatch API requests.
+pub(crate) async fn throttle_request() {
     let delay = {
         let Ok(mut mgr) = TOKEN_MANAGER.lock() else {
-            return true;
+            return;
         };
-        if let Some(until) = mgr.blocked_until {
-            if Instant::now() < until {
-                return false;
-            }
-            mgr.blocked_until = None;
-        }
         let now = Instant::now();
-        let delay = if let Some(last) = mgr.last_request {
+        let delay = mgr.last_request.and_then(|last| {
             let elapsed = now.duration_since(last);
-            if elapsed < SPACING {
-                Some(SPACING - elapsed)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+            (elapsed < REQUEST_THROTTLE).then(|| REQUEST_THROTTLE - elapsed)
+        });
         mgr.last_request = Some(now + delay.unwrap_or_default());
         delay
     };
@@ -273,23 +270,12 @@ pub(crate) async fn wait_for_gate() -> bool {
     if let Some(d) = delay {
         tokio::time::sleep(d).await;
     }
-    true
 }
 
-/// Triggers cooldown across the global token manager.
-pub(crate) fn trigger_gate_cooldown() {
+/// Clears any cached guest token across the global token manager without imposing a multi-minute ban.
+pub(crate) fn clear_cached_dynamic_token() {
     if let Ok(mut mgr) = TOKEN_MANAGER.lock() {
-        mgr.trigger_cooldown();
-    }
-}
-
-/// Checks if cooldown is currently active.
-#[cfg(test)]
-pub(crate) fn is_gate_cooling_down() -> bool {
-    if let Ok(mgr) = TOKEN_MANAGER.lock() {
-        mgr.is_cooling_down()
-    } else {
-        false
+        mgr.clear_dynamic_token();
     }
 }
 
@@ -305,9 +291,9 @@ mod tests {
                 "token2".to_string(),
                 "token3".to_string(),
             ],
+            invalid_tokens: HashSet::new(),
             current_index: 0,
             cached_dynamic_token: None,
-            blocked_until: None,
             last_request: None,
         };
 
@@ -317,6 +303,26 @@ mod tests {
         assert_eq!(tm.next_env_token(), Some("token1".to_string())); // Wraps around
     }
 
+    #[test]
+    fn test_invalidate_env_token_prunes_and_blocks_reseed() {
+        let mut tm = TokenManager {
+            tokens: vec!["tok_a".into(), "tok_b".into()],
+            invalid_tokens: HashSet::new(),
+            current_index: 0,
+            cached_dynamic_token: None,
+            last_request: None,
+        };
+
+        assert_eq!(tm.next_env_token().as_deref(), Some("tok_a"));
+        tm.invalidate_env_token("tok_a");
+        assert_eq!(tm.env_token_count(), 1);
+        assert_eq!(tm.next_env_token().as_deref(), Some("tok_b"));
+
+        // Re-seeding from TOML/env config does not restore the invalidated token.
+        tm.seed_configured_tokens("tok_a, tok_b, tok_c");
+        assert_eq!(tm.tokens, vec!["tok_b".to_string(), "tok_c".to_string()]);
+    }
+
     static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
@@ -324,9 +330,9 @@ mod tests {
         let _lock = TEST_MUTEX.lock().unwrap();
         let mut tm = TokenManager {
             tokens: Vec::new(),
+            invalid_tokens: HashSet::new(),
             current_index: 0,
             cached_dynamic_token: None,
-            blocked_until: None,
             last_request: None,
         };
 
@@ -372,19 +378,18 @@ mod tests {
     }
 
     #[test]
-    fn test_cooldown_gating() {
+    fn test_clear_cached_dynamic_token() {
         let _lock = TEST_MUTEX.lock().unwrap();
         let mut tm = TokenManager {
             tokens: Vec::new(),
+            invalid_tokens: HashSet::new(),
             current_index: 0,
             cached_dynamic_token: Some("dummy".to_string()),
-            blocked_until: None,
             last_request: None,
         };
 
-        assert!(!tm.is_cooling_down());
-        tm.trigger_cooldown();
-        assert!(tm.is_cooling_down());
+        assert_eq!(tm.cached_dynamic_token.as_deref(), Some("dummy"));
+        tm.clear_dynamic_token();
         assert!(tm.cached_dynamic_token.is_none());
     }
 
@@ -414,19 +419,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wait_for_gate_blocks_under_cooldown() {
+    async fn test_throttle_request_enforces_500ms_pacing() {
         let _lock = TEST_MUTEX.lock().unwrap();
-        // Trigger cooldown on global TOKEN_MANAGER
-        trigger_gate_cooldown();
-        assert!(is_gate_cooling_down());
-
-        // Under cooldown, wait_for_gate immediately returns false without making network requests
-        let gate_opened = wait_for_gate().await;
-        assert!(!gate_opened, "Gate must remain closed when under cooldown");
-
-        // Clean up cooldown so other tests aren't affected
         if let Ok(mut mgr) = TOKEN_MANAGER.lock() {
-            mgr.blocked_until = None;
+            mgr.last_request = Some(Instant::now());
         }
+        let start = Instant::now();
+        throttle_request().await;
+        assert!(
+            start.elapsed() >= Duration::from_millis(450),
+            "Expected ~500ms pacing between requests, elapsed={:?}",
+            start.elapsed()
+        );
     }
 }

@@ -143,18 +143,15 @@ pub(crate) fn extract_track_meta_from_macro(macro_calls: &Value) -> Option<Match
     (!meta.title.is_empty() || !meta.artist.is_empty()).then_some(meta)
 }
 
-/// Extract track identifiers (isrcs, spotify_ids, itunes_ids) from a musixmatch track object.
+/// Extract track identifiers (isrcs, spotify_ids) from a musixmatch track object.
 pub(crate) fn extract_track_ids_from_json(track: &Value) -> TrackMatchInfo {
     let isrcs = extract_all_isrcs_from_json(track);
     let spotify_ids =
         extract_all_strings_from_fields(track, "track_spotify_id", "commontrack_spotify_ids");
-    let itunes_ids =
-        extract_all_strings_from_fields(track, "track_itunes_id", "commontrack_itunes_ids");
 
     TrackMatchInfo {
         track_isrcs: isrcs,
         track_spotify_ids: spotify_ids,
-        track_itunes_ids: itunes_ids,
         youtube_video_id: None,
     }
 }
@@ -180,8 +177,7 @@ mod tests {
         let json: Value = serde_json::from_str(
             r#"{
             "track_isrc": "USUM72345678",
-            "track_spotify_id": "6rqhFg4Kj6gIwR5v",
-            "track_itunes_id": "123456789"
+            "track_spotify_id": "6rqhFg4Kj6gIwR5v"
         }"#,
         )
         .unwrap();
@@ -189,7 +185,6 @@ mod tests {
         let ids = extract_track_ids_from_json(&json);
         assert_eq!(ids.track_isrcs, vec!["USUM72345678".to_string()]);
         assert_eq!(ids.track_spotify_ids, vec!["6rqhFg4Kj6gIwR5v".to_string()]);
-        assert_eq!(ids.track_itunes_ids, vec!["123456789".to_string()]);
     }
 
     #[test]
@@ -226,8 +221,7 @@ mod tests {
             "track_isrc": "EEUL32203751",
             "commontrack_isrcs": [["EEUL32203751", "GBKPL2177541"]],
             "track_spotify_id": "5FVd6KXrgO9B3JPmC8OPst",
-            "commontrack_spotify_ids": ["5FVd6KXrgO9B3JPmC8OPst", "2UzMpPKPhbcC8RbsmuURAZ"],
-            "commontrack_itunes_ids": [1442699400, 776001036]
+            "commontrack_spotify_ids": ["5FVd6KXrgO9B3JPmC8OPst", "2UzMpPKPhbcC8RbsmuURAZ"]
         }"#,
         )
         .unwrap();
@@ -244,10 +238,6 @@ mod tests {
                 "2UzMpPKPhbcC8RbsmuURAZ".to_string()
             ]
         );
-        assert_eq!(
-            ids.track_itunes_ids,
-            vec!["1442699400".to_string(), "776001036".to_string()]
-        );
     }
 
     #[test]
@@ -262,7 +252,6 @@ mod tests {
         let ids = extract_track_ids_from_json(&json);
         assert!(ids.track_isrcs.is_empty());
         assert!(ids.track_spotify_ids.is_empty());
-        assert!(ids.track_itunes_ids.is_empty());
     }
 
     #[test]

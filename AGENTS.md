@@ -58,9 +58,9 @@ src/ui/ (modern.rs Ratatui TUI or pipe.rs stdout)
   - Tier 1: Round-robin pool from `MUSIXMATCH_USERTOKEN` env var.
   - Tier 2: Auto-fetches anonymous token via `token.get` API if Tier 1 is unconfigured or exhausted.
   - Tier 3: Auto-purges invalid tokens on 401/402/403/429 responses, requests a fresh token, and retries once transparently.
-  - Rate Limiting: 1.5s request spacing gate + 10-minute cooldown on non-renewable 401/402/403/429. Disk token cached at `~/.cache/lyricsmpris/musixmatch_token.json`.
+  - Rate Limiting: 500ms Morphe request pacing per API call (no 10-minute cooldown lockout); expired Tier-1 tokens (`401` with `hint: renew`) are pruned for the session. Disk token cached at `~/.cache/lyricsmpris/musixmatch_token.json`.
   - Query Fallback Pipeline:
-    1. Direct `macro.subtitles.get` combining metadata and track IDs (ISRC, Spotify ID, iTunes ID).
+    1. Direct `macro.subtitles.get` combining metadata and track IDs (ISRC, Spotify ID).
     2. Pure metadata fallback (dropping IDs if ID lookup returns `TrackNotFound`).
     3. Cleaned title fallback (stripping feat/remaster annotations via `clean_title_annotations`).
     4. Candidate search (`track.search` via `search_and_fetch_best_candidate`).
