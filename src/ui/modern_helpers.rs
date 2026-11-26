@@ -144,6 +144,123 @@ impl WrappedBlock {
     }
 }
 
+/// Return the index of the parent `!is_bg` line for `idx` (rewinding past `is_bg` siblings).
+pub fn parent_group_start(lines: &[crate::lyrics::LyricLine], idx: usize) -> usize {
+    if lines.is_empty() {
+        return 0;
+    }
+    let mut cur = idx.min(lines.len() - 1);
+    while cur > 0 && lines[cur].is_bg {
+        cur -= 1;
+    }
+    if lines[cur].is_bg {
+        lines.iter().position(|l| !l.is_bg).unwrap_or(0)
+    } else {
+        cur
+    }
+}
+
+/// Return the exclusive end index after `group_start` and all contiguous trailing `is_bg` lines.
+pub fn group_end(lines: &[crate::lyrics::LyricLine], group_start: usize) -> usize {
+    let mut end = (group_start + 1).min(lines.len());
+    while lines.get(end).is_some_and(|l| l.is_bg) {
+        end += 1;
+    }
+    end
+}
+
+/// Resolve the paused manual scroll index, snapping off standalone `is_bg` lines onto their parent.
+pub fn resolve_scrolled_index(
+    lines: &[crate::lyrics::LyricLine],
+    base_index: usize,
+    scroll_offset: isize,
+) -> usize {
+    if lines.is_empty() {
+        return 0;
+    }
+    let raw = (base_index as isize + scroll_offset)
+        .max(0)
+        .min(lines.len().saturating_sub(1) as isize) as usize;
+    parent_group_start(lines, raw)
+}
+
+/// Step manual scroll offset by `delta` primary lyric groups (skipping `is_bg` lines).
+pub fn step_scroll_offset(
+    lines: &[crate::lyrics::LyricLine],
+    base_index: usize,
+    current_offset: isize,
+    delta: isize,
+) -> isize {
+    if lines.is_empty() {
+        return current_offset;
+    }
+    let primary_indices: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| (!l.is_bg).then_some(i))
+        .collect();
+    if primary_indices.is_empty() {
+        let cur =
+            (base_index as isize + current_offset).clamp(0, lines.len().saturating_sub(1) as isize);
+        return (cur + delta).clamp(0, lines.len().saturating_sub(1) as isize)
+            - base_index as isize;
+    }
+    let cur = resolve_scrolled_index(lines, base_index, current_offset);
+    let pos = primary_indices
+        .binary_search(&cur)
+        .unwrap_or_else(|ins| ins.saturating_sub(1));
+    let target_pos = if delta < 0 {
+        pos.saturating_sub(delta.unsigned_abs())
+    } else {
+        pos.saturating_add(delta as usize)
+            .min(primary_indices.len() - 1)
+    };
+    primary_indices[target_pos] as isize - base_index as isize
+}
+
+/// Compute scroll offset targeting the first (`to_end = false`) or last (`to_end = true`) primary line.
+pub fn edge_scroll_offset(
+    lines: &[crate::lyrics::LyricLine],
+    base_index: usize,
+    to_end: bool,
+) -> isize {
+    if lines.is_empty() {
+        return 0;
+    }
+    let target = if to_end {
+        lines
+            .iter()
+            .rposition(|l| !l.is_bg)
+            .unwrap_or(lines.len() - 1)
+    } else {
+        lines.iter().position(|l| !l.is_bg).unwrap_or(0)
+    };
+    target as isize - base_index as isize
+}
+
+fn collect_group_ranges(
+    lines: &[crate::lyrics::LyricLine],
+    start: usize,
+    end: usize,
+) -> Vec<(usize, usize)> {
+    let mut groups = Vec::new();
+    let mut i = start;
+    while i < end {
+        if lines.get(i).is_some_and(|l| l.is_bg) {
+            groups.push((i, i + 1));
+            i += 1;
+        } else {
+            let mut g_end = i + 1;
+            while g_end < end && lines.get(g_end).is_some_and(|l| l.is_bg) {
+                g_end += 1;
+            }
+            groups.push((i, g_end));
+            i = g_end;
+        }
+    }
+    groups
+}
+
 /// Draw the UI using cached wrapped lines.
 ///
 /// This function handles:
@@ -158,6 +275,7 @@ pub fn draw_ui_with_cache<B: Backend>(
     wrapped_cache: &mut Option<(usize, Vec<WrappedBlock>)>,
     styles: &LyricStyles,
     karaoke_enabled: bool,
+    split_background: bool,
     max_visible_lines: Option<usize>,
     scroll_offset: isize,
 ) -> Result<(), Box<dyn Error + Send + Sync>>
@@ -177,6 +295,7 @@ where
                 height,
                 styles,
                 karaoke_enabled,
+                split_background,
                 max_visible_lines,
                 scroll_offset,
             );
@@ -197,6 +316,7 @@ fn compute_visible_spans<'a>(
     height: usize,
     styles: &'a LyricStyles,
     karaoke_enabled: bool,
+    split_background: bool,
     max_visible_lines: Option<usize>,
     scroll_offset: isize,
 ) -> Vec<Line<'a>> {
@@ -217,8 +337,8 @@ fn compute_visible_spans<'a>(
         return Vec::new();
     }
 
-    let blocks = ensure_wrapped_cache(wrapped_cache, &update.lines, width);
-    let visible = gather_visible_lines(
+    let blocks = ensure_wrapped_cache(wrapped_cache, &update.lines, width, split_background);
+    let visible = gather_visible_lines_with_split(
         update,
         blocks,
         width,
@@ -226,6 +346,7 @@ fn compute_visible_spans<'a>(
         styles,
         update.position,
         karaoke_enabled,
+        split_background,
         max_visible_lines,
         scroll_offset,
     );
@@ -239,6 +360,7 @@ fn ensure_wrapped_cache<'a>(
     wrapped_cache: &'a mut Option<(usize, Vec<WrappedBlock>)>,
     lines: &[crate::lyrics::LyricLine],
     width: usize,
+    split_background: bool,
 ) -> &'a Vec<WrappedBlock> {
     let needs_rebuild = match wrapped_cache {
         Some((cached_w, blocks)) => *cached_w != width || blocks.len() != lines.len(),
@@ -254,6 +376,13 @@ fn ensure_wrapped_cache<'a>(
                         primary: Vec::new(),
                         background: wrap_text(&l.text, width),
                         bg_first: true,
+                    };
+                }
+                if !split_background {
+                    return WrappedBlock {
+                        primary: wrap_text(&l.text, width),
+                        background: Vec::new(),
+                        bg_first: false,
                     };
                 }
                 let (main_text, bg_text) = split_line_main_and_background(&l.text);
@@ -327,32 +456,147 @@ impl<'a> VisibleLines<'a> {
     }
 }
 
-/// Collect lines before the current index. Returns Lines in visual top->down order.
-fn collect_before_spans<'a>(
-    current_index: usize,
+fn group_bg_first(lines: &[crate::lyrics::LyricLine], g_start: usize, g_end: usize) -> bool {
+    if g_end <= g_start + 1 {
+        return false;
+    }
+    let Some(main_line) = lines.get(g_start) else {
+        return false;
+    };
+    if main_line.is_bg {
+        return false;
+    }
+    let main_start = main_line.vocal_start();
+    lines[g_start + 1..g_end]
+        .iter()
+        .filter(|l| l.is_bg)
+        .map(crate::lyrics::LyricLine::vocal_start)
+        .min_by(f64::total_cmp)
+        .is_some_and(|bg_start| bg_start + f64::EPSILON < main_start)
+}
+
+fn is_line_actively_singing(line: &crate::lyrics::LyricLine, position: f64) -> bool {
+    if !position.is_finite() {
+        return false;
+    }
+    let start = line.vocal_start();
+    let Some(end) = line.vocal_end() else {
+        return false;
+    };
+    start.is_finite() && end > start && position >= start && position < end
+}
+
+fn append_karaoke_split_lines<'a>(
+    out: &mut Vec<Line<'a>>,
+    bg_first: bool,
+    main_spans: Option<Vec<Line<'a>>>,
+    bg_spans: Option<Vec<Line<'a>>>,
+) {
+    if bg_first {
+        if let Some(bs) = bg_spans {
+            out.extend(bs);
+        }
+        if let Some(ms) = main_spans {
+            out.extend(ms);
+        }
+    } else {
+        if let Some(ms) = main_spans {
+            out.extend(ms);
+        }
+        if let Some(bs) = bg_spans {
+            out.extend(bs);
+        }
+    }
+}
+
+struct ContextRenderCtx<'a> {
+    update: &'a Update,
     wrapped_blocks: &'a [WrappedBlock],
-    mut lines_needed: usize,
+    width: usize,
     styles: &'a LyricStyles,
+    position: f64,
+    use_karaoke: bool,
+    allow_overlap_active: bool,
+    split_background: bool,
+}
+
+fn render_group_block_lines<'a>(
+    ctx: &ContextRenderCtx<'a>,
+    g_start: usize,
+    g_end: usize,
+    dist: usize,
+    is_before: bool,
+) -> Vec<Line<'a>> {
+    let style = ctx.styles.get_line_style_by_distance(dist, is_before);
+    let bg_style = ctx.styles.get_background_style_by_distance(dist, is_before);
+    let ordered: Vec<usize> = if group_bg_first(&ctx.update.lines, g_start, g_end) {
+        ((g_start + 1)..g_end)
+            .chain(std::iter::once(g_start))
+            .collect()
+    } else {
+        (g_start..g_end).collect()
+    };
+
+    let mut out = Vec::new();
+    for idx in ordered {
+        let block = &ctx.wrapped_blocks[idx];
+        let line_opt = ctx.update.lines.get(idx);
+        let overlap_active = ctx.allow_overlap_active
+            && line_opt.is_some_and(|l| is_line_actively_singing(l, ctx.position));
+
+        if overlap_active {
+            let line = line_opt.unwrap();
+            let line_has_words = ctx
+                .update
+                .provider
+                .as_ref()
+                .is_some_and(crate::state::Provider::is_word_synced)
+                || line.has_word_timings();
+            if ctx.use_karaoke
+                && line_has_words
+                && let Some((main_spans, bg_spans)) = try_build_karaoke_spans_split(
+                    ctx.update,
+                    idx,
+                    ctx.width,
+                    ctx.styles,
+                    ctx.position,
+                    ctx.split_background,
+                )
+            {
+                append_karaoke_split_lines(&mut out, block.bg_first, main_spans, bg_spans);
+                continue;
+            }
+            let (active_style, active_bg_style) = if line.is_bg {
+                (ctx.styles.background_current, ctx.styles.background_current)
+            } else {
+                (ctx.styles.current, ctx.styles.background_current)
+            };
+            out.extend(block.styled_lines(active_style, active_bg_style));
+        } else {
+            out.extend(block.styled_lines(style, bg_style));
+        }
+    }
+    out
+}
+
+/// Collect lines before the current group. Returns Lines in visual top->down order.
+fn collect_before_spans<'a>(
+    ctx: &ContextRenderCtx<'a>,
+    before_groups: &[(usize, usize)],
+    mut lines_needed: usize,
 ) -> Vec<Line<'a>> {
     let mut chunks: Vec<Vec<Line<'a>>> = Vec::new();
 
-    let mut i = current_index;
-    while i > 0 && lines_needed > 0 {
-        i -= 1;
-        let dist = current_index - i;
-        let style = styles.get_line_style_by_distance(dist, true);
-        let bg_style = styles.get_background_style_by_distance(dist, true);
-        let block = &wrapped_blocks[i];
-        let block_len = block.len();
-        let take = block_len.min(lines_needed);
-        let skip = block_len - take;
-        chunks.push(
-            block
-                .styled_lines(style, bg_style)
-                .skip(skip)
-                .take(take)
-                .collect(),
-        );
+    for (idx_from_end, &(g_start, g_end)) in before_groups.iter().rev().enumerate() {
+        if lines_needed == 0 {
+            break;
+        }
+        let dist = idx_from_end + 1;
+        let mut group_lines = render_group_block_lines(ctx, g_start, g_end, dist, true);
+        let group_len = group_lines.len();
+        let take = group_len.min(lines_needed);
+        let skip = group_len - take;
+        chunks.push(group_lines.drain(skip..).collect());
         lines_needed -= take;
     }
 
@@ -360,75 +604,62 @@ fn collect_before_spans<'a>(
     chunks.into_iter().flatten().collect()
 }
 
-/// Collect lines after the current index. Returns Lines in visual top->down order.
+/// Collect lines after the current group. Returns Lines in visual top->down order.
 fn collect_after_spans<'a>(
-    current_index: usize,
-    wrapped_blocks: &'a [WrappedBlock],
+    ctx: &ContextRenderCtx<'a>,
+    after_groups: &[(usize, usize)],
     mut lines_needed: usize,
-    styles: &'a LyricStyles,
 ) -> Vec<Line<'a>> {
     let mut result = Vec::new();
-    let mut j = current_index + 1;
-    while j < wrapped_blocks.len() && lines_needed > 0 {
-        let dist = j - current_index;
-        let style = styles.get_line_style_by_distance(dist, false);
-        let bg_style = styles.get_background_style_by_distance(dist, false);
-        let block = &wrapped_blocks[j];
-        let take = block.len().min(lines_needed);
-        result.extend(block.styled_lines(style, bg_style).take(take));
-        lines_needed -= take;
-        j += 1;
+
+    for (k, &(g_start, g_end)) in after_groups.iter().enumerate() {
+        if lines_needed == 0 {
+            break;
+        }
+        let dist = k + 1;
+        for line in render_group_block_lines(ctx, g_start, g_end, dist, false)
+            .into_iter()
+            .take(lines_needed)
+        {
+            result.push(line);
+            lines_needed -= 1;
+        }
     }
     result
 }
 
-/// Collect complete lyric blocks before the current index (for max_visible_lines mode).
-/// Returns all wrapped lines from each block in visual top->down order.
-fn collect_before_blocks<'a>(
-    current_index: usize,
-    wrapped_blocks: &'a [WrappedBlock],
-    blocks_needed: usize,
-    styles: &'a LyricStyles,
+/// Collect complete logical lyric groups before the current group (for max_visible_lines mode).
+/// Returns all wrapped lines from each group in visual top->down order.
+fn collect_before_groups<'a>(
+    ctx: &ContextRenderCtx<'a>,
+    before_groups: &[(usize, usize)],
+    groups_needed: usize,
 ) -> Vec<Line<'a>> {
     let mut result = Vec::new();
-    let start_index = current_index.saturating_sub(blocks_needed);
+    let start = before_groups.len().saturating_sub(groups_needed);
+    let selected = &before_groups[start..];
 
-    for (block_idx, block) in wrapped_blocks
-        .iter()
-        .enumerate()
-        .take(current_index)
-        .skip(start_index)
-    {
-        let dist = current_index - block_idx;
-        let style = styles.get_line_style_by_distance(dist, true);
-        let bg_style = styles.get_background_style_by_distance(dist, true);
-        result.extend(block.styled_lines(style, bg_style));
+    for (offset, &(g_start, g_end)) in selected.iter().enumerate() {
+        let dist = selected.len() - offset;
+        result.extend(render_group_block_lines(ctx, g_start, g_end, dist, true));
     }
 
     result
 }
 
-/// Collect complete lyric blocks after the current index (for max_visible_lines mode).
-/// Returns all wrapped lines from each block in visual top->down order.
-fn collect_after_blocks<'a>(
-    current_index: usize,
-    wrapped_blocks: &'a [WrappedBlock],
-    blocks_needed: usize,
-    styles: &'a LyricStyles,
+/// Collect complete logical lyric groups after the current group (for max_visible_lines mode).
+/// Returns all wrapped lines from each group in visual top->down order.
+fn collect_after_groups<'a>(
+    ctx: &ContextRenderCtx<'a>,
+    after_groups: &[(usize, usize)],
+    groups_needed: usize,
 ) -> Vec<Line<'a>> {
     let mut result = Vec::new();
-    let end_index = (current_index + 1 + blocks_needed).min(wrapped_blocks.len());
+    let take = groups_needed.min(after_groups.len());
 
-    for (block_idx, block) in wrapped_blocks
-        .iter()
-        .enumerate()
-        .take(end_index)
-        .skip(current_index + 1)
-    {
-        let dist = block_idx - current_index;
-        let style = styles.get_line_style_by_distance(dist, false);
-        let bg_style = styles.get_background_style_by_distance(dist, false);
-        result.extend(block.styled_lines(style, bg_style));
+    for (offset, &(g_start, g_end)) in after_groups[..take].iter().enumerate() {
+        let dist = offset + 1;
+        result.extend(render_group_block_lines(ctx, g_start, g_end, dist, false));
     }
 
     result
@@ -444,11 +675,11 @@ fn split_words_into_lines<'b>(
 }
 
 fn line_uses_explicit_spaces(words: &[crate::lyrics::types::WordTiming], line_text: &str) -> bool {
-    words
-        .iter()
-        .take(words.len().saturating_sub(1))
-        .any(|w| w.ends_with_space)
-        || !line_text.chars().any(char::is_whitespace)
+    words.iter().take(words.len().saturating_sub(1)).any(|w| {
+        w.ends_with_space
+            || w.text.chars().next_back().is_some_and(char::is_whitespace)
+            || w.text.chars().next().is_some_and(char::is_whitespace)
+    }) || !line_text.chars().any(char::is_whitespace)
 }
 
 fn split_words_into_lines_mode<'b>(
@@ -509,6 +740,7 @@ fn split_words_into_lines_mode<'b>(
 /// # Arguments
 /// * `max_visible_lines` - Maximum number of lyric blocks to display (None = unlimited)
 /// * `scroll_offset` - Manual scroll offset in lyric blocks when paused
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn gather_visible_lines<'a>(
     update: &'a Update,
@@ -521,21 +753,44 @@ pub fn gather_visible_lines<'a>(
     max_visible_lines: Option<usize>,
     scroll_offset: isize,
 ) -> VisibleLines<'a> {
+    gather_visible_lines_with_split(
+        update,
+        wrapped_blocks,
+        w,
+        h,
+        styles,
+        position,
+        karaoke_enabled,
+        true,
+        max_visible_lines,
+        scroll_offset,
+    )
+}
+
+/// Build `VisibleLines` with configurable visual background bracket splitting.
+#[allow(clippy::too_many_arguments)]
+pub fn gather_visible_lines_with_split<'a>(
+    update: &'a Update,
+    wrapped_blocks: &'a [WrappedBlock],
+    w: usize,
+    h: usize,
+    styles: &'a LyricStyles,
+    position: f64,
+    karaoke_enabled: bool,
+    split_background: bool,
+    max_visible_lines: Option<usize>,
+    scroll_offset: isize,
+) -> VisibleLines<'a> {
     // Calculate the effective index considering scroll offset when paused
     let base_index = update.index.unwrap_or(0);
     let effective_index = if !update.playing {
-        // When paused, allow scrolling
-        (base_index as isize + scroll_offset)
-            .max(0)
-            .min(wrapped_blocks.len().saturating_sub(1) as isize) as usize
+        resolve_scrolled_index(&update.lines, base_index, scroll_offset)
+            .min(wrapped_blocks.len().saturating_sub(1))
     } else {
-        base_index
+        parent_group_start(&update.lines, base_index).min(wrapped_blocks.len().saturating_sub(1))
     };
 
-    let mut trailing_bg_end = effective_index + 1;
-    while update.lines.get(trailing_bg_end).is_some_and(|l| l.is_bg) {
-        trailing_bg_end += 1;
-    }
+    let trailing_bg_end = group_end(&update.lines, effective_index).min(wrapped_blocks.len());
 
     let current_block = wrapped_blocks.get(effective_index);
     let current_height: usize = (effective_index..trailing_bg_end)
@@ -545,28 +800,52 @@ pub fn gather_visible_lines<'a>(
 
     // Build current line spans (with karaoke if applicable, but only when not scrolled)
     let use_karaoke = karaoke_enabled && scroll_offset == 0 && update.playing;
-    let mut current_spans = match current_block {
-        Some(block) => build_current_spans(update, block, w, styles, position, use_karaoke),
+    let main_spans = match current_block {
+        Some(block) => build_current_spans(
+            update,
+            block,
+            w,
+            styles,
+            position,
+            use_karaoke,
+            split_background,
+        ),
         None => Vec::new(),
     };
+    let mut bg_spans = Vec::new();
     for bg_idx in (effective_index + 1)..trailing_bg_end {
         if let Some(bg_block) = wrapped_blocks.get(bg_idx) {
-            let bg_active = update.lines.get(bg_idx).is_some_and(|l| position >= l.time);
+            let bg_active = (!update.playing && scroll_offset != 0)
+                || update.lines.get(bg_idx).is_some_and(|l| position >= l.time);
             if use_karaoke
                 && bg_active
-                && let Some((_, Some(bg_karaoke))) =
-                    try_build_karaoke_spans_split(update, bg_idx, w, styles, position)
+                && let Some((_, Some(bg_karaoke))) = try_build_karaoke_spans_split(
+                    update,
+                    bg_idx,
+                    w,
+                    styles,
+                    position,
+                    split_background,
+                )
             {
-                current_spans.extend(bg_karaoke);
+                bg_spans.extend(bg_karaoke);
             } else {
                 let (style, bg_style) = if bg_active {
                     (styles.background_current, styles.background_current)
                 } else {
                     (styles.background_after, styles.background_after)
                 };
-                current_spans.extend(bg_block.styled_lines(style, bg_style));
+                bg_spans.extend(bg_block.styled_lines(style, bg_style));
             }
         }
+    }
+    let mut current_spans = Vec::with_capacity(main_spans.len() + bg_spans.len());
+    if group_bg_first(&update.lines, effective_index, trailing_bg_end) {
+        current_spans.extend(bg_spans);
+        current_spans.extend(main_spans);
+    } else {
+        current_spans.extend(main_spans);
+        current_spans.extend(bg_spans);
     }
 
     // If current block fills or exceeds available terminal height, no context can fit
@@ -578,16 +857,19 @@ pub fn gather_visible_lines<'a>(
         };
     }
 
+    let before_groups = collect_group_ranges(&update.lines, 0, effective_index);
+    let after_groups = collect_group_ranges(&update.lines, trailing_bg_end, wrapped_blocks.len());
+
     // Calculate context lines for max_visible_lines
     let (lines_before, lines_after) = if let Some(max) = max_visible_lines {
-        // Limit to available context blocks constrained by max_visible_lines and remaining screen rows
+        // Limit to available context groups constrained by max_visible_lines and remaining screen rows
         let max_context_blocks = max.saturating_sub(1);
         let total_context = max_context_blocks.min(h.saturating_sub(current_height));
         let ideal_before = total_context / 2;
         let ideal_after = total_context - ideal_before;
 
-        let available_before = effective_index;
-        let available_after = wrapped_blocks.len().saturating_sub(trailing_bg_end);
+        let available_before = before_groups.len();
+        let available_after = after_groups.len();
 
         // Dynamically rebalance context if either side is starved at boundaries (e.g. at track start or end)
         let (before_blocks, after_blocks) = if available_before < ideal_before {
@@ -611,17 +893,27 @@ pub fn gather_visible_lines<'a>(
         (lines_before, lines_after)
     };
 
-    let after_start_idx = trailing_bg_end.saturating_sub(1);
+    let ctx = ContextRenderCtx {
+        update,
+        wrapped_blocks,
+        width: w,
+        styles,
+        position,
+        use_karaoke,
+        allow_overlap_active: scroll_offset == 0,
+        split_background,
+    };
+
     let before = if max_visible_lines.is_some() {
-        collect_before_blocks(effective_index, wrapped_blocks, lines_before, styles)
+        collect_before_groups(&ctx, &before_groups, lines_before)
     } else {
-        collect_before_spans(effective_index, wrapped_blocks, lines_before, styles)
+        collect_before_spans(&ctx, &before_groups, lines_before)
     };
 
     let after = if max_visible_lines.is_some() {
-        collect_after_blocks(after_start_idx, wrapped_blocks, lines_after, styles)
+        collect_after_groups(&ctx, &after_groups, lines_after)
     } else {
-        collect_after_spans(after_start_idx, wrapped_blocks, lines_after, styles)
+        collect_after_spans(&ctx, &after_groups, lines_after)
     };
 
     VisibleLines {
@@ -639,6 +931,7 @@ fn build_current_spans<'a>(
     styles: &'a LyricStyles,
     position: f64,
     karaoke_enabled: bool,
+    split_background: bool,
 ) -> Vec<Line<'a>> {
     // Try to build richsync karaoke spans
     if let Some(idx) = update.index
@@ -652,24 +945,10 @@ fn build_current_spans<'a>(
                 .get(idx)
                 .is_some_and(crate::lyrics::LyricLine::has_word_timings))
         && let Some((main_spans, bg_spans)) =
-            try_build_karaoke_spans_split(update, idx, width, styles, position)
+            try_build_karaoke_spans_split(update, idx, width, styles, position, split_background)
     {
         let mut lines = Vec::new();
-        if current_block.bg_first {
-            if let Some(bs) = bg_spans {
-                lines.extend(bs);
-            }
-            if let Some(ms) = main_spans {
-                lines.extend(ms);
-            }
-        } else {
-            if let Some(ms) = main_spans {
-                lines.extend(ms);
-            }
-            if let Some(bs) = bg_spans {
-                lines.extend(bs);
-            }
-        }
+        append_karaoke_split_lines(&mut lines, current_block.bg_first, main_spans, bg_spans);
         lines
     } else {
         let (style, bg_style) = if update.index.is_some() {
@@ -691,6 +970,7 @@ fn try_build_karaoke_spans_split<'a>(
     width: usize,
     styles: &'a LyricStyles,
     position: f64,
+    split_background: bool,
 ) -> Option<KaraokeSplitSpans<'a>> {
     let line = update.lines.get(idx)?;
     let words = line.words.as_ref()?;
@@ -700,6 +980,8 @@ fn try_build_karaoke_spans_split<'a>(
         Vec<&crate::lyrics::types::WordTiming>,
     ) = if line.is_bg {
         (Vec::new(), words.iter().collect())
+    } else if !split_background {
+        (words.iter().collect(), Vec::new())
     } else {
         split_words_main_and_background(words)
     };
@@ -753,7 +1035,7 @@ fn try_build_karaoke_spans<'a>(
     position: f64,
 ) -> Option<Vec<Line<'a>>> {
     let (main_lines, bg_lines) =
-        try_build_karaoke_spans_split(update, idx, width, styles, position)?;
+        try_build_karaoke_spans_split(update, idx, width, styles, position, true)?;
     let line = update.lines.get(idx)?;
     let bg_first = determine_background_first(&line.text, line.words.as_deref());
 
@@ -1260,7 +1542,7 @@ mod tests {
             "夜空に光る（星のように）",
         )];
 
-        let blocks = ensure_wrapped_cache(&mut cache, &lines, 80);
+        let blocks = ensure_wrapped_cache(&mut cache, &lines, 80, true);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].primary, vec!["夜空に光る"]);
         assert_eq!(blocks[0].background, vec!["（星のように）"]);
@@ -1778,5 +2060,238 @@ mod tests {
         assert_eq!(visible.current[1].spans[0].style, styles.background_current);
         assert_eq!(visible.after.len(), 1);
         assert_eq!(visible.after[0].spans[0].content, "Next main");
+    }
+
+    #[test]
+    fn test_no_split_bg_keeps_parenthetical_inline() {
+        let styles = LyricStyles::default();
+        let words = vec![
+            crate::lyrics::types::create_word_timing(0.0, 0.3, "I").with_space(true),
+            crate::lyrics::types::create_word_timing(0.3, 0.6, "want").with_space(true),
+            crate::lyrics::types::create_word_timing(0.6, 0.9, "you").with_space(true),
+            crate::lyrics::types::create_word_timing(0.9, 1.2, "(Oh").with_space(true),
+            crate::lyrics::types::create_word_timing(1.2, 1.5, "yeah)"),
+        ];
+        let lines = vec![
+            crate::lyrics::LyricLine::new(0.0, "I want you (Oh yeah)")
+                .with_end(Some(1.5))
+                .with_words(Some(words)),
+        ];
+
+        let mut cache = None;
+        let blocks = ensure_wrapped_cache(&mut cache, &lines, 80, false);
+        assert_eq!(blocks[0].primary, vec!["I want you (Oh yeah)"]);
+        assert!(blocks[0].background.is_empty());
+
+        let update = Update {
+            lines: std::sync::Arc::new(lines),
+            index: Some(0),
+            position: 1.6,
+            playing: true,
+            ..Default::default()
+        };
+        let visible = gather_visible_lines_with_split(
+            &update, blocks, 80, 24, &styles, 1.6, true, false, None, 0,
+        );
+        assert_eq!(visible.current.len(), 1);
+        let rendered: String = visible.current[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(rendered, "I want you (Oh yeah)");
+    }
+
+    #[test]
+    fn test_max_visible_lines_counts_main_plus_bg_as_one_group() {
+        let styles = LyricStyles::default();
+        let lines = vec![
+            crate::lyrics::LyricLine::new(0.0, "Lead 0"),
+            crate::lyrics::LyricLine::new(1.0, "Echo 0").with_bg(true),
+            crate::lyrics::LyricLine::new(5.0, "Lead 1"),
+            crate::lyrics::LyricLine::new(6.0, "Echo 1").with_bg(true),
+            crate::lyrics::LyricLine::new(10.0, "Lead 2"),
+            crate::lyrics::LyricLine::new(11.0, "Echo 2").with_bg(true),
+        ];
+        let mut cache = None;
+        let blocks = ensure_wrapped_cache(&mut cache, &lines, 80, true);
+        let update = Update {
+            lines: std::sync::Arc::new(lines),
+            index: Some(2),
+            position: 6.5,
+            playing: true,
+            ..Default::default()
+        };
+
+        let visible = gather_visible_lines_with_split(
+            &update,
+            blocks,
+            80,
+            24,
+            &styles,
+            6.5,
+            false,
+            true,
+            Some(3),
+            0,
+        );
+        assert_eq!(visible.before.len(), 2);
+        assert_eq!(visible.before[0].spans[0].content, "Lead 0");
+        assert_eq!(visible.before[1].spans[0].content, "Echo 0");
+        assert_eq!(visible.current.len(), 2);
+        assert_eq!(visible.current[0].spans[0].content, "Lead 1");
+        assert_eq!(visible.current[1].spans[0].content, "Echo 1");
+        assert_eq!(visible.after.len(), 2);
+        assert_eq!(visible.after[0].spans[0].content, "Lead 2");
+        assert_eq!(visible.after[1].spans[0].content, "Echo 2");
+    }
+
+    #[test]
+    fn test_leading_is_bg_renders_above_main_in_current_and_context() {
+        let styles = LyricStyles::default();
+        // Matches lrc.red TTML structure (e.g. L38 of Rolling In the Deep):
+        // x-bg vocal is sung chronologically before main words, even though parse_ttml emits [main, bg].
+        let lines = vec![
+            crate::lyrics::LyricLine::new(165.0, "Prev main"),
+            crate::lyrics::LyricLine::new(170.072, "We could've had it all").with_words(Some(
+                vec![
+                    crate::lyrics::types::create_word_timing(173.177, 173.477, "We")
+                        .with_space(true),
+                    crate::lyrics::types::create_word_timing(173.477, 177.443, "all"),
+                ],
+            )),
+            crate::lyrics::LyricLine::new(170.072, "You're gonna wish")
+                .with_words(Some(vec![
+                    crate::lyrics::types::create_word_timing(170.072, 170.500, "You're")
+                        .with_space(true),
+                    crate::lyrics::types::create_word_timing(170.500, 171.200, "wish"),
+                ]))
+                .with_bg(true),
+            crate::lyrics::LyricLine::new(180.0, "Next main"),
+        ];
+        let mut cache = None;
+        let blocks = ensure_wrapped_cache(&mut cache, &lines, 80, true);
+        let update = Update {
+            lines: std::sync::Arc::new(lines),
+            index: Some(1),
+            position: 171.0,
+            playing: true,
+            ..Default::default()
+        };
+
+        let visible = gather_visible_lines_with_split(
+            &update, blocks, 80, 24, &styles, 171.0, true, true, None, 0,
+        );
+        assert_eq!(visible.current.len(), 2);
+        let first_line: String = visible.current[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        let second_line: String = visible.current[1]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(first_line, "You're wish");
+        assert_eq!(second_line, "We all");
+
+        // When focus advances to Next main, the leading bg group in `before` also keeps bg above main.
+        let update_after = Update {
+            lines: update.lines.clone(),
+            index: Some(3),
+            position: 181.0,
+            playing: true,
+            ..Default::default()
+        };
+        let visible_after = gather_visible_lines_with_split(
+            &update_after,
+            blocks,
+            80,
+            24,
+            &styles,
+            181.0,
+            false,
+            true,
+            None,
+            0,
+        );
+        assert_eq!(
+            visible_after.before[1].spans[0].content,
+            "You're gonna wish"
+        );
+        assert_eq!(
+            visible_after.before[2].spans[0].content,
+            "We could've had it all"
+        );
+    }
+
+    #[test]
+    fn test_overlapping_before_line_continues_karaoke_until_sung_end() {
+        let styles = LyricStyles::default();
+        // L38 main held "all" until 177.443 while L39 x-bg enters at 174.553.
+        let lines = vec![
+            crate::lyrics::LyricLine::new(170.072, "We could've had it all").with_words(Some(
+                vec![
+                    crate::lyrics::types::create_word_timing(173.177, 173.477, "We")
+                        .with_space(true),
+                    crate::lyrics::types::create_word_timing(173.477, 174.655, "had")
+                        .with_space(true),
+                    crate::lyrics::types::create_word_timing(174.655, 177.443, "all"),
+                ],
+            )),
+            crate::lyrics::LyricLine::new(170.072, "You're gonna wish")
+                .with_words(Some(vec![crate::lyrics::types::create_word_timing(
+                    170.072, 173.050, "wish",
+                )]))
+                .with_bg(true),
+            crate::lyrics::LyricLine::new(174.553, "We could've had it all").with_words(Some(
+                vec![
+                    crate::lyrics::types::create_word_timing(177.701, 178.000, "We")
+                        .with_space(true),
+                    crate::lyrics::types::create_word_timing(178.000, 182.000, "all"),
+                ],
+            )),
+            crate::lyrics::LyricLine::new(174.553, "Tears are gonna fall")
+                .with_words(Some(vec![crate::lyrics::types::create_word_timing(
+                    174.553, 176.000, "Tears",
+                )]))
+                .with_bg(true),
+        ];
+        let mut cache = None;
+        let blocks = ensure_wrapped_cache(&mut cache, &lines, 80, true);
+
+        // At 175.0: index is L39 (2), while L38 main (0) is still singing "all" and L38 bg (1) already ended at 173.050.
+        let upd_mid = Update {
+            lines: std::sync::Arc::new(lines.clone()),
+            index: Some(2),
+            position: 175.0,
+            playing: true,
+            ..Default::default()
+        };
+        let visible_mid = gather_visible_lines_with_split(
+            &upd_mid, blocks, 80, 24, &styles, 175.0, true, true, None, 0,
+        );
+        // L38 bg (before[0]) already ended -> dimmed cyan before style
+        assert_eq!(
+            visible_mid.before[0].spans[0].style,
+            styles.before.fg(ratatui::style::Color::Cyan)
+        );
+        // L38 main (before[1]) still active -> first word highlighted green, last word actively animating!
+        assert_eq!(visible_mid.before[1].spans[0].style, styles.current);
+        assert!(visible_mid.before[1].spans.len() >= 3);
+
+        // At 178.0: L38 main ended at 177.443 -> now both L38 bg and L38 main use dim before styles.
+        let upd_after = Update {
+            lines: std::sync::Arc::new(lines),
+            index: Some(2),
+            position: 178.0,
+            playing: true,
+            ..Default::default()
+        };
+        let visible_after = gather_visible_lines_with_split(
+            &upd_after, blocks, 80, 24, &styles, 178.0, true, true, None, 0,
+        );
+        assert_eq!(visible_after.before[1].spans[0].style, styles.before);
     }
 }

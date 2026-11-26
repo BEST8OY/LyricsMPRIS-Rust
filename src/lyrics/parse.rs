@@ -13,8 +13,14 @@ use serde_json::Value;
 const MAX_LYRIC_LINES: usize = 1000;
 const MAX_WORDS_PER_LINE: usize = 100;
 
-/// Parse Musixmatch subtitle_body JSON into lyric lines (line-level timing only).
+/// Parse Musixmatch subtitle_body (either LRC text or JSON array) into lyric lines.
 pub fn parse_subtitle_body(subtitle_body: &str) -> Option<Vec<LyricLine>> {
+    let trimmed = subtitle_body.trim();
+    if trimmed.starts_with('[') && trimmed.as_bytes().get(1).is_some_and(u8::is_ascii_digit) {
+        let parsed = parse_synced_lyrics(trimmed);
+        return (!parsed.is_empty()).then_some(parsed);
+    }
+
     let lines_val = serde_json::from_str::<Value>(subtitle_body).ok()?;
     let arr = lines_val.as_array()?;
 
@@ -27,7 +33,7 @@ pub fn parse_subtitle_body(subtitle_body: &str) -> Option<Vec<LyricLine>> {
         let text = line.get("text").and_then(|v| v.as_str()).unwrap_or("♪");
         parsed.push(LyricLine::new(time, text));
     }
-    Some(parsed)
+    (!parsed.is_empty()).then_some(parsed)
 }
 
 /// Parse Musixmatch richsync_body JSON into lyric lines with word-level timing.
@@ -50,13 +56,32 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<Vec<LyricLine>> {
             .pointer("/te")
             .and_then(|v| v.as_f64())
             .unwrap_or(line_start + 3.0);
-        let text = line
-            .get("x")
-            .or_else(|| line.get("text"))
-            .and_then(|v| v.as_str())
+        let x_opt = line.get("x").and_then(|v| v.as_str());
+        let raw_text = x_opt
+            .or_else(|| line.get("text").and_then(|v| v.as_str()))
             .unwrap_or("♪");
 
-        let words = parse_word_timings(line, line_start, line_end);
+        let words = line
+            .get("l")
+            .and_then(|v| v.as_array())
+            .and_then(|char_arr| {
+                parse_character_array(
+                    &char_arr[..char_arr.len().min(MAX_WORDS_PER_LINE)],
+                    line_start,
+                    line_end,
+                    x_opt,
+                )
+            });
+        let text = if let Some(ref ws) = words
+            && !ws.is_empty()
+        {
+            join_words(ws)
+        } else {
+            raw_text.to_string()
+        };
+        if text.is_empty() {
+            continue;
+        }
         parsed.push(
             LyricLine::new(line_start, text)
                 .with_end(Some(line_end))
@@ -67,58 +92,61 @@ pub fn parse_richsync_body(richsync_body: &str) -> Option<Vec<LyricLine>> {
     Some(parsed)
 }
 
-fn parse_word_timings(line: &Value, line_start: f64, line_end: f64) -> Option<Vec<WordTiming>> {
-    if let Some(words_arr) = line.get("words").and_then(|v| v.as_array()) {
-        return parse_explicit_word_array(
-            &words_arr[..words_arr.len().min(MAX_WORDS_PER_LINE)],
-            line_start,
-            line_end,
-        );
+fn join_words(words: &[WordTiming]) -> String {
+    let mut out = String::new();
+    for (i, w) in words.iter().enumerate() {
+        out.push_str(&w.text);
+        if w.ends_with_space && i + 1 < words.len() {
+            out.push(' ');
+        }
     }
-
-    if let Some(char_arr) = line.get("l").and_then(|v| v.as_array()) {
-        return parse_character_array(
-            &char_arr[..char_arr.len().min(MAX_WORDS_PER_LINE)],
-            line_start,
-            line_end,
-        );
-    }
-
-    None
+    out
 }
 
-fn parse_explicit_word_array(
-    words_arr: &[Value],
-    line_start: f64,
-    line_end: f64,
-) -> Option<Vec<WordTiming>> {
-    let word_timings: Vec<WordTiming> = words_arr
-        .iter()
-        .map(|w| {
-            let start = w
-                .get("start")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(line_start);
-            let end = w.get("end").and_then(|v| v.as_f64()).unwrap_or(start);
-            let text = w.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let final_end = if end <= start { line_end } else { end };
-            create_word_timing(start, final_end, text)
-        })
-        .collect();
+fn match_x_cursor(x: &str, cursor: &mut usize, chunk: &str) -> Option<(String, bool)> {
+    while *cursor < x.len() {
+        let Some(ch) = x[*cursor..].chars().next() else {
+            break;
+        };
+        if ch.is_whitespace() {
+            *cursor += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    if *cursor >= x.len() || chunk.is_empty() {
+        return None;
+    }
 
-    (!word_timings.is_empty()).then_some(word_timings)
+    let mut x_chars = x[*cursor..].char_indices();
+    let mut match_end_rel = 0usize;
+    for c_chunk in chunk.chars() {
+        let (_, c_x) = x_chars.next()?;
+        if !c_x.to_lowercase().eq(c_chunk.to_lowercase()) {
+            return None;
+        }
+        match_end_rel += c_x.len_utf8();
+    }
+
+    let end_abs = *cursor + match_end_rel;
+    let matched = x[*cursor..end_abs].to_string();
+    let next_is_space = x[end_abs..].chars().next().is_some_and(char::is_whitespace);
+    *cursor = end_abs;
+    Some((matched, next_is_space))
 }
 
 fn parse_character_array(
     char_arr: &[Value],
     line_start: f64,
     line_end: f64,
+    x_text: Option<&str>,
 ) -> Option<Vec<WordTiming>> {
     let mut word_timings: Vec<WordTiming> = Vec::new();
+    let mut x_cursor = 0usize;
 
     for (i, elem) in char_arr.iter().enumerate() {
-        let text = elem.get("c").and_then(|v| v.as_str()).unwrap_or("");
-        if text.trim().is_empty() {
+        let raw_chunk = elem.get("c").and_then(|v| v.as_str()).unwrap_or("");
+        if raw_chunk.trim().is_empty() {
             continue;
         }
 
@@ -162,12 +190,28 @@ fn parse_character_array(
             end.max(start + MIN_WORD_DURATION)
         };
 
-        let ends_with_space = char_arr
-            .get(i + 1)
-            .and_then(|next| next.get("c").and_then(|v| v.as_str()))
-            .is_some_and(|s| s.chars().any(char::is_whitespace));
+        let raw_ends_with_space = raw_chunk.ends_with([' ', '\t']);
+        let stripped = raw_chunk.trim_end_matches([' ', '\t']);
+        let (final_text, mut ends_with_space) = if let Some(x) = x_text
+            && !x.is_empty()
+            && let Some((matched, x_space)) = match_x_cursor(x, &mut x_cursor, stripped)
+        {
+            (matched, x_space)
+        } else {
+            (stripped.to_string(), raw_ends_with_space)
+        };
 
-        word_timings.push(create_word_timing(start, final_end, text).with_space(ends_with_space));
+        if !ends_with_space
+            && char_arr
+                .get(i + 1)
+                .and_then(|next| next.get("c").and_then(|v| v.as_str()))
+                .is_some_and(|s| s.chars().any(char::is_whitespace))
+        {
+            ends_with_space = true;
+        }
+
+        word_timings
+            .push(create_word_timing(start, final_end, &final_text).with_space(ends_with_space));
     }
 
     (!word_timings.is_empty()).then_some(word_timings)
@@ -193,5 +237,32 @@ mod tests {
         assert!((parsed[0].time - 10.5).abs() < 1e-6);
         assert!((parsed[1].time - 80.25).abs() < 1e-6);
         assert!((parsed[2].time - 150.123).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_richsync_reconciles_chunk_casing_and_spacing_from_x() {
+        let json = r#"[{"ts":10.0,"te":12.0,"l":[{"c":"hello","o":0.0},{"c":"world","o":0.5}],"x":"Hello World"}]"#;
+        let parsed = parse_richsync_body(json).unwrap();
+        assert_eq!(parsed[0].text, "Hello World");
+        let words = parsed[0].words.as_ref().unwrap();
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].text, "Hello");
+        assert!(words[0].ends_with_space);
+        assert_eq!(words[1].text, "World");
+        assert!(!words[1].ends_with_space);
+    }
+
+    #[test]
+    fn test_parse_subtitle_body_supports_lrc_and_json() {
+        let lrc_sub = "[00:10.50] First line\n[00:15.25] Second line";
+        let parsed_lrc = parse_subtitle_body(lrc_sub).unwrap();
+        assert_eq!(parsed_lrc.len(), 2);
+        assert_eq!(parsed_lrc[0].text, "First line");
+
+        let json_sub = r#"[{"text":"Line A","time":{"total":5.5}}]"#;
+        let parsed_json = parse_subtitle_body(json_sub).unwrap();
+        assert_eq!(parsed_json.len(), 1);
+        assert_eq!(parsed_json[0].text, "Line A");
+        assert!((parsed_json[0].time - 5.5).abs() < 1e-6);
     }
 }

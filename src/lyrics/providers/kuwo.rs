@@ -480,3 +480,20 @@ impl LyricsProvider for KuwoProvider {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_kuwo_matches_morphe_word_tokens() {
+        let raw = "[00:10.000]<10,20>hello <30,40>world\n";
+        let lyrics = parse_kuwo_lrc(raw, "https://www.kuwo.cn/play_detail/1").unwrap();
+        let words = lyrics.lines[0].words.as_ref().unwrap();
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0].text, "hello ");
+        assert!(!words[0].ends_with_space);
+        assert_eq!(words[1].text, "world");
+        assert!(!words[1].ends_with_space);
+    }
+}

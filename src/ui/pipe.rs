@@ -7,7 +7,7 @@
 //! - Outputs plain text suitable for pipes and redirects
 
 use crate::pool;
-use crate::ui::estimate_update_and_next_sleep;
+use crate::ui::progression::estimate_update_and_next_sleep_for_pipe;
 use std::pin::Pin;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -75,9 +75,9 @@ impl PipeState {
         self.last_update = Some(upd);
         self.last_update_instant = Some(Instant::now());
 
-        // Schedule next line-transition timer wakeup (pipe mode never renders per-word karaoke)
+        // Schedule next line-transition timer wakeup (pipe mode ignores is_bg lines)
         let (_, next) =
-            estimate_update_and_next_sleep(&self.last_update, self.last_update_instant, false);
+            estimate_update_and_next_sleep_for_pipe(&self.last_update, self.last_update_instant);
         self.next_sleep = next;
     }
 
@@ -97,7 +97,9 @@ impl PipeState {
     /// Print the current line from an update.
     fn print_current_line(&mut self, upd: &crate::state::Update) {
         if let Some(idx) = upd.index {
-            if let Some(line) = upd.lines.get(idx) {
+            if let Some(line) = upd.lines.get(idx)
+                && !line.is_bg
+            {
                 println!("{}", line.text);
             }
             self.last_line_idx = Some(idx);
@@ -107,7 +109,7 @@ impl PipeState {
     /// Handle timer wakeup - estimate position and print new lines if changed.
     fn handle_timer_wakeup(&mut self) {
         let (maybe_estimated, next) =
-            estimate_update_and_next_sleep(&self.last_update, self.last_update_instant, false);
+            estimate_update_and_next_sleep_for_pipe(&self.last_update, self.last_update_instant);
 
         if let Some(mut estimated) = maybe_estimated {
             let (tracked_idx, _) = self
@@ -119,7 +121,9 @@ impl PipeState {
             if estimated.index != self.last_line_idx {
                 match estimated.index {
                     Some(idx) => {
-                        if let Some(line) = estimated.lines.get(idx) {
+                        if let Some(line) = estimated.lines.get(idx)
+                            && !line.is_bg
+                        {
                             println!("{}", line.text);
                         }
                     }

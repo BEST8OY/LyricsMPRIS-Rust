@@ -153,7 +153,8 @@ fn apply_toml_and_env(cli: &mut Config) -> Result<(), String> {
         cli.isrc = true;
     }
 
-    cli.settings = resolve_runtime_settings(&toml_cfg, cli.allow_plain, cli.no_split_bg);
+    cli.settings =
+        resolve_runtime_settings(&toml_cfg, cli.allow_plain, cli.no_split_bg || cli.pipe);
     cli.allow_plain = cli.settings.allow_plain;
     Ok(())
 }

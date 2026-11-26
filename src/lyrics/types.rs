@@ -56,10 +56,6 @@ pub struct TrackMatchInfo {
     pub youtube_video_id: Option<String>,
 }
 
-/// Provider result: parsed lines plus optional raw lyrics string (LRC format or JSON)
-/// and optional track identifiers extracted from the provider response.
-pub type ProviderResult = Result<(Vec<LyricLine>, Option<String>, TrackMatchInfo), LyricsError>;
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LyricLine {
     pub time: f64,
@@ -129,6 +125,26 @@ impl LyricLine {
     #[allow(dead_code)]
     pub fn is_centered(&self) -> bool {
         Self::is_centered_agent_id(self.agent_id.as_deref())
+    }
+
+    /// Returns the earliest vocal onset timestamp (`first_word.start`, falling back to `self.time`).
+    pub fn vocal_start(&self) -> f64 {
+        self.words
+            .as_ref()
+            .and_then(|ws| ws.first())
+            .map(|w| w.start)
+            .unwrap_or(self.time)
+    }
+
+    /// Returns the vocal end timestamp (`last_word.end`, falling back to `self.end`).
+    pub fn vocal_end(&self) -> Option<f64> {
+        let word_end = self
+            .words
+            .as_ref()
+            .and_then(|ws| ws.last())
+            .map(|w| w.end)
+            .filter(|e| e.is_finite() && *e >= self.time);
+        word_end.or_else(|| self.end.filter(|e| e.is_finite() && *e >= self.time))
     }
 
     /// Returns the effective sung end time (`max(last_word.end, self.end)`).
@@ -526,26 +542,26 @@ impl SyncTracker {
             return (None, changed);
         }
 
-        // Fast path: forward sequential progression when no BG lines complicate indexing
+        // Fast path: forward sequential progression skipping over sibling `is_bg` lines
         if let Some(idx) = self.current_index
             && idx < lines.len()
             && !lines[idx].is_bg
         {
             let curr = &lines[idx];
-            let next = lines.get(idx + 1);
+            let next_primary_idx = (idx + 1..lines.len()).find(|&i| !lines[i].is_bg);
 
-            if position >= curr.time && next.is_none_or(|n| position < n.time) {
+            if position >= curr.time && next_primary_idx.is_none_or(|ni| position < lines[ni].time)
+            {
                 return (Some(idx), false);
             }
 
-            if let Some(next_line) = next
-                && !next_line.is_bg
-                && position >= next_line.time
+            if let Some(ni) = next_primary_idx
+                && position >= lines[ni].time
             {
-                let next_next = lines.get(idx + 2);
-                if next_next.is_none_or(|nn| position < nn.time) {
-                    self.current_index = Some(idx + 1);
-                    return (Some(idx + 1), true);
+                let after_ni = (ni + 1..lines.len()).find(|&i| !lines[i].is_bg);
+                if after_ni.is_none_or(|fi| position < lines[fi].time) {
+                    self.current_index = Some(ni);
+                    return (Some(ni), true);
                 }
             }
         }
@@ -671,5 +687,19 @@ mod tests {
         assert!((w.end - 5.5).abs() < 1e-6);
         assert_eq!(w.grapheme_times.len(), 1);
         assert!((w.grapheme_times[0] - 4.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_sync_tracker_skips_bg_siblings() {
+        let lines = vec![
+            LyricLine::new(10.0, "Main 0"),
+            LyricLine::new(11.5, "Bg 0").with_bg(true),
+            LyricLine::new(15.0, "Main 1"),
+        ];
+        let mut tracker = SyncTracker::new();
+        assert_eq!(tracker.update(&lines, 10.0), (Some(0), true));
+        assert_eq!(tracker.update(&lines, 12.0), (Some(0), false));
+        assert_eq!(tracker.update(&lines, 14.9), (Some(0), false));
+        assert_eq!(tracker.update(&lines, 15.0), (Some(2), true));
     }
 }

@@ -95,6 +95,54 @@ pub(crate) fn extract_all_isrcs_from_json(track: &Value) -> Vec<String> {
     isrcs
 }
 
+/// Track metadata returned by Musixmatch (`matcher.track.get` or `track.search`) for candidate scoring.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct MatchedTrackMeta {
+    pub title: String,
+    pub artist: String,
+    pub album: String,
+    pub duration_secs: i64,
+}
+
+pub(crate) fn extract_track_meta_from_json(track: &Value) -> MatchedTrackMeta {
+    let title = track
+        .get("track_name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let artist = track
+        .get("artist_name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let album = track
+        .get("album_name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let duration_secs = track
+        .get("track_length")
+        .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f.round() as i64)))
+        .unwrap_or(0);
+    MatchedTrackMeta {
+        title,
+        artist,
+        album,
+        duration_secs,
+    }
+}
+
+pub(crate) fn extract_track_meta_from_macro(macro_calls: &Value) -> Option<MatchedTrackMeta> {
+    let track = macro_calls
+        .pointer("/matcher.track.get/message/body/track")
+        .or_else(|| macro_calls.pointer("/track"))?;
+    let meta = extract_track_meta_from_json(track);
+    (!meta.title.is_empty() || !meta.artist.is_empty()).then_some(meta)
+}
+
 /// Extract track identifiers (isrcs, spotify_ids, itunes_ids) from a musixmatch track object.
 pub(crate) fn extract_track_ids_from_json(track: &Value) -> TrackMatchInfo {
     let isrcs = extract_all_isrcs_from_json(track);
@@ -142,6 +190,33 @@ mod tests {
         assert_eq!(ids.track_isrcs, vec!["USUM72345678".to_string()]);
         assert_eq!(ids.track_spotify_ids, vec!["6rqhFg4Kj6gIwR5v".to_string()]);
         assert_eq!(ids.track_itunes_ids, vec!["123456789".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_track_meta_from_macro() {
+        let json: Value = serde_json::from_str(
+            r#"{
+            "matcher.track.get": {
+                "message": {
+                    "body": {
+                        "track": {
+                            "track_name": "Rolling in the Deep",
+                            "artist_name": "Adele",
+                            "album_name": "21",
+                            "track_length": 228
+                        }
+                    }
+                }
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let meta = extract_track_meta_from_macro(&json).unwrap();
+        assert_eq!(meta.title, "Rolling in the Deep");
+        assert_eq!(meta.artist, "Adele");
+        assert_eq!(meta.album, "21");
+        assert_eq!(meta.duration_secs, 228);
     }
 
     #[test]

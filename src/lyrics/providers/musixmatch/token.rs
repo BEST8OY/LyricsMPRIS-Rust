@@ -8,8 +8,22 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-pub(crate) const DEFAULT_USER_AGENT: &str =
-    "Musixmatch/2025120901 CFNetwork/3860.300.31 Darwin/25.2.0";
+pub(crate) const API_BASE: &str = "https://apic.musixmatch.com/ws/1.1/";
+pub(crate) const APP_ID: &str = "android-player-v1.0";
+pub(crate) const DEFAULT_USER_AGENT: &str = "Dalvik/2.1.0 (Linux; U; Android 17)";
+pub(crate) const DEFAULT_COOKIE: &str = "AWSELB=0; AWSELBCORS=0";
+
+pub(crate) fn request_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+pub(crate) fn open_api_get(client: &Client, url: &str) -> reqwest::RequestBuilder {
+    client
+        .get(url)
+        .header("User-Agent", DEFAULT_USER_AGENT)
+        .header("Cookie", DEFAULT_COOKIE)
+        .header("Accept", "application/json")
+}
 
 pub(crate) const SPACING: Duration = Duration::from_millis(1500);
 pub(crate) const COOLDOWN: Duration = Duration::from_secs(600);
@@ -89,21 +103,9 @@ fn clear_token_at_path(path: &std::path::Path) {
 
 /// Requests a fresh anonymous Musixmatch user token directly from the API (`token.get`).
 pub async fn fetch_fresh_musixmatch_token(client: &Client) -> Result<String, LyricsError> {
-    let guid = uuid::Uuid::new_v4().to_string();
-    let url = format!(
-        "https://apic-appmobile.musixmatch.com/ws/1.1/token.get?app_id=mac-ios-v2.0&guid={guid}"
-    );
-    let resp = client
-        .get(&url)
-        .header("User-Agent", DEFAULT_USER_AGENT)
-        .header("X-User-Agent", DEFAULT_USER_AGENT)
-        .header("Cookie", format!("x-mxm-token-guid={guid}"))
-        .header("X-Cookie", format!("x-mxm-token-guid={guid}"))
-        .header("x-mxm-app-version", "10.1.1")
-        .header("Accept", "application/json")
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .send()
-        .await?;
+    let req_id = request_id();
+    let url = format!("{API_BASE}token.get?user_language=en&app_id={APP_ID}&t={req_id}");
+    let resp = open_api_get(client, &url).send().await?;
 
     if !resp.status().is_success() {
         return Err(LyricsError::Http(resp.status().as_u16()));

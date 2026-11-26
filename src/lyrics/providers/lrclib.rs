@@ -5,42 +5,13 @@ use crate::lyrics::providers::{
     BoxFuture, FetchedCandidate, LyricsProvider, MAX_CANDIDATES, ProviderContext, SOFT_MIN,
     score_lyrics_candidate, score_track_candidate,
 };
-use crate::lyrics::types::{LyricLine, Lyrics, LyricsError, TrackInfo, TrackMatchInfo};
-use serde::Deserialize;
+use crate::lyrics::types::{Lyrics, LyricsError, TrackInfo, TrackMatchInfo};
 use serde_json::Value;
 
 const DEFAULT_BASE_URL: &str = "https://lrclib.net/api";
 const APP_ID: &str = "HLyf7QYkIJfl4wcObeD-caHjBZPnGhv0Vuvx2UiIFKk";
 
 pub struct LrcLibProvider;
-
-/// Legacy deserialization struct retained for test compatibility.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[allow(dead_code)]
-pub struct LrcLibResponse {
-    pub synced_lyrics: Option<String>,
-    pub plain_lyrics: Option<String>,
-    pub track_name: Option<String>,
-    pub artist_name: Option<String>,
-    pub duration: Option<f64>,
-    #[serde(default)]
-    pub instrumental: bool,
-}
-
-#[allow(dead_code)]
-pub async fn fetch_lyrics_from_lrclib(
-    track: &TrackInfo,
-) -> Result<(Vec<LyricLine>, Option<String>, TrackMatchInfo), LyricsError> {
-    let ctx = ProviderContext::from_settings(crate::config::RuntimeSettings::default());
-    let ids = TrackMatchInfo::default();
-    let provider = LrcLibProvider;
-    let cands = provider.fetch_candidates(track, &ids, &ctx).await?;
-    let Some(first) = cands.into_iter().next() else {
-        return Err(LyricsError::Api("No lyrics found on LRCLIB".into()));
-    };
-    Ok((first.lyrics.lines, Some("LRCLIB".into()), ids))
-}
 
 fn base_url(ctx: &ProviderContext) -> String {
     crate::lyrics::providers::endpoint_url(

@@ -24,9 +24,6 @@ pub mod spotify;
 pub mod unison;
 pub mod ytmusic;
 
-pub use lrclib::fetch_lyrics_from_lrclib;
-pub use musixmatch::fetch_lyrics_from_musixmatch_usertoken;
-
 use crate::config::RuntimeSettings;
 use crate::lyrics::types::{Lyrics, LyricsError, TrackInfo, TrackMatchInfo, http_client};
 use crate::text_utils::{normalize_for_match, to_simplified_chinese};

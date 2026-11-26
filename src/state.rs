@@ -454,14 +454,60 @@ impl LyricState {
 
     /// Sanitizes and sorts a collection of lyric lines.
     ///
-    /// This is a pure function that doesn't mutate state.
+    /// Keeps each parent `!is_bg` line grouped with its immediately following `is_bg`
+    /// sibling lines so early/leading background vocals cannot detach ahead of their parent.
     fn sanitize_and_sort(lines: Vec<LyricLine>) -> Vec<LyricLine> {
-        let mut sanitized: Vec<LyricLine> =
-            lines.into_iter().filter_map(Self::sanitize_line).collect();
+        let sanitized: Vec<LyricLine> = lines.into_iter().filter_map(Self::sanitize_line).collect();
+        if sanitized.is_empty() {
+            return sanitized;
+        }
 
-        sanitized.sort_by(|a, b| a.time.total_cmp(&b.time));
+        // Group each primary line with its immediately following `is_bg` lines.
+        let mut clusters: Vec<Vec<LyricLine>> = Vec::with_capacity(sanitized.len());
+        for line in sanitized {
+            if line.is_bg
+                && let Some(last_cluster) = clusters.last_mut()
+                && !last_cluster[0].is_bg
+            {
+                last_cluster.push(line);
+            } else {
+                clusters.push(vec![line]);
+            }
+        }
 
-        sanitized
+        // Pull parent start time back to any earlier attached background vocal and sort
+        // sibling bg lines chronologically while keeping the parent first in each cluster.
+        for cluster in &mut clusters {
+            if cluster.len() > 1 && !cluster[0].is_bg {
+                cluster[1..].sort_by(|a, b| a.time.total_cmp(&b.time));
+                let earliest_bg = cluster[1].time;
+                if earliest_bg < cluster[0].time {
+                    cluster[0].time = earliest_bg;
+                }
+            }
+        }
+
+        clusters.sort_by(|a, b| a[0].time.total_cmp(&b[0].time));
+
+        // Maintain monotonic timestamps across cluster boundaries so binary_search remains valid.
+        let mut flat = Vec::new();
+        for i in 0..clusters.len() {
+            let next_start = clusters.get(i + 1).map(|c| c[0].time);
+            let mut cluster = std::mem::take(&mut clusters[i]);
+            if let Some(limit) = next_start
+                && cluster.len() > 1
+            {
+                let floor = cluster[0].time;
+                for bg in &mut cluster[1..] {
+                    if bg.time > limit {
+                        bg.time = limit.max(floor);
+                    }
+                }
+            }
+            flat.extend(cluster);
+        }
+
+        flat
     }
 
     /// Sanitizes a single lyric line, returning `None` for invalid lines.
@@ -866,5 +912,24 @@ mod tests {
         assert!(player.time_anchor().instant.is_none());
         assert!((player.position - estimated_before).abs() < 0.005);
         assert_eq!(player.estimate_position(), player.position);
+    }
+
+    #[test]
+    fn test_sanitize_and_sort_keeps_early_bg_attached_to_parent() {
+        let mut lyric_state = LyricState::default();
+        let lines = vec![
+            LyricLine::new(5.0, "Line 0"),
+            LyricLine::new(11.2, "baby"),
+            LyricLine::new(10.0, "Oh yeah").with_bg(true),
+            LyricLine::new(15.0, "Line 2"),
+        ];
+        lyric_state.update_lines(lines);
+        assert_eq!(lyric_state.lines.len(), 4);
+        assert_eq!(lyric_state.lines[1].text, "baby");
+        assert!(!lyric_state.lines[1].is_bg);
+        assert!((lyric_state.lines[1].time - 10.0).abs() < 1e-6);
+        assert_eq!(lyric_state.lines[2].text, "Oh yeah");
+        assert!(lyric_state.lines[2].is_bg);
+        assert_eq!(lyric_state.get_index(10.5), Some(1));
     }
 }

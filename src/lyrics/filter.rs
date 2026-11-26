@@ -533,10 +533,6 @@ pub fn filter_lyrics_text(mut lyrics: Lyrics, custom_filter: Option<&str>) -> Ly
             line.words = (!new_words.is_empty()).then_some(new_words);
         }
         line.text = cleaned_collapsed;
-        line.end = None;
-        line.agent_id = None;
-        line.is_duet = false;
-        line.is_bg = false;
         out.push(line);
     }
 
@@ -590,6 +586,153 @@ fn trim_word_brackets(mut w: WordTiming) -> Option<WordTiming> {
     rebuilt.romaji = w.romaji.take();
     rebuilt.ruby = w.ruby.take();
     Some(rebuilt)
+}
+
+fn split_straddling_word(
+    w: &WordTiming,
+    split_byte: usize,
+    left_is_bg: bool,
+) -> (Option<WordTiming>, Option<WordTiming>) {
+    let left_raw = w.text[..split_byte].trim();
+    let right_raw = w.text[split_byte..].trim();
+    let trim_bg = |raw: &str, ends_space: bool| {
+        (!raw.is_empty())
+            .then(|| {
+                trim_word_brackets(WordTiming {
+                    start: w.start,
+                    end: w.end,
+                    text: raw.to_string(),
+                    ends_with_space: ends_space,
+                    ..Default::default()
+                })
+            })
+            .flatten()
+    };
+    let build_main = |raw: &str, ends_space: bool| {
+        (!raw.is_empty()).then(|| {
+            let mut mw = create_word_timing(w.start, w.end, raw);
+            mw.ends_with_space = ends_space;
+            mw
+        })
+    };
+    if left_is_bg {
+        (
+            trim_bg(left_raw, false),
+            build_main(right_raw, w.ends_with_space),
+        )
+    } else {
+        (
+            build_main(left_raw, false),
+            trim_bg(right_raw, w.ends_with_space),
+        )
+    }
+}
+
+fn split_outer_bracket_words(
+    words: &[WordTiming],
+    has_head: bool,
+    has_tail: bool,
+) -> (Option<Vec<WordTiming>>, Option<Vec<WordTiming>>) {
+    let n = words.len();
+    let mut head_end = 0usize;
+    let mut head_straddle_main: Option<WordTiming> = None;
+    let mut head_bg_words: Vec<WordTiming> = Vec::new();
+
+    if has_head {
+        let mut depth = 0usize;
+        let mut opened = false;
+        'outer_head: for (i, w) in words.iter().enumerate() {
+            for (b, ch) in w.text.char_indices() {
+                if ch == '(' || ch == '（' {
+                    depth += 1;
+                    opened = true;
+                } else if (ch == ')' || ch == '）') && depth > 0 {
+                    depth -= 1;
+                    if opened && depth == 0 {
+                        let after_close = b + ch.len_utf8();
+                        head_end = i + 1;
+                        if !w.text[after_close..].trim().is_empty() {
+                            let (bg_part, main_part) = split_straddling_word(w, after_close, true);
+                            if let Some(bw) = bg_part {
+                                head_bg_words.push(bw);
+                            }
+                            head_straddle_main = main_part;
+                        } else if let Some(trimmed) = trim_word_brackets(w.clone()) {
+                            head_bg_words.push(trimmed);
+                        }
+                        break 'outer_head;
+                    }
+                }
+            }
+            if let Some(trimmed) = trim_word_brackets(w.clone()) {
+                head_bg_words.push(trimmed);
+            }
+        }
+    }
+
+    let mut tail_start = n;
+    let mut tail_straddle_main: Option<WordTiming> = None;
+    let mut tail_bg_words_rev: Vec<WordTiming> = Vec::new();
+
+    if has_tail {
+        let mut depth = 0usize;
+        let mut closed = false;
+        'outer_tail: for j in (head_end..n).rev() {
+            let w = &words[j];
+            for (b, ch) in w.text.char_indices().rev() {
+                if ch == ')' || ch == '）' {
+                    depth += 1;
+                    closed = true;
+                } else if (ch == '(' || ch == '（') && depth > 0 {
+                    depth -= 1;
+                    if closed && depth == 0 {
+                        tail_start = j;
+                        if !w.text[..b].trim().is_empty() {
+                            let (main_part, bg_part) = split_straddling_word(w, b, false);
+                            if let Some(bw) = bg_part {
+                                tail_bg_words_rev.push(bw);
+                            }
+                            tail_straddle_main = main_part;
+                        } else if let Some(trimmed) = trim_word_brackets(w.clone()) {
+                            tail_bg_words_rev.push(trimmed);
+                        }
+                        break 'outer_tail;
+                    }
+                }
+            }
+            if let Some(trimmed) = trim_word_brackets(w.clone()) {
+                tail_bg_words_rev.push(trimmed);
+            }
+        }
+    }
+
+    let mut bw = head_bg_words;
+    bw.extend(tail_bg_words_rev.into_iter().rev());
+
+    let mut mw = Vec::with_capacity(
+        tail_start.saturating_sub(head_end)
+            + usize::from(head_straddle_main.is_some())
+            + usize::from(tail_straddle_main.is_some()),
+    );
+    if let Some(m) = head_straddle_main {
+        mw.push(m);
+    }
+    mw.extend(words[head_end..tail_start].iter().cloned());
+    if let Some(m) = tail_straddle_main {
+        mw.push(m);
+    }
+
+    if let Some(last) = mw.last_mut() {
+        last.ends_with_space = false;
+    }
+    if let Some(last) = bw.last_mut() {
+        last.ends_with_space = false;
+    }
+
+    (
+        (!mw.is_empty()).then_some(mw),
+        (!bw.is_empty()).then_some(bw),
+    )
 }
 
 /// Splits leading/trailing `(...)` or `（...）` background vocals onto dedicated `is_bg` lines
@@ -690,32 +833,12 @@ pub fn split_bracket_background(mut lyrics: Lyrics) -> Lyrics {
         let (main_words, bg_words) = if let Some(words) = line.words.as_ref()
             && !words.is_empty()
         {
-            let mut mw = Vec::new();
-            let mut bw = Vec::new();
-            for w in words {
-                let wt = w.text.trim();
-                let is_bg_word = wt.starts_with('(')
-                    || wt.starts_with('（')
-                    || wt.ends_with(')')
-                    || wt.ends_with('）')
-                    || (!bw.is_empty() && tail_bg.is_some() && head_bg.is_none());
-                if is_bg_word {
-                    if let Some(trimmed) = trim_word_brackets(w.clone()) {
-                        bw.push(trimmed);
-                    }
-                } else {
-                    mw.push(w.clone());
-                }
-            }
-            (
-                (!mw.is_empty()).then_some(mw),
-                (!bw.is_empty()).then_some(bw),
-            )
+            split_outer_bracket_words(words, head_bg.is_some(), tail_bg.is_some())
         } else {
             (None, None)
         };
 
-        let main_start = main_words
+        let raw_main_start = main_words
             .as_ref()
             .and_then(|ws| ws.first())
             .map(|w| w.start)
@@ -736,6 +859,10 @@ pub fn split_bracket_background(mut lyrics: Lyrics) -> Lyrics {
             .and_then(|ws| ws.last())
             .map(|w| w.end)
             .or(line.end);
+
+        // Keep parent line start <= bg_start so leading head_bg keeps [main, bg] sorted
+        // monotonically without detaching bg ahead of main during sorting/binary search.
+        let main_start = raw_main_start.min(bg_start);
 
         let main_line = LyricLine {
             time: main_start,
@@ -971,15 +1098,132 @@ pub fn format_line_text(
     text
 }
 
+fn has_wrapping_parens(s: &str) -> bool {
+    let t = s.trim();
+    if let Some(first) = t.chars().next()
+        && (first == '(' || first == '（')
+    {
+        let close = if first == '(' { ')' } else { '）' };
+        return find_matching_paren(t, 0, first, close)
+            .is_some_and(|end_idx| end_idx + close.len_utf8() == t.len());
+    }
+    false
+}
+
+fn wrap_bg_parens(s: &str) -> String {
+    let t = s.trim();
+    if t.is_empty() || has_wrapping_parens(t) {
+        t.to_string()
+    } else {
+        format!("({t})")
+    }
+}
+
+fn push_standalone_pipe_line(out: &mut Vec<LyricLine>, mut line: LyricLine) {
+    line.text = wrap_bg_parens(&line.text);
+    line.is_bg = false;
+    if !line.text.trim().is_empty() {
+        out.push(line);
+    }
+}
+
+/// Folds parented `is_bg` lines back inline onto their parent line in sung chronological order
+/// for `--pipe` consumers, and promotes standalone `is_bg` lines to printable `"(...)"` lines.
+pub fn fold_background_for_pipe(mut lyrics: Lyrics) -> Lyrics {
+    let lines = std::mem::take(&mut lyrics.lines);
+    if lines.is_empty() {
+        return lyrics;
+    }
+
+    let mut out = Vec::with_capacity(lines.len());
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        if lines[i].is_bg {
+            push_standalone_pipe_line(&mut out, lines[i].clone());
+            i += 1;
+            continue;
+        }
+
+        let mut main = lines[i].clone();
+        let main_start = main.vocal_start();
+        let main_raw_end = main.sung_end();
+
+        let mut j = i + 1;
+        let mut leading_bgs = Vec::new();
+        let mut trailing_bgs = Vec::new();
+        let mut merged_any = false;
+
+        while j < lines.len() && lines[j].is_bg {
+            let bg = &lines[j];
+            let same_phrase = (bg.time - main.time).abs() <= 0.05
+                || main_raw_end.is_some_and(|e| bg.time + 0.05 < e);
+            if !same_phrase {
+                break;
+            }
+            merged_any = true;
+            main.time = main.time.min(bg.time);
+            if let Some(bg_end) = bg.sung_end() {
+                main.end = Some(main.end.map_or(bg_end, |me| me.max(bg_end)));
+            }
+            let wrapped = wrap_bg_parens(&bg.text);
+            if !wrapped.is_empty() {
+                if bg.vocal_start() + f64::EPSILON < main_start {
+                    leading_bgs.push(wrapped);
+                } else {
+                    trailing_bgs.push(wrapped);
+                }
+            }
+            j += 1;
+        }
+
+        if merged_any {
+            let mut parts = Vec::with_capacity(leading_bgs.len() + trailing_bgs.len() + 1);
+            parts.extend(leading_bgs);
+            let main_trimmed = main.text.trim();
+            if !main_trimmed.is_empty() {
+                parts.push(main_trimmed.to_string());
+            }
+            parts.extend(trailing_bgs);
+            main.text = parts.join(" ");
+            main.words = None;
+        }
+        out.push(main);
+
+        // Emit any remaining standalone delayed `is_bg` lines in their own timestamps.
+        while j < lines.len() && lines[j].is_bg {
+            push_standalone_pipe_line(&mut out, lines[j].clone());
+            j += 1;
+        }
+
+        i = j;
+    }
+
+    lyrics.lines = out;
+    lyrics
+}
+
 /// Applies full Section B display preparation (`LyricsFilter` -> `LyricsBracketSplitter` -> `LyricsTextFormatter` -> `LyricsRetiming`).
-pub fn prepare_lyrics_for_display(
+pub fn prepare_lyrics_for_display(lyrics: Lyrics, track: &TrackInfo, cfg: &FilterConfig) -> Lyrics {
+    prepare_lyrics_with_mode(lyrics, track, cfg, false)
+}
+
+/// Applies `--pipe` preparation: keeps parenthesized vocals inline and folds `is_bg` vocals cleanly.
+pub fn prepare_lyrics_for_pipe(lyrics: Lyrics, track: &TrackInfo, cfg: &FilterConfig) -> Lyrics {
+    prepare_lyrics_with_mode(lyrics, track, cfg, true)
+}
+
+fn prepare_lyrics_with_mode(
     mut lyrics: Lyrics,
     track: &TrackInfo,
     cfg: &FilterConfig,
+    pipe_mode: bool,
 ) -> Lyrics {
     lyrics = filter_credit_lines(lyrics, track, cfg.credit_line_markers.as_deref());
     lyrics = filter_lyrics_text(lyrics, cfg.lyrics_text_filter_regex.as_deref());
-    if cfg.split_background {
+    if pipe_mode {
+        lyrics = fold_background_for_pipe(lyrics);
+    } else if cfg.split_background {
         lyrics = split_bracket_background(lyrics);
     }
     if cfg.force_capitalize || cfg.strip_trailing_punctuation || cfg.han_mode != HanMode::None {
@@ -1059,5 +1303,126 @@ mod tests {
             "Wait..."
         );
         assert_eq!(format_line_text("why?", true, true, HanMode::None), "Why?");
+    }
+
+    #[test]
+    fn test_split_bracket_background_multiword_head_preserves_middle_words() {
+        let words = vec![
+            create_word_timing(10.0, 10.4, "(Yeah"),
+            create_word_timing(10.4, 10.7, "I"),
+            create_word_timing(10.7, 11.0, "know)"),
+            create_word_timing(11.2, 12.0, "baby"),
+        ];
+        let lines = vec![
+            LyricLine::new(10.0, "(Yeah I know) baby")
+                .with_end(Some(12.0))
+                .with_words(Some(words)),
+        ];
+        let lyrics = Lyrics::new(lines, "Test", true);
+        let split = split_bracket_background(lyrics);
+        assert_eq!(split.lines.len(), 2);
+
+        let main = &split.lines[0];
+        let bg = &split.lines[1];
+        assert!(!main.is_bg);
+        assert_eq!(main.text, "baby");
+        assert!(
+            main.time <= bg.time,
+            "main.time ({}) must be <= bg.time ({}) so sorting stays attached",
+            main.time,
+            bg.time
+        );
+        let main_words: Vec<&str> = main
+            .words
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|w| w.text.as_str())
+            .collect();
+        assert_eq!(main_words, vec!["baby"]);
+
+        assert!(bg.is_bg);
+        assert_eq!(bg.text, "Yeah I know");
+        let bg_words: Vec<&str> = bg
+            .words
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|w| w.text.as_str())
+            .collect();
+        assert_eq!(bg_words, vec!["Yeah", "I", "know"]);
+    }
+
+    #[test]
+    fn test_filter_lyrics_text_preserves_bg_and_timing_metadata() {
+        let lines = vec![
+            LyricLine::new(5.0, "   Ooh,   yeah  ★ ")
+                .with_end(Some(8.0))
+                .with_agent(Some("v2".to_string()), true)
+                .with_bg(true),
+        ];
+        let lyrics = Lyrics::new(lines, "Test", true);
+        let filtered = filter_lyrics_text(lyrics, Some("★"));
+        assert_eq!(filtered.lines.len(), 1);
+        let line = &filtered.lines[0];
+        assert_eq!(line.text, "Ooh, yeah");
+        assert!(line.is_bg);
+        assert_eq!(line.end, Some(8.0));
+        assert_eq!(line.agent_id.as_deref(), Some("v2"));
+        assert!(line.is_duet);
+    }
+
+    #[test]
+    fn test_fold_background_for_pipe_merges_ttml_and_keeps_standalone_lrc() {
+        let lines = vec![
+            // TTML trailing x-bg (e.g. lrc.red L13)
+            LyricLine::new(58.906, "We could've had it all")
+                .with_end(Some(63.735))
+                .with_words(Some(vec![create_word_timing(
+                    58.906,
+                    63.252,
+                    "We could've had it all",
+                )])),
+            LyricLine::new(60.386, "You're gonna wish you never had met me")
+                .with_end(Some(63.735))
+                .with_bg(true),
+            // TTML leading x-bg (e.g. lrc.red L38)
+            LyricLine::new(170.072, "We could've had it all")
+                .with_end(Some(177.443))
+                .with_words(Some(vec![create_word_timing(173.177, 177.443, "We")])),
+            LyricLine::new(170.072, "You're gonna wish you never had met me")
+                .with_end(Some(173.050))
+                .with_words(Some(vec![create_word_timing(170.072, 173.050, "You're")]))
+                .with_bg(true),
+            // LRC main + delayed standalone "(Never had met me)"
+            LyricLine::new(200.0, "We could've had it all (you're gonna wish you)"),
+            LyricLine::new(203.5, "(Never had met me)").with_bg(true),
+            // Standalone bg-only line without outer parens
+            LyricLine::new(210.0, "Ooh yeah").with_bg(true),
+        ];
+        let lyrics = Lyrics::new(lines, "Test", true);
+        let pipe = prepare_lyrics_for_pipe(
+            lyrics,
+            &TrackInfo::new("Rolling in the Deep", "Adele", "21", 228),
+            &FilterConfig::default(),
+        );
+
+        assert_eq!(pipe.lines.len(), 5);
+        assert_eq!(
+            pipe.lines[0].text,
+            "We could've had it all (You're gonna wish you never had met me)"
+        );
+        assert_eq!(
+            pipe.lines[1].text,
+            "(You're gonna wish you never had met me) We could've had it all"
+        );
+        assert_eq!(
+            pipe.lines[2].text,
+            "We could've had it all (you're gonna wish you)"
+        );
+        assert_eq!(pipe.lines[3].text, "(Never had met me)");
+        assert!(!pipe.lines[3].is_bg);
+        assert_eq!(pipe.lines[4].text, "(Ooh yeah)");
+        assert!(!pipe.lines[4].is_bg);
     }
 }

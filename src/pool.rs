@@ -34,7 +34,7 @@
 
 use crate::event::fetch::{FetchOutcome, spawn_fetch};
 use crate::event::{Event, RetryDirective, ScoredCandidate, process_event, send_update};
-use crate::lyrics::filter::prepare_lyrics_for_display;
+use crate::lyrics::filter::{prepare_lyrics_for_display, prepare_lyrics_for_pipe};
 use crate::lyrics::types::{Lyrics, TrackInfo};
 use crate::mpris::{TrackMetadata, events::MprisEventHandler};
 use crate::state::{Provider, StateBundle, Update};
@@ -569,7 +569,11 @@ fn apply_lyrics_to_bundle(
     loop_state.current_fingerprint = Some(fp);
 
     let track = track_info_from_meta(meta, loop_state.state_bundle.player_state.length);
-    let prepared = prepare_lyrics_for_display(raw_lyrics, &track, &config.settings().filters);
+    let prepared = if config.inner.pipe {
+        prepare_lyrics_for_pipe(raw_lyrics, &track, &config.settings().filters)
+    } else {
+        prepare_lyrics_for_display(raw_lyrics, &track, &config.settings().filters)
+    };
     let provider = Provider::from_lyrics(&prepared);
     loop_state
         .state_bundle

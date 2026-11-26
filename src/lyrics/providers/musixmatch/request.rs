@@ -2,8 +2,12 @@
 
 use std::sync::LazyLock;
 
-use super::extract::{extract_track_ids_from_macro, get_root_hint, get_root_status_code};
-use super::token::DEFAULT_USER_AGENT;
+use super::extract::{
+    MatchedTrackMeta, extract_track_ids_from_macro, extract_track_meta_from_json,
+    extract_track_meta_from_macro, get_root_hint, get_root_status_code,
+};
+use super::token::{API_BASE, APP_ID, open_api_get, request_id};
+use crate::lyrics::providers::MAX_CANDIDATES;
 use crate::lyrics::types::{LyricLine, LyricsError, TrackMatchInfo};
 use crate::text_utils::{DURATION_TOLERANCE_SECS, clean_title_annotations, normalize};
 use reqwest::Client;
@@ -12,8 +16,13 @@ use serde_json::Value;
 /// Outcome of a single token's fetch attempt.
 #[derive(Debug, PartialEq)]
 pub(crate) enum FetchOutcome {
-    /// Successfully found lyrics: (parsed lines, raw response content, track identifiers)
-    Success(Vec<LyricLine>, Option<String>, TrackMatchInfo),
+    /// Successfully found lyrics: (parsed lines, raw response content, track identifiers, track metadata)
+    Success(
+        Vec<LyricLine>,
+        Option<String>,
+        TrackMatchInfo,
+        Option<MatchedTrackMeta>,
+    ),
     /// Track was not found on Musixmatch (200 status but empty list/no lyrics).
     TrackNotFound,
     /// A token-specific issue (401 unauthorized, 402 payment, 403 forbidden, 429 rate limit).
@@ -80,25 +89,18 @@ pub(crate) async fn try_macro_for_lyrics(
     client: &Client,
     params: &[(String, String)],
 ) -> Result<FetchOutcome, LyricsError> {
-    let macro_base = "https://apic-appmobile.musixmatch.com/ws/1.1/macro.subtitles.get?format=json&namespace=lyrics_richsynched&subtitle_format=mxm&optional_calls=track.richsync&app_id=mac-ios-v2.0&richsync_compact_type=words&";
-    let macro_url = macro_base.to_string()
+    let req_id = request_id();
+    let macro_base = format!(
+        "{API_BASE}macro.subtitles.get?namespace=lyrics_richsynched&optional_calls=track.richsync&subtitle_format=lrc&f_subtitle_length_max_deviation=40&format=json&app_id={APP_ID}&t={req_id}&"
+    );
+    let macro_url = macro_base
         + &params
             .iter()
             .map(|(k, v)| format!("{}={}", k, urlencoding::encode(v)))
             .collect::<Vec<_>>()
             .join("&");
 
-    let macro_resp = client
-        .get(&macro_url)
-        .header("User-Agent", DEFAULT_USER_AGENT)
-        .header("X-User-Agent", DEFAULT_USER_AGENT)
-        .header("Cookie", "x-mxm-token-guid=")
-        .header("X-Cookie", "x-mxm-token-guid=")
-        .header("x-mxm-app-version", "10.1.1")
-        .header("Accept", "application/json")
-        .header("Accept-Language", "en-US,en;q=0.9")
-        .send()
-        .await?;
+    let macro_resp = open_api_get(client, &macro_url).send().await?;
 
     let macro_status = macro_resp.status();
 
@@ -126,6 +128,7 @@ pub(crate) async fn try_macro_for_lyrics(
 
     if let Some(calls) = macro_calls {
         let track_ids = extract_track_ids_from_macro(calls);
+        let track_meta = extract_track_meta_from_macro(calls);
 
         // Check instrumental status first
         let is_instrumental = calls
@@ -135,7 +138,12 @@ pub(crate) async fn try_macro_for_lyrics(
 
         if is_instrumental {
             let line = LyricLine::new(0.0, "♪ Instrumental ♪");
-            return Ok(FetchOutcome::Success(vec![line], None, track_ids));
+            return Ok(FetchOutcome::Success(
+                vec![line],
+                None,
+                track_ids,
+                track_meta,
+            ));
         }
 
         // Prefer richsync (word-level timing) if available
@@ -149,6 +157,7 @@ pub(crate) async fn try_macro_for_lyrics(
                 parsed,
                 Some(richsync_body.to_string()),
                 track_ids,
+                track_meta,
             ));
         }
 
@@ -163,6 +172,7 @@ pub(crate) async fn try_macro_for_lyrics(
                 parsed,
                 Some(subtitle_body.to_string()),
                 track_ids,
+                track_meta,
             ));
         }
     }
@@ -362,20 +372,14 @@ pub(crate) fn is_title_compatible(query_title: &str, candidate_title: &str) -> b
     false
 }
 
-/// Helper: selects the best candidate track ID from a track.search result list.
-///
-/// Filters out tracks without synchronized/plain lyrics or instrumentals, filters by duration tolerance (±2.0s),
-/// checks title compatibility and version tag parity (avoiding live/acoustic/remix pollution for studio tracks),
-/// and scores candidates by album match, exact title match, richsync presence, duration closeness, and rating.
-pub(crate) fn select_best_candidate_track_id(
+/// Selects ranked `(track_id, meta)` candidates from a `track.search` result list.
+pub(crate) fn ranked_candidate_tracks(
     track_list: &[Value],
     title: &str,
     album: &str,
     duration: Option<f64>,
-) -> Option<i64> {
-    let mut best_id = None;
-    let mut highest_score = f64::NEG_INFINITY;
-
+) -> Vec<(i64, MatchedTrackMeta)> {
+    let mut ranked: Vec<(f64, i64, MatchedTrackMeta)> = Vec::new();
     let norm_title = normalize(title);
 
     for item in track_list {
@@ -476,13 +480,29 @@ pub(crate) fn select_best_candidate_track_id(
             .unwrap_or(0.0);
         score += rating.min(20.0);
 
-        if score > highest_score {
-            highest_score = score;
-            best_id = Some(track_id);
-        }
+        ranked.push((score, track_id, extract_track_meta_from_json(track)));
     }
 
-    best_id
+    ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
+    ranked.into_iter().map(|(_, id, meta)| (id, meta)).collect()
+}
+
+/// Helper: selects the best candidate track ID from a track.search result list.
+///
+/// Filters out tracks without synchronized/plain lyrics or instrumentals, filters by duration tolerance (±2.0s),
+/// checks title compatibility and version tag parity (avoiding live/acoustic/remix pollution for studio tracks),
+/// and scores candidates by album match, exact title match, richsync presence, duration closeness, and rating.
+#[cfg(test)]
+pub(crate) fn select_best_candidate_track_id(
+    track_list: &[Value],
+    title: &str,
+    album: &str,
+    duration: Option<f64>,
+) -> Option<i64> {
+    ranked_candidate_tracks(track_list, title, album, duration)
+        .into_iter()
+        .next()
+        .map(|(id, _)| id)
 }
 
 /// Fallback helper: calls track.search to find candidates with duration matching and retrieves lyrics for the best candidate.
@@ -502,24 +522,20 @@ pub(crate) async fn search_and_fetch_best_candidate(
     }
 
     for query_title in queries {
-        let search_url = format!(
-            "https://apic-appmobile.musixmatch.com/ws/1.1/track.search?format=json&app_id=mac-ios-v2.0&page_size=15&q_artist={}&q_track={}&usertoken={}",
+        let req_id = request_id();
+        let mut search_url = format!(
+            "{API_BASE}track.search?page_size=10&page=1&s_track_rating=desc&q_artist={}&q_track={}&usertoken={}&format=json&app_id={APP_ID}&t={req_id}",
             urlencoding::encode(artist),
             urlencoding::encode(&query_title),
             urlencoding::encode(token),
         );
+        if let Some(d) = duration
+            && d > 0.0
+        {
+            search_url.push_str(&format!("&q_duration={}", d.round() as i64));
+        }
 
-        let resp = client
-            .get(&search_url)
-            .header("User-Agent", DEFAULT_USER_AGENT)
-            .header("X-User-Agent", DEFAULT_USER_AGENT)
-            .header("Cookie", "x-mxm-token-guid=")
-            .header("X-Cookie", "x-mxm-token-guid=")
-            .header("x-mxm-app-version", "10.1.1")
-            .header("Accept", "application/json")
-            .header("Accept-Language", "en-US,en;q=0.9")
-            .send()
-            .await?;
+        let resp = open_api_get(client, &search_url).send().await?;
 
         let status = resp.status();
         if status.is_server_error() {
@@ -539,16 +555,26 @@ pub(crate) async fn search_and_fetch_best_candidate(
         let Some(track_list) = track_list else {
             continue;
         };
-        if let Some(best_track_id) =
-            select_best_candidate_track_id(track_list, title, album, duration)
+        for (best_track_id, cand_meta) in
+            ranked_candidate_tracks(track_list, title, album, duration)
+                .into_iter()
+                .take(MAX_CANDIDATES)
         {
             let id_params = vec![
                 ("track_id".to_string(), best_track_id.to_string()),
                 ("usertoken".to_string(), token.to_string()),
             ];
             let outcome = try_macro_for_lyrics(client, &id_params).await?;
-            if !matches!(outcome, FetchOutcome::TrackNotFound) {
-                return Ok(Some(outcome));
+            match outcome {
+                FetchOutcome::Success(lines, raw, ids, macro_meta) => {
+                    let meta = macro_meta.or_else(|| {
+                        (!cand_meta.title.is_empty() || !cand_meta.artist.is_empty())
+                            .then_some(cand_meta)
+                    });
+                    return Ok(Some(FetchOutcome::Success(lines, raw, ids, meta)));
+                }
+                FetchOutcome::TokenError { .. } => return Ok(Some(outcome)),
+                FetchOutcome::TrackNotFound => continue,
             }
         }
     }

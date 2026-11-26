@@ -65,7 +65,7 @@ impl LyricStyles {
         }
 
         if is_before {
-            self.before.add_modifier(Modifier::ITALIC)
+            self.before.fg(Color::Cyan)
         } else if dist == 1 {
             self.background_after
         } else {

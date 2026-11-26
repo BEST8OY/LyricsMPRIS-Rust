@@ -38,6 +38,8 @@ pub struct ModernUIState {
     pub last_update_instant: Option<Instant>,
     /// Runtime karaoke toggle (can be toggled with 'k')
     pub karaoke_enabled: bool,
+    /// Whether parenthesized background vocals split onto separate sub-lines (`--no-split-bg`)
+    pub split_background: bool,
     /// Manual scroll offset when paused (in lyric blocks, not wrapped lines)
     pub scroll_offset: isize,
     /// Optional command channel to trigger candidate cycling ('r')
@@ -53,6 +55,7 @@ impl ModernUIState {
             should_exit: false,
             last_update_instant: None,
             karaoke_enabled: true,
+            split_background: true,
             scroll_offset: 0,
             cmd_tx: None,
         }
@@ -130,6 +133,7 @@ pub async fn display_lyrics_modern(
     let styles = LyricStyles::default();
     let mut state = ModernUIState::new();
     state.karaoke_enabled = karaoke_enabled;
+    state.split_background = mpris_config.settings.filters.split_background;
     state.cmd_tx = Some(cmd_tx);
     // per-word sleep used to schedule redraws only at interesting times (word boundaries)
     let mut next_word_sleep: Option<Pin<Box<Sleep>>> = None;
@@ -247,6 +251,7 @@ where
         &mut state.wrapped_cache,
         styles,
         state.karaoke_enabled,
+        state.split_background,
         max_visible_lines,
         state.scroll_offset,
     )?;
@@ -362,102 +367,12 @@ fn process_event(
                     }
                     Ok(false)
                 }
-                KeyCode::Up => {
-                    // Scroll up (towards earlier lines) when paused, clamped to start
-                    if let Some(ref update) = state.last_update
-                        && !update.playing
-                        && !update.lines.is_empty()
-                    {
-                        let base_index = update.index.unwrap_or(0) as isize;
-                        let min_offset = -base_index;
-                        let old_offset = state.scroll_offset;
-                        state.scroll_offset =
-                            (state.scroll_offset.saturating_sub(1)).max(min_offset);
-                        Ok(state.scroll_offset != old_offset)
-                    } else {
-                        Ok(false)
-                    }
-                }
-                KeyCode::Down => {
-                    // Scroll down (towards later lines) when paused, clamped to end
-                    if let Some(ref update) = state.last_update
-                        && !update.playing
-                        && !update.lines.is_empty()
-                    {
-                        let base_index = update.index.unwrap_or(0) as isize;
-                        let max_offset =
-                            (update.lines.len().saturating_sub(1) as isize) - base_index;
-                        let old_offset = state.scroll_offset;
-                        state.scroll_offset =
-                            (state.scroll_offset.saturating_add(1)).min(max_offset);
-                        Ok(state.scroll_offset != old_offset)
-                    } else {
-                        Ok(false)
-                    }
-                }
-                KeyCode::PageUp => {
-                    // Scroll up 5 lines when paused, clamped to start
-                    if let Some(ref update) = state.last_update
-                        && !update.playing
-                        && !update.lines.is_empty()
-                    {
-                        let base_index = update.index.unwrap_or(0) as isize;
-                        let min_offset = -base_index;
-                        let old_offset = state.scroll_offset;
-                        state.scroll_offset =
-                            (state.scroll_offset.saturating_sub(5)).max(min_offset);
-                        Ok(state.scroll_offset != old_offset)
-                    } else {
-                        Ok(false)
-                    }
-                }
-                KeyCode::PageDown => {
-                    // Scroll down 5 lines when paused, clamped to end
-                    if let Some(ref update) = state.last_update
-                        && !update.playing
-                        && !update.lines.is_empty()
-                    {
-                        let base_index = update.index.unwrap_or(0) as isize;
-                        let max_offset =
-                            (update.lines.len().saturating_sub(1) as isize) - base_index;
-                        let old_offset = state.scroll_offset;
-                        state.scroll_offset =
-                            (state.scroll_offset.saturating_add(5)).min(max_offset);
-                        Ok(state.scroll_offset != old_offset)
-                    } else {
-                        Ok(false)
-                    }
-                }
-                KeyCode::Home => {
-                    // Jump to beginning of lyrics when paused
-                    if let Some(ref update) = state.last_update
-                        && !update.playing
-                        && !update.lines.is_empty()
-                    {
-                        let base_index = update.index.unwrap_or(0) as isize;
-                        let old_offset = state.scroll_offset;
-                        state.scroll_offset = -base_index;
-                        Ok(state.scroll_offset != old_offset)
-                    } else {
-                        Ok(false)
-                    }
-                }
-                KeyCode::End => {
-                    // Jump to end of lyrics when paused
-                    if let Some(ref update) = state.last_update
-                        && !update.playing
-                        && !update.lines.is_empty()
-                    {
-                        let base_index = update.index.unwrap_or(0) as isize;
-                        let max_offset =
-                            (update.lines.len().saturating_sub(1) as isize) - base_index;
-                        let old_offset = state.scroll_offset;
-                        state.scroll_offset = max_offset;
-                        Ok(state.scroll_offset != old_offset)
-                    } else {
-                        Ok(false)
-                    }
-                }
+                KeyCode::Up => Ok(apply_paused_scroll(state, PausedScroll::Step(-1))),
+                KeyCode::Down => Ok(apply_paused_scroll(state, PausedScroll::Step(1))),
+                KeyCode::PageUp => Ok(apply_paused_scroll(state, PausedScroll::Step(-5))),
+                KeyCode::PageDown => Ok(apply_paused_scroll(state, PausedScroll::Step(5))),
+                KeyCode::Home => Ok(apply_paused_scroll(state, PausedScroll::Edge(false))),
+                KeyCode::End => Ok(apply_paused_scroll(state, PausedScroll::Edge(true))),
                 _ => Ok(false),
             }
         }
@@ -467,6 +382,34 @@ fn process_event(
         }
         _ => Ok(false),
     }
+}
+
+enum PausedScroll {
+    Step(isize),
+    Edge(bool),
+}
+
+fn apply_paused_scroll(state: &mut ModernUIState, action: PausedScroll) -> bool {
+    let Some(ref update) = state.last_update else {
+        return false;
+    };
+    if update.playing || update.lines.is_empty() {
+        return false;
+    }
+    let base_index = update.index.unwrap_or(0);
+    let old_offset = state.scroll_offset;
+    state.scroll_offset = match action {
+        PausedScroll::Step(delta) => crate::ui::modern_helpers::step_scroll_offset(
+            &update.lines,
+            base_index,
+            state.scroll_offset,
+            delta,
+        ),
+        PausedScroll::Edge(to_end) => {
+            crate::ui::modern_helpers::edge_scroll_offset(&update.lines, base_index, to_end)
+        }
+    };
+    state.scroll_offset != old_offset
 }
 
 fn to_boxed_err<E: std::error::Error + Send + Sync + 'static>(
@@ -714,6 +657,48 @@ mod tests {
         let state = ModernUIState::default();
         assert_eq!(state.scroll_offset, 0);
         assert!(state.karaoke_enabled);
+        assert!(state.split_background);
         assert!(!state.should_exit);
+    }
+
+    #[test]
+    fn test_paused_scroll_skips_is_bg_lines() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+
+        let key_event = |code: KeyCode| {
+            Event::Key(KeyEvent {
+                code,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            })
+        };
+
+        let mut state = ModernUIState::new();
+        let lines = vec![
+            crate::lyrics::LyricLine::new(0.0, "Lead 0"),
+            crate::lyrics::LyricLine::new(1.0, "Echo 0").with_bg(true),
+            crate::lyrics::LyricLine::new(5.0, "Lead 1"),
+            crate::lyrics::LyricLine::new(6.0, "Echo 1").with_bg(true),
+            crate::lyrics::LyricLine::new(10.0, "Lead 2"),
+        ];
+        state.last_update = Some(Update {
+            lines: Arc::new(lines),
+            index: Some(0),
+            playing: false,
+            ..Default::default()
+        });
+
+        assert!(process_event(key_event(KeyCode::Down), &mut state).unwrap());
+        assert_eq!(state.scroll_offset, 2); // Lead 1
+
+        assert!(process_event(key_event(KeyCode::End), &mut state).unwrap());
+        assert_eq!(state.scroll_offset, 4); // Lead 2
+
+        assert!(process_event(key_event(KeyCode::Up), &mut state).unwrap());
+        assert_eq!(state.scroll_offset, 2); // Lead 1
+
+        assert!(process_event(key_event(KeyCode::Home), &mut state).unwrap());
+        assert_eq!(state.scroll_offset, 0); // Lead 0
     }
 }
